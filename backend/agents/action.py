@@ -5,7 +5,12 @@ create_reminder for Reminders.app.
 
 from google.adk.agents import LlmAgent
 
-from tools.mac_control import create_reminder_tool, open_app_tool
+from tools.mac_control import (
+    click_ui_tool,
+    create_reminder_tool,
+    open_app_tool,
+    type_in_field_tool,
+)
 from .verifier_callbacks import log_tool_result_callback
 
 action_agent = LlmAgent(
@@ -14,11 +19,24 @@ action_agent = LlmAgent(
     description="Executes a single milestone goal using real Mac control tools.",
     instruction=(
         "You are given one milestone goal describing an outcome that needs "
-        "to happen on the user's Mac.\n\n"
-        "Decide which tool (if any) accomplishes that outcome:\n"
+        "to happen on the user's Mac. Milestones for the same overall task "
+        "arrive one at a time in this same conversation, in order, so use "
+        "earlier milestones/tool calls to infer which app you're working in "
+        "(e.g. if you already called open_app('Spotify'), later milestones "
+        "like 'lo-fi is playing' are still about Spotify).\n\n"
+        "Decide which tool (if any) accomplishes the current milestone:\n"
         "- open_app: use this when the milestone is about an application "
         "being launched/open/in the foreground (e.g. 'Spotify is open and "
         "in the foreground'). Extract just the app name, e.g. 'Spotify'.\n"
+        "- click_ui: use this when the milestone is about clicking something "
+        "inside the app that's already open (e.g. 'the first search result "
+        "is selected'). You must pass expected_app_name - the app this "
+        "click is meant for, inferred from context (e.g. 'Spotify'). The "
+        "tool refuses to act if that app isn't actually frontmost, so get "
+        "this right rather than guessing at random.\n"
+        "- type_in_field: use this when the milestone is about text being "
+        "entered somewhere (e.g. 'the search field contains lo-fi'). Same "
+        "expected_app_name requirement as click_ui.\n"
         "- create_reminder: use this when the milestone is about a reminder "
         "existing/being created (e.g. 'a reminder exists to call mom "
         "tomorrow at 5pm'). Extract:\n"
@@ -27,14 +45,14 @@ action_agent = LlmAgent(
         "  - due_date: the date mentioned or implied (e.g. 'tomorrow', "
         "'2026-08-13') - pass it as plain text, don't compute it yourself\n"
         "  - due_time: the time mentioned or implied (e.g. '5pm', '17:00')\n\n"
-        "If the milestone doesn't match any available tool (e.g. it "
-        "describes clicking/typing inside an app we have no tool for yet), "
-        "don't call anything - just say plainly what you would do if you "
-        "had the right tool, and that it wasn't executed.\n\n"
+        "If the milestone doesn't match any available tool, or a tool "
+        "refuses to act (e.g. wrong_frontmost_app), don't retry blindly - "
+        "report plainly what happened and that the milestone wasn't "
+        "completed.\n\n"
         "After calling a tool, report back in one short sentence whether it "
         "actually succeeded, based on the tool's own result - don't claim "
         "success if the tool reported failure."
     ),
-    tools=[open_app_tool, create_reminder_tool],
+    tools=[open_app_tool, click_ui_tool, type_in_field_tool, create_reminder_tool],
     after_tool_callback=log_tool_result_callback,
 )

@@ -128,15 +128,12 @@ async def main() -> None:
         for milestone in plan.milestones:
             await run_action(action_runner, action_session.id, milestone.goal)
 
-    # Real task that ends in an actual app-launch action: Orchestrator ->
-    # Planner produces a milestone plan for the Spotify command, then we
-    # hand every milestone to the Action agent. Only the first milestone
-    # ("Spotify is open") has a real tool (open_app) - the Action agent has
-    # no tool for locating a playlist or pressing play yet, so for those it
-    # should describe what it would do instead of executing anything. We
-    # don't special-case this in code; it falls out of the agent only having
-    # open_app/create_reminder available and being instructed to say so when
-    # no tool fits.
+    # Full Spotify command, executed for real end to end: Orchestrator ->
+    # Planner produces a milestone plan, then every milestone goes to the
+    # Action agent, which now has open_app, click_ui, and type_in_field
+    # available - open Spotify, type "lo-fi" into its search field, click
+    # the first result. click_ui/type_in_field print which tier (AX vs
+    # vision) actually resolved each target via their tool result dicts.
     session4 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
     spotify_plan = await run_command(orchestrator_runner, session4.id, "open Spotify and play some lo-fi music")
 

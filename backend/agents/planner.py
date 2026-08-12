@@ -19,7 +19,7 @@ class MilestonePlan(BaseModel):
     milestones: list[Milestone]
 
 
-# The Planner is a leaf agent (no sub_agents) - it only ever receives a task
+# The Planner is a leaf agent (no sub_agents) — it only ever receives a task
 # description and returns a structured plan. output_schema forces Gemini's
 # final reply to validate against MilestonePlan, so we can parse it directly
 # instead of scraping free-text.
@@ -38,7 +38,7 @@ planner_agent = LlmAgent(
         "- step_number: its 1-indexed position in the plan\n"
         "- goal: the outcome to reach\n"
         "- success_signal: an observable signal that tells us the goal was reached\n\n"
-        "Keep the plan minimal - only the milestones actually needed to "
+        "Keep the plan minimal — only the milestones actually needed to "
         "accomplish the task, in the order they must happen."
     ),
     output_schema=MilestonePlan,

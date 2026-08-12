@@ -20,11 +20,17 @@ def log_tool_result_callback(tool, args, tool_context, tool_response):
     """
     if isinstance(tool_response, dict) and "success" in tool_response:
         if tool_response["success"]:
+            # click_ui/type_in_field report which location tier resolved the
+            # target (accessibility vs vision) - surfacing that here matters
+            # for demo reliability, since silently leaning on the slower,
+            # less exact vision fallback every time would be worth knowing.
+            tier_note = f" [tier={tool_response['tier']}]" if tool_response.get("tier") else ""
             logger.info(
-                "[%s] succeeded with args=%s -> %s",
+                "[%s] succeeded with args=%s -> %s%s",
                 tool.name,
                 args,
                 tool_response.get("message"),
+                tier_note,
             )
         else:
             logger.error(

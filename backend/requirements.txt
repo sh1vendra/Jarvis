@@ -2,3 +2,6 @@ google-adk
 python-dotenv
 pydantic
 dateparser
+pyobjc-framework-Cocoa
+pyobjc-framework-ApplicationServices
+pyobjc-framework-Quartz

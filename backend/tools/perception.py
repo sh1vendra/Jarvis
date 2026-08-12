@@ -1,0 +1,158 @@
+"""Perception helpers: reading what's actually on screen.
+
+Two ways to "see" the UI:
+1. The macOS Accessibility API (AX) - the same API screen readers use. It
+   lets us ask a running app "what elements do you have and where are they"
+   without a screenshot. This only works well for apps that actually expose
+   a real accessibility tree (most native Cocoa apps do; Electron/Chromium
+   apps like Spotify often expose almost nothing).
+2. A raw screenshot, for the vision fallback when AX comes up empty.
+"""
+
+import os
+import subprocess
+import tempfile
+import time
+
+import ApplicationServices as AS
+from AppKit import NSWorkspace
+
+# Roles worth surfacing to the caller - purely structural containers
+# (AXGroup, AXScrollArea, AXUnknown, ...) are skipped since they're never
+# themselves something you'd click or type into.
+_INTERESTING_ROLES = {
+    "AXButton",
+    "AXTextField",
+    "AXSearchField",
+    "AXStaticText",
+    "AXLink",
+    "AXMenuItem",
+    "AXCell",
+    "AXRadioButton",
+    "AXCheckBox",
+    "AXPopUpButton",
+}
+
+# app_name -> (timestamp, tree) so repeated calls within a couple seconds
+# don't re-walk the whole AX tree again.
+_ui_tree_cache: dict[str, tuple[float, dict]] = {}
+_CACHE_TTL_SECONDS = 2.0
+
+
+def _pid_for_app(app_name: str) -> int | None:
+    for app in NSWorkspace.sharedWorkspace().runningApplications():
+        if app.localizedName() == app_name:
+            return app.processIdentifier()
+    return None
+
+
+def _ax_attr(element, attribute):
+    """Thin wrapper around AXUIElementCopyAttributeValue: returns the
+    attribute's value, or None if the element doesn't have it / errors."""
+    err, value = AS.AXUIElementCopyAttributeValue(element, attribute, None)
+    if err != 0:
+        return None
+    return value
+
+
+def _ax_point(element):
+    value = _ax_attr(element, "AXPosition")
+    if value is None:
+        return None
+    # AXPosition comes back as an opaque AXValue wrapping a CGPoint - pyobjc
+    # requires unpacking it explicitly via AXValueGetValue.
+    ok, point = AS.AXValueGetValue(value, AS.kAXValueCGPointType, None)
+    return (point.x, point.y) if ok else None
+
+
+def _ax_size(element):
+    value = _ax_attr(element, "AXSize")
+    if value is None:
+        return None
+    ok, size = AS.AXValueGetValue(value, AS.kAXValueCGSizeType, None)
+    return (size.width, size.height) if ok else None
+
+
+def _walk(element, elements: list, depth: int, max_depth: int, max_elements: int) -> None:
+    if depth > max_depth or len(elements) >= max_elements:
+        return
+
+    role = _ax_attr(element, "AXRole")
+    if role in _INTERESTING_ROLES:
+        # Prefer AXDescription since most macOS apps put the human-readable
+        # label there (AXTitle is frequently empty on buttons/cells);
+        # fall back to AXTitle, then AXValue (useful for text fields).
+        label = _ax_attr(element, "AXDescription") or _ax_attr(element, "AXTitle") or _ax_attr(element, "AXValue")
+        position = _ax_point(element)
+        size = _ax_size(element)
+        if label and position and size:
+            elements.append(
+                {
+                    "role": role,
+                    "label": str(label),
+                    "x": position[0],
+                    "y": position[1],
+                    "width": size[0],
+                    "height": size[1],
+                }
+            )
+
+    for child in _ax_attr(element, "AXChildren") or []:
+        _walk(child, elements, depth + 1, max_depth, max_elements)
+
+
+def get_ui_tree(app_name: str, use_cache: bool = True) -> dict:
+    """Returns the visible interactive elements of `app_name`'s frontmost
+    window via the Accessibility API.
+
+    Returns a dict: {"found_app": bool, "elements": [{role, label, x, y,
+    width, height}, ...]}. An app that exposes no real accessibility tree
+    (common for Electron/Chromium apps) will simply come back with very few
+    or zero elements - that's a real signal, not a bug in this function.
+    """
+    if use_cache:
+        cached = _ui_tree_cache.get(app_name)
+        if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
+            return cached[1]
+
+    pid = _pid_for_app(app_name)
+    if pid is None:
+        result = {"found_app": False, "elements": []}
+        _ui_tree_cache[app_name] = (time.monotonic(), result)
+        return result
+
+    app_ref = AS.AXUIElementCreateApplication(pid)
+    windows = _ax_attr(app_ref, "AXWindows") or []
+
+    elements: list = []
+    for window in windows:
+        _walk(window, elements, depth=0, max_depth=20, max_elements=500)
+
+    result = {"found_app": True, "elements": elements}
+    _ui_tree_cache[app_name] = (time.monotonic(), result)
+    return result
+
+
+def capture_screenshot() -> bytes:
+    """Captures the whole screen via the `screencapture` CLI and returns the
+    PNG bytes. `-x` suppresses the shutter sound, which matters here since
+    this can run many times per session with no user watching for it.
+
+    `screencapture` writes its output by replacing the destination path
+    (rename-over-target), not by writing into an already-open file
+    descriptor - so we create the temp path, close our handle to it *before*
+    calling screencapture, then reopen by path afterward to read the bytes
+    it actually wrote. Keeping the original fd open and reading from it
+    would silently return 0 bytes (a stale fd pointing at the old, empty,
+    now-unlinked inode).
+    """
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        result = subprocess.run(["screencapture", "-x", path], capture_output=True, timeout=10)
+        if result.returncode != 0:
+            raise RuntimeError(f"screencapture failed: {result.stderr.decode(errors='replace')}")
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        os.remove(path)
