@@ -11,6 +11,7 @@ System Settings -> Privacy & Security -> Automation.
 """
 
 import subprocess
+import time
 from datetime import datetime
 
 import dateparser
@@ -130,3 +131,89 @@ def create_reminder(task: str, due_date: str, due_time: str) -> dict:
 # tool's schema/description that gets sent to Gemini, so the docstring above
 # doubles as the tool description Gemini sees.
 create_reminder_tool = FunctionTool(create_reminder)
+
+
+def _frontmost_app_name() -> str | None:
+    """Asks System Events (macOS's UI-automation app) which application
+    process is currently frontmost, and returns its name.
+
+    `tell application "System Events" to get name of first application
+    process whose frontmost is true` reads as: among all running app
+    processes, filter to the one whose `frontmost` property is true (there's
+    exactly one at a time), and get its `name`. This is the real signal for
+    "is this app actually in the foreground" - it comes from macOS's own
+    window-manager state, not from whether our launch command exited 0.
+    """
+    result = subprocess.run(
+        [
+            "osascript",
+            "-e",
+            'tell application "System Events" to get name of first application process whose frontmost is true',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def open_app(app_name: str) -> dict:
+    """Launches a macOS application and verifies it actually became the
+    frontmost (foreground) app - not just that the launch command succeeded.
+
+    Args:
+        app_name: The application's name as it appears in /Applications,
+            e.g. "Spotify", "Safari" (with or without the ".app" suffix).
+
+    Returns:
+        A dict with:
+            success: bool, True only if the app was confirmed frontmost
+            message: human-readable summary of what happened
+            error: the raw error string if something went wrong, else None
+    """
+    clean_name = app_name.removesuffix(".app")
+
+    launch = subprocess.run(
+        ["open", "-a", clean_name],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if launch.returncode != 0:
+        stderr = launch.stderr.strip()
+        return {
+            "success": False,
+            "message": f"Could not launch '{clean_name}' - the 'open' command itself failed.",
+            "error": stderr or f"open exited with code {launch.returncode}",
+        }
+
+    # `open` returning 0 only means macOS accepted the launch request, not
+    # that the app is running or in the foreground yet - app launch is
+    # asynchronous and can take anywhere from instant to a couple seconds.
+    # So we poll the real frontmost-app state instead of trusting that exit
+    # code: check every 150ms for up to ~2 seconds.
+    deadline = time.monotonic() + 2.0
+    last_seen = None
+    while time.monotonic() < deadline:
+        last_seen = _frontmost_app_name()
+        if last_seen and last_seen.lower() == clean_name.lower():
+            return {
+                "success": True,
+                "message": f"'{clean_name}' is running and in the foreground.",
+                "error": None,
+            }
+        time.sleep(0.15)
+
+    return {
+        "success": False,
+        "message": (
+            f"'{clean_name}' was launched but never became the frontmost app "
+            f"within 2 seconds (frontmost app is currently '{last_seen}')."
+        ),
+        "error": "frontmost_verification_timeout",
+    }
+
+
+open_app_tool = FunctionTool(open_app)

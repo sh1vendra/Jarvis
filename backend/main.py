@@ -128,6 +128,24 @@ async def main() -> None:
         for milestone in plan.milestones:
             await run_action(action_runner, action_session.id, milestone.goal)
 
+    # Real task that ends in an actual app-launch action: Orchestrator ->
+    # Planner produces a milestone plan for the Spotify command, then we
+    # hand every milestone to the Action agent. Only the first milestone
+    # ("Spotify is open") has a real tool (open_app) - the Action agent has
+    # no tool for locating a playlist or pressing play yet, so for those it
+    # should describe what it would do instead of executing anything. We
+    # don't special-case this in code; it falls out of the agent only having
+    # open_app/create_reminder available and being instructed to say so when
+    # no tool fits.
+    session4 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+    spotify_plan = await run_command(orchestrator_runner, session4.id, "open Spotify and play some lo-fi music")
+
+    if spotify_plan is not None:
+        action_runner2 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
+        action_session2 = await action_runner2.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+        for milestone in spotify_plan.milestones:
+            await run_action(action_runner2, action_session2.id, milestone.goal)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -25,7 +25,7 @@ class MilestonePlan(BaseModel):
 # instead of scraping free-text.
 planner_agent = LlmAgent(
     name="planner_agent",
-    model="gemini-flash-latest",
+    model="gemini-flash-lite-latest",
     description="Breaks a real task into an ordered list of outcome-based milestones.",
     instruction=(
         "You are a planning agent. You receive a task description and break it "

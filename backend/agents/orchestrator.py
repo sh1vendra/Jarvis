@@ -15,7 +15,7 @@ from .planner import planner_agent
 
 orchestrator_agent = LlmAgent(
     name="orchestrator_agent",
-    model="gemini-flash-latest",
+    model="gemini-flash-lite-latest",
     description="Front door for user commands. Answers simple chat directly, delegates real tasks to the planner.",
     instruction=(
         "You are the orchestrator for a voice assistant called Jarvis.\n\n"
