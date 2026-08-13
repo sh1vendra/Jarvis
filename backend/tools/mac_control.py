@@ -325,17 +325,22 @@ def _screen_scale_factor() -> float:
     return NSScreen.mainScreen().backingScaleFactor()
 
 
-def _ask_vision_for_coordinates(target_description: str) -> tuple[float, float] | None:
-    """Tier 2: screenshots the whole screen and asks Gemini's vision model
-    for the pixel coordinates of the described element."""
-    png_bytes = capture_screenshot()
+def _ask_vision_for_coordinates_in_image(image_bytes: bytes, target_description: str) -> tuple[float, float] | None:
+    """Asks Gemini vision for the pixel coordinates of target_description
+    within image_bytes, relative to that image's own top-left origin.
 
+    This is the shared primitive behind both a single whole-screen guess
+    and every zoomed-in crop guess in _locate_via_vision_zoom below - vision
+    naturally reports coordinates relative to whatever image it's actually
+    shown, so a cropped image needs no different prompt, just a smaller
+    image.
+    """
     api_key = os.environ.get("GOOGLE_API_KEY")
     client = genai.Client(api_key=api_key)
     response = client.models.generate_content(
         model="gemini-flash-lite-latest",
         contents=[
-            genai_types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
+            genai_types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
             (
                 f"Find the UI element best described as: {target_description!r}.\n"
                 "Reply with ONLY raw JSON (no markdown fences) of the form "
@@ -352,12 +357,56 @@ def _ask_vision_for_coordinates(target_description: str) -> tuple[float, float] 
 
     try:
         coords = json.loads(text)
-        pixel_x, pixel_y = float(coords["x"]), float(coords["y"])
+        return float(coords["x"]), float(coords["y"])
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
 
+
+def _ask_vision_for_coordinates(target_description: str) -> tuple[float, float] | None:
+    """Single-shot, whole-screen vision guess, converted to point-space.
+    Still used as the first step of _locate_via_vision_zoom below - the
+    zoom search only pays for extra vision calls when this initial guess
+    needs refining."""
+    png_bytes = capture_screenshot()
+    coords = _ask_vision_for_coordinates_in_image(png_bytes, target_description)
+    if coords is None:
+        return None
     scale = _screen_scale_factor()
-    return pixel_x / scale, pixel_y / scale
+    return coords[0] / scale, coords[1] / scale
+
+
+_ZOOM_CROP_SIZE = (600.0, 400.0)  # pixel width/height of the first zoomed-in crop
+
+
+def _locate_via_vision_zoom(target_description: str) -> tuple[float, float] | None:
+    """First iteration of an iterative crop-and-zoom vision search, meant to
+    replace _ask_vision_for_coordinates's single whole-screen guess for
+    small UI elements - measured directly, a whole-screen guess for
+    Spotify's collapsed search icon landed ~100pt off the real element.
+
+    Step 1: ask vision for a rough guess against the whole screenshot, same
+    as _ask_vision_for_coordinates_in_image does today.
+    Step 2: crop tightly around that guess and ask again on the smaller
+    image - the same element now occupies a much larger fraction of what
+    vision sees, which should make this second guess more precise.
+
+    Returns pixel-space coordinates in the *original* full screenshot's
+    coordinate system (not yet converted to point-space). Not wired into
+    click_ui/type_in_field yet - this only covers the first zoom level; a
+    second, tighter level and the final point-space conversion come next.
+    """
+    full_screenshot = capture_screenshot()
+    coords = _ask_vision_for_coordinates_in_image(full_screenshot, target_description)
+    if coords is None:
+        return None
+
+    crop_width, crop_height = _ZOOM_CROP_SIZE
+    cropped_bytes, crop_left, crop_top = _crop_image(full_screenshot, coords[0], coords[1], crop_width, crop_height)
+    refined = _ask_vision_for_coordinates_in_image(cropped_bytes, target_description)
+    if refined is None:
+        return coords
+
+    return _translate_crop_coords(refined[0], refined[1], crop_left, crop_top)
 
 
 def _crop_image(
