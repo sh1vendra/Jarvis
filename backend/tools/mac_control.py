@@ -827,7 +827,20 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
     located = None
     if used_shortcut:
         field_offset = _APP_SEARCH_FIELD_OFFSET.get(expected_app_name)
-        window_frame = get_frontmost_window_frame(expected_app_name) if field_offset else None
+        window_frame = None
+        if field_offset:
+            # Right after a fresh open_app relaunch, the process can report
+            # itself frontmost (via the System Events check the guard above
+            # uses) slightly before its AX window is actually queryable -
+            # measured directly: this returned None immediately after a
+            # cold-started Spotify in some runs and not others, purely
+            # timing-dependent. A few short retries absorbs that race
+            # without a long fixed sleep on every call.
+            for _ in range(3):
+                window_frame = get_frontmost_window_frame(expected_app_name)
+                if window_frame is not None:
+                    break
+                time.sleep(0.2)
         if window_frame is not None:
             win_x, win_y, win_w, _win_h = window_frame
             x_fraction, y_offset = field_offset
