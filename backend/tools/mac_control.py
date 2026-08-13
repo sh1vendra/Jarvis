@@ -932,6 +932,111 @@ def _generate_grid_candidates(center_x: float, center_y: float, spacing: float) 
     ]
 
 
+_GRID_SEARCH_NAV_DIFF_THRESHOLD = 40.0  # wide-region diff above this suggests navigation, not just a local miss
+
+
+def locate_and_click_via_grid_search(
+    app_name: str, target_description: str, expected_outcome: str
+) -> dict:
+    """Locates and clicks a target by trying a small number of candidate
+    points around vision's rough guess, instead of trusting one coordinate
+    guess to be precise. For targets where that single guess has already
+    been measured unreliable (see planning.md's crop-and-zoom entry for
+    Spotify's search results) - not a general-purpose replacement for
+    click_ui's normal two-tier location.
+
+    Each candidate is tried in order: dispatch the click, immediately check
+    via _verify_click_outcome (the same OS-state-first / pixel-diff-plus-
+    vision verification click_ui already uses) whether expected_outcome
+    actually happened, and stop as soon as one hits. Capped at
+    _GRID_SEARCH_MAX_ATTEMPTS candidates so a bad initial guess can't turn
+    into unbounded clicking.
+
+    Guards against a wrong click doing something worse than nothing: after
+    each failed candidate, a wide-region screenshot diff checks whether the
+    click appears to have navigated away from the expected view entirely
+    (as opposed to just missing its target with no effect) - if so, the
+    remaining candidates are not tried, since clicking blindly in a now
+    different, unknown context could make things worse rather than better.
+    """
+    guard_error = _verify_expected_app_frontmost(app_name)
+    if guard_error is not None:
+        return guard_error
+
+    full_screenshot = capture_screenshot()
+    rough = _ask_vision_for_coordinates_in_image(full_screenshot, target_description)
+    if rough is None:
+        return {
+            "success": False,
+            "message": f"Vision could not produce even a rough guess for '{target_description}'.",
+            "tier": None,
+            "error": "no_vision_guess",
+        }
+
+    scale = _screen_scale_factor()
+    center_x, center_y = rough[0] / scale, rough[1] / scale
+    candidates = _generate_grid_candidates(center_x, center_y, _GRID_SEARCH_SPACING)[:_GRID_SEARCH_MAX_ATTEMPTS]
+
+    # A wide region around the rough guess, snapshotted once up front - used
+    # after every failed candidate to check for accidental navigation,
+    # independent of which candidate point was actually tried.
+    wide_region_center = (center_x, center_y)
+    wide_before = capture_region(*wide_region_center, 800.0, 500.0)
+
+    state_check = _APP_PLAYER_STATE_CHECKS.get(app_name)
+    before_player_state = state_check() if state_check is not None else None
+
+    attempts_log = []
+    for i, (x, y) in enumerate(candidates, start=1):
+        region_center = (x, y)
+        before_region_png = capture_region(*region_center, *_VERIFY_REGION_SIZE)
+
+        _dispatch_click(x, y)
+        time.sleep(0.3)
+
+        verified, detail = _verify_click_outcome(
+            app_name, expected_outcome, before_player_state, before_region_png, region_center
+        )
+        attempts_log.append(f"attempt {i} at ({x:.0f},{y:.0f}): {detail}")
+        logger.info("grid search for %r: %s", target_description, attempts_log[-1])
+
+        if verified:
+            return {
+                "success": True,
+                "message": (
+                    f"Grid search found a working click for '{target_description}' on attempt "
+                    f"{i}/{len(candidates)} at ({x:.0f}, {y:.0f}); verified: {detail}."
+                ),
+                "tier": "grid_search",
+                "error": None,
+            }
+
+        wide_after = capture_region(*wide_region_center, 800.0, 500.0)
+        wide_diff = _region_pixel_diff_score(wide_before, wide_after)
+        if wide_diff > _GRID_SEARCH_NAV_DIFF_THRESHOLD:
+            return {
+                "success": False,
+                "message": (
+                    f"Grid search aborted after attempt {i}/{len(candidates)}: a click near "
+                    f"({x:.0f}, {y:.0f}) appears to have navigated away from the expected view "
+                    f"(wide-region diff score {wide_diff:.2f}), so remaining candidates were not "
+                    f"tried. Attempts so far: {'; '.join(attempts_log)}"
+                ),
+                "tier": "grid_search",
+                "error": "grid_search_navigation_detected",
+            }
+
+    return {
+        "success": False,
+        "message": (
+            f"Grid search tried {len(candidates)} candidate points for '{target_description}' "
+            f"without verifying the expected outcome. Attempts: {'; '.join(attempts_log)}"
+        ),
+        "tier": "grid_search",
+        "error": "grid_search_exhausted",
+    }
+
+
 def click_ui(target_description: str, expected_app_name: str, expected_outcome: str) -> dict:
     """Clicks a UI element described in plain language, in a specific app,
     and verifies the click actually produced its intended effect.
