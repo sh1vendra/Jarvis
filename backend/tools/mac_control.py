@@ -362,19 +362,6 @@ def _ask_vision_for_coordinates_in_image(image_bytes: bytes, target_description:
         return None
 
 
-def _ask_vision_for_coordinates(target_description: str) -> tuple[float, float] | None:
-    """Single-shot, whole-screen vision guess, converted to point-space.
-    Still used as the first step of _locate_via_vision_zoom below - the
-    zoom search only pays for extra vision calls when this initial guess
-    needs refining."""
-    png_bytes = capture_screenshot()
-    coords = _ask_vision_for_coordinates_in_image(png_bytes, target_description)
-    if coords is None:
-        return None
-    scale = _screen_scale_factor()
-    return coords[0] / scale, coords[1] / scale
-
-
 _ZOOM_CROP_SIZE = (600.0, 400.0)  # pixel width/height of the first zoomed-in crop
 _ZOOM_SHRINK_FACTOR = 2.0  # each subsequent zoom level crops half as wide/tall as the last
 _ZOOM_TIGHT_THRESHOLD = 180.0  # stop zooming once a crop would be this small (pixels) or smaller
@@ -519,26 +506,28 @@ def _locate_element(app_name: str, target_description: str, roles: set[str] | No
             "reveal_expanded": False,
         }
 
-    # Tier 1 found nothing above threshold - fall back to vision. (In
-    # practice the AX query itself is near-instant, so there's no real ~1.5s
-    # wait to insert; the timeout budget is spent on Gemini's vision call
-    # instead of an idle sleep.)
-    coordinates = _ask_vision_for_coordinates(target_description)
+    # Tier 1 found nothing above threshold - fall back to vision, via the
+    # iterative crop-and-zoom search rather than a single whole-screen
+    # guess. Measured directly: a single-shot guess for Spotify's search
+    # icon landed ~100pt off the real element; zooming in narrows that
+    # because the target occupies a much larger fraction of what vision
+    # sees once cropped.
+    coordinates = _locate_via_vision_zoom(target_description)
     if coordinates is None:
         return {"error": f"Could not locate '{target_description}' via accessibility or vision."}
 
     reveal_expanded = False
     if _looks_collapsible(target_description):
         # The first guess might be a collapsed icon, not the real field -
-        # click it, give the UI a moment to expand, then ask vision again
-        # against a fresh screenshot rather than trusting the first guess
-        # was already the actual field. Only done when the description
-        # plausibly names something collapsible, so a field that's already
-        # open and correctly located on the first try doesn't pay this
-        # extra click + screenshot + model round-trip.
+        # click it, give the UI a moment to expand, then re-run the zoom
+        # search against a fresh screenshot rather than trusting the first
+        # guess was already the actual field. Only done when the
+        # description plausibly names something collapsible, so a field
+        # that's already open and correctly located on the first try
+        # doesn't pay this extra click + screenshot + model round-trip.
         _dispatch_click(coordinates[0], coordinates[1])
         time.sleep(0.5)
-        refined = _ask_vision_for_coordinates(target_description)
+        refined = _locate_via_vision_zoom(target_description)
         if refined is not None:
             coordinates = refined
             reveal_expanded = True
