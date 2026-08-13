@@ -140,6 +140,23 @@ and `type_in_field`:
    after a fresh launch), since re-asking vision to relocate the *now-open*
    field was measured to be just as unreliable as the original icon lookup.
 
+   **Known limitation, still unresolved: clicking Spotify's first search
+   result.** Unlike the collapsed search icon, there's no keyboard-shortcut
+   escape hatch for "select and play the first result." Both location
+   strategies were retested specifically for this target, against a real,
+   independently-verified ground truth (a saved screenshot where clicking
+   a known point was confirmed via `_spotify_player_state()` to start real
+   playback): `_locate_via_vision_zoom` scored 0/10 within any usable
+   tolerance (errors 158-661pt, worse than the single-shot whole-screen
+   guess it's supposed to improve on), and a full unfiltered AX dump of the
+   search-results window (depth 25, no role filtering) found every node
+   unlabeled with empty leaves - genuinely nothing to read, not a filtering
+   artifact. See `planning.md`'s entry for the full numbers. `click_ui` is
+   not special-cased for this target - it still tries vision (Tier 2) and
+   will very likely mis-click, but its outcome verification (below) is what
+   keeps this honest: a live end-to-end run correctly reports
+   `click_outcome_not_verified` rather than a false success.
+
 Every click is dispatched via `_dispatch_click` (raw Quartz
 `CGEventCreateMouseEvent`/`CGEventPost` at the HID event tap level, chosen
 over AppleScript System Events clicks specifically to avoid focus/routing

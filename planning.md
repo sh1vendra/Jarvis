@@ -361,3 +361,73 @@ now, added because it's the concrete case that motivated this work. Didn't
 try to make the OS-state check universal by inferring intent automatically
 across arbitrary apps - `_looks_like_playback_outcome`'s keyword gate is a
 narrow, explicit check, not a general outcome-classifier.
+
+---
+
+## Rejected: neither crop-and-zoom vision nor Accessibility API locate Spotify's search results reliably - left as a known, unfixed limitation
+
+**What we tried:** With `click_ui`'s outcome verification now trustworthy,
+the remaining gap was locating "first search result" precisely enough to
+click it at all. Two things were tested, both against a real, directly
+confirmed ground truth (a saved screenshot where clicking point (448, 218)
+was independently verified to start real playback - `Billie Jean` -> a
+genuinely new track, `paused` -> `playing`, checked via
+`_spotify_player_state()` before assuming anything about the image):
+
+1. **`_locate_via_vision_zoom` (the same crop-and-zoom search already
+   working for the collapsed search icon).** The hypothesis going in was
+   reasonable: search results are large, visually distinct elements (album
+   art, title, a literal green play button), not a tiny ambiguous icon, so
+   zooming might behave completely differently here. It didn't. Single-shot
+   whole-screen guesses were tight and *consistent* (5/5 landed within 13px
+   of each other) but confidently wrong - ~360pt from the real target,
+   in the left sidebar, not the results area. Running the full zoom search
+   (5 attempts with `"first search result"`, 5 more with a much more
+   specific description naming the exact playlist and its green play
+   button) made things *worse*, not better: errors ranged from 158pt to
+   661pt, and unlike the icon case's single consistent wrong answer, these
+   were scattered across multiple different wrong locations. Zooming in
+   apparently amplifies noise here rather than converging - 10/10 zoom
+   attempts, 0 within any usable click tolerance.
+2. **The Accessibility API, checked with fresh eyes rather than assumed
+   from the earlier icon investigation.** A full unfiltered dump of
+   Spotify's AX tree (no role filtering, depth 25) for this exact search
+   results window found ~15 total nodes, every single one unlabeled
+   (`AXDescription`/`AXTitle` empty or `None`), bottoming out in completely
+   empty leaf `AXGroup`s. This isn't `get_ui_tree`'s interesting-roles
+   filter hiding something real - the raw tree genuinely has nothing to
+   read. Confirms and extends the original finding (previously only
+   checked for the collapsed icon, not this view): Spotify's
+   Chromium/Electron renderer doesn't expose its content to the
+   Accessibility API at all in this window, regardless of what part of the
+   UI is being asked about.
+
+**Decision: left as a known, disclosed limitation for the demo, not
+patched over.** Per the standard set for this whole investigation (if an
+approach doesn't demonstrate real, consistent accuracy, don't wire it in
+and don't keep tuning it), neither path is trustworthy enough to hand a
+real click through. The keyboard-shortcut fallback that worked for the
+collapsed search icon (Cmd+L) doesn't have an equivalent here - there's no
+known "select and play the first result" keyboard shortcut in Spotify to
+substitute in the same way.
+
+**Why this is worth keeping as a documented limitation rather than forcing
+something in:** A forced fix that isn't actually reliable would reintroduce
+exactly the failure mode `click_ui`'s outcome verification was just built
+to catch and report honestly - and it now does exactly that. Live-testing
+the real end-to-end command still ends with `click_ui` correctly reporting
+`click_outcome_not_verified`, backed by real Spotify player state showing
+no playback change, rather than a false success. The system's honesty
+about this specific limitation is itself the deliverable of this step, not
+a consolation prize.
+
+**What would actually resolve this, if pursued later:** Full-page
+screenshot vision (whole-screen, not cropped) was measurably more *precise
+per-guess* here than zoomed crops, even though still not accurate enough
+to use directly - suggesting the model does have some real signal about
+roughly where results are, just not enough to trust for a single click.
+A different strategy entirely (e.g. a much larger click-tolerance
+region-click-and-verify loop, or scanning a grid of candidate points and
+using `click_ui`'s own outcome verification to detect a hit) wasn't tried
+here and might be worth a dedicated follow-up if this limitation turns out
+to matter for the actual demo.
