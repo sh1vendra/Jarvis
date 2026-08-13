@@ -11,6 +11,7 @@ System Settings -> Privacy & Security -> Automation.
 """
 
 import difflib
+import io
 import json
 import os
 import subprocess
@@ -23,8 +24,9 @@ from AppKit import NSScreen
 from google import genai
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
+from PIL import Image, ImageChops
 
-from .perception import capture_screenshot, get_ui_tree
+from .perception import capture_region, capture_screenshot, get_field_values, get_ui_tree
 
 
 def _build_applescript(task: str, due_date: datetime, list_name: str) -> str:
@@ -379,10 +381,26 @@ def _dispatch_click(x: float, y: float) -> None:
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
 
+# Descriptions that plausibly name a search entry point that might currently
+# be a collapsed icon rather than an open, visible field - e.g. Spotify's
+# Home view shows only a magnifying-glass icon until it's clicked. Confirmed
+# directly: asking vision for "search field" coordinates on that view
+# returned a confident-looking guess pointing at an unrelated podcast tile,
+# because there was no actual field on screen yet for it to find.
+_COLLAPSIBLE_FIELD_HINTS = ("search field", "search bar", "search box", "search input")
+
+
+def _looks_collapsible(target_description: str) -> bool:
+    lowered = target_description.lower()
+    return any(hint in lowered for hint in _COLLAPSIBLE_FIELD_HINTS)
+
+
 def _locate_element(app_name: str, target_description: str, roles: set[str] | None = None) -> dict:
     """Runs the two-tier location strategy and returns a dict describing
-    what was found and how: {"x", "y", "tier": "accessibility" | "vision"}
-    or {"error": str} if both tiers failed."""
+    what was found and how: {"x", "y", "tier": "accessibility" | "vision",
+    "reveal_expanded": bool} or {"error": str} if both tiers failed.
+    reveal_expanded is only ever True for the vision tier - see
+    _looks_collapsible."""
     element, score = _best_ax_match(app_name, target_description, roles)
     if element is not None:
         return {
@@ -391,6 +409,7 @@ def _locate_element(app_name: str, target_description: str, roles: set[str] | No
             "tier": "accessibility",
             "matched_label": element["label"],
             "match_score": round(score, 2),
+            "reveal_expanded": False,
         }
 
     # Tier 1 found nothing above threshold - fall back to vision. (In
@@ -401,7 +420,23 @@ def _locate_element(app_name: str, target_description: str, roles: set[str] | No
     if coordinates is None:
         return {"error": f"Could not locate '{target_description}' via accessibility or vision."}
 
-    return {"x": coordinates[0], "y": coordinates[1], "tier": "vision"}
+    reveal_expanded = False
+    if _looks_collapsible(target_description):
+        # The first guess might be a collapsed icon, not the real field -
+        # click it, give the UI a moment to expand, then ask vision again
+        # against a fresh screenshot rather than trusting the first guess
+        # was already the actual field. Only done when the description
+        # plausibly names something collapsible, so a field that's already
+        # open and correctly located on the first try doesn't pay this
+        # extra click + screenshot + model round-trip.
+        _dispatch_click(coordinates[0], coordinates[1])
+        time.sleep(0.5)
+        refined = _ask_vision_for_coordinates(target_description)
+        if refined is not None:
+            coordinates = refined
+            reveal_expanded = True
+
+    return {"x": coordinates[0], "y": coordinates[1], "tier": "vision", "reveal_expanded": reveal_expanded}
 
 
 def _verify_expected_app_frontmost(expected_app_name: str) -> dict | None:
@@ -437,6 +472,103 @@ def _verify_expected_app_frontmost(expected_app_name: str) -> dict | None:
     return None
 
 
+_VERIFY_REGION_SIZE = (400.0, 160.0)  # width, height in points, centered on the field
+_NO_CHANGE_DIFF_THRESHOLD = 2.0  # mean 0-255 grayscale diff below this = "nothing visibly happened"
+
+
+def _region_pixel_diff_score(before_png: bytes, after_png: bytes) -> float:
+    """Mean per-pixel grayscale difference (0-255) between two same-region
+    screenshots. Cheap, deterministic, and immune to hallucination - unlike
+    a single vision yes/no call, which measurably gave a false positive on
+    this exact scenario (asked to confirm text was visible on an unchanged
+    Spotify screen, it said yes once out of five otherwise-correct tries).
+    Used as a first, harder gate before ever trusting vision's judgment.
+    """
+    before_img = Image.open(io.BytesIO(before_png)).convert("L")
+    after_img = Image.open(io.BytesIO(after_png)).convert("L")
+    if before_img.size != after_img.size:
+        after_img = after_img.resize(before_img.size)
+    diff = ImageChops.difference(before_img, after_img)
+    histogram = diff.histogram()
+    pixel_count = sum(histogram)
+    if pixel_count == 0:
+        return 0.0
+    weighted_sum = sum(value * count for value, count in enumerate(histogram))
+    return weighted_sum / pixel_count
+
+
+def _verify_text_entered(
+    app_name: str, expected_text: str, before_region_png: bytes, region_center: tuple[float, float]
+) -> tuple[bool, str]:
+    """Confirms typed text actually landed somewhere, instead of reporting
+    success just because the paste command didn't error.
+
+    Tier A: a fresh (uncached) accessibility query for real field *values*
+    (not labels - see perception.get_field_values) - fast, no model call,
+    and exact when it works.
+
+    Tier B (only when tier A finds no text fields at all - confirmed with
+    Spotify, whose AX tree exposes none): a before/after pixel diff of the
+    region around where we clicked. If nothing visibly changed there, that's
+    a confident, hallucination-free "the click missed" - no need to even
+    ask vision. Only if something DID visibly change do we ask vision to
+    confirm it's actually the expected text, and only on that small cropped
+    region rather than the whole screen (a much less ambiguous question,
+    which is what produced the false positive in the first place).
+    """
+    field_values = get_field_values(app_name)
+    if field_values:
+        for value in field_values:
+            if expected_text.lower() in (value or "").lower():
+                return True, f"confirmed via accessibility - a field's value contains {expected_text!r}"
+        return False, (
+            f"accessibility shows text field(s) present but none contain {expected_text!r} "
+            f"(saw: {field_values!r})"
+        )
+
+    x, y = region_center
+    width, height = _VERIFY_REGION_SIZE
+    after_region_png = capture_region(x, y, width, height)
+    diff_score = _region_pixel_diff_score(before_region_png, after_region_png)
+
+    if diff_score < _NO_CHANGE_DIFF_THRESHOLD:
+        return False, (
+            f"no visual change detected near the click point (diff score {diff_score:.2f}) "
+            "- the click likely missed its target"
+        )
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-flash-lite-latest",
+        contents=[
+            genai_types.Part.from_bytes(data=after_region_png, mime_type="image/png"),
+            (
+                f"Does this cropped screenshot show the text {expected_text!r} - e.g. typed "
+                "into a search field or input box? Reply with ONLY raw JSON (no markdown "
+                'fences): {"visible": true or false}'
+            ),
+        ],
+    )
+    text = response.text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        parsed = json.loads(text)
+        visible = bool(parsed.get("visible"))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        visible = False
+
+    detail = (
+        f"visual change detected near the click (diff score {diff_score:.2f}) and vision "
+        f"confirms {expected_text!r} is visible there"
+        if visible
+        else f"visual change detected near the click (diff score {diff_score:.2f}) but vision "
+        f"could not confirm {expected_text!r} is the text shown"
+    )
+    return visible, detail
+
+
 def click_ui(target_description: str, expected_app_name: str) -> dict:
     """Clicks a UI element described in plain language, in a specific app.
 
@@ -468,11 +600,13 @@ def click_ui(target_description: str, expected_app_name: str) -> dict:
 
     _dispatch_click(located["x"], located["y"])
 
-    tier_detail = (
-        f"matched AX label '{located['matched_label']}' (score {located['match_score']})"
-        if located["tier"] == "accessibility"
-        else "used Gemini vision on a screenshot"
-    )
+    if located["tier"] == "accessibility":
+        tier_detail = f"matched AX label '{located['matched_label']}' (score {located['match_score']})"
+    elif located.get("reveal_expanded"):
+        tier_detail = "used Gemini vision - first click revealed a collapsed field, then vision re-located it"
+    else:
+        tier_detail = "used Gemini vision on a screenshot"
+
     return {
         "success": True,
         "message": f"Clicked '{target_description}' via {located['tier']} tier ({tier_detail}) at ({located['x']:.0f}, {located['y']:.0f}).",
@@ -515,6 +649,13 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
     if "error" in located:
         return {"success": False, "message": located["error"], "tier": None, "error": located["error"]}
 
+    # Captured before the click/paste so _verify_text_entered can diff
+    # against it afterward - this is what actually catches a click that
+    # missed its target, rather than trusting a single after-the-fact vision
+    # opinion in isolation.
+    region_center = (located["x"], located["y"])
+    before_region_png = capture_region(*region_center, *_VERIFY_REGION_SIZE)
+
     _dispatch_click(located["x"], located["y"])
     time.sleep(0.2)  # give the field a moment to actually gain focus
 
@@ -533,14 +674,37 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
     Quartz.CGEventSetFlags(key_up, Quartz.kCGEventFlagMaskCommand)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_up)
 
-    tier_detail = (
-        f"matched AX label '{located['matched_label']}' (score {located['match_score']})"
-        if located["tier"] == "accessibility"
-        else "used Gemini vision on a screenshot"
-    )
+    if located["tier"] == "accessibility":
+        tier_detail = f"matched AX label '{located['matched_label']}' (score {located['match_score']})"
+    elif located.get("reveal_expanded"):
+        tier_detail = "used Gemini vision - first click revealed a collapsed field, then vision re-located it"
+    else:
+        tier_detail = "used Gemini vision on a screenshot"
+
+    # Don't report success just because the paste command didn't error -
+    # confirm the text is actually there. This is exactly the check that was
+    # missing when this tool once reported success on Spotify while "lo-fi"
+    # had actually landed nowhere (the vision-located click missed).
+    time.sleep(0.3)  # give the UI a moment to render the paste before checking
+    verified, verify_detail = _verify_text_entered(expected_app_name, text, before_region_png, region_center)
+
+    if not verified:
+        return {
+            "success": False,
+            "message": (
+                f"Typed into '{target_description}' via {located['tier']} tier ({tier_detail}), "
+                f"but could not verify the text actually landed: {verify_detail}."
+            ),
+            "tier": located["tier"],
+            "error": "type_not_verified",
+        }
+
     return {
         "success": True,
-        "message": f"Typed into '{target_description}' via {located['tier']} tier ({tier_detail}).",
+        "message": (
+            f"Typed into '{target_description}' via {located['tier']} tier ({tier_detail}); "
+            f"verified: {verify_detail}."
+        ),
         "tier": located["tier"],
         "error": None,
     }

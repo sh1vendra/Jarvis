@@ -133,6 +133,74 @@ def get_ui_tree(app_name: str, use_cache: bool = True) -> dict:
     return result
 
 
+def get_field_values(app_name: str) -> list[str]:
+    """Fresh (always uncached) query for the actual AXValue of every
+    text-like field in app_name's frontmost window.
+
+    This exists specifically to verify typed text actually landed somewhere.
+    get_ui_tree's `label` deliberately prefers AXDescription/AXTitle over
+    AXValue (those are what make a UI-labeling pass useful - "Search",
+    "Add Reminder", etc.), so it's the wrong thing to read here: after
+    typing, we need the field's actual current *contents*, not its label.
+    """
+    pid = _pid_for_app(app_name)
+    if pid is None:
+        return []
+
+    app_ref = AS.AXUIElementCreateApplication(pid)
+    windows = _ax_attr(app_ref, "AXWindows") or []
+
+    values: list[str] = []
+
+    def walk(element, depth=0, max_depth=20, count=[0]):
+        if depth > max_depth or count[0] > 500:
+            return
+        role = _ax_attr(element, "AXRole")
+        if role in ("AXTextField", "AXSearchField"):
+            value = _ax_attr(element, "AXValue")
+            if value:
+                values.append(str(value))
+        count[0] += 1
+        for child in _ax_attr(element, "AXChildren") or []:
+            walk(child, depth + 1, max_depth, count)
+
+    for window in windows:
+        walk(window)
+    return values
+
+
+def capture_region(x: float, y: float, width: float, height: float) -> bytes:
+    """Captures a rectangular region of the screen, centered on point-space
+    coordinates (x, y), and returns PNG bytes.
+
+    `screencapture -R<x>,<y>,<w>,<h>` takes its rect in point-space (the same
+    coordinate system as clicks and AX positions) and returns the image at
+    the display's native pixel resolution - confirmed directly: requesting
+    a 300x200 point region on this Retina display came back as a 600x400
+    pixel PNG. So callers pass plain click-coordinate units, no manual
+    Retina scale conversion needed here (unlike capture_screenshot's
+    whole-screen output, which vision-tier coordinate math does have to
+    divide by the scale factor).
+    """
+    left = x - width / 2
+    top = y - height / 2
+
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        result = subprocess.run(
+            ["screencapture", "-x", "-R", f"{left},{top},{width},{height}", path],
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"screencapture -R failed: {result.stderr.decode(errors='replace')}")
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        os.remove(path)
+
+
 def capture_screenshot() -> bytes:
     """Captures the whole screen via the `screencapture` CLI and returns the
     PNG bytes. `-x` suppresses the shutter sound, which matters here since
