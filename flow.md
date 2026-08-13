@@ -157,6 +157,19 @@ and `type_in_field`:
    keeps this honest: a live end-to-end run correctly reports
    `click_outcome_not_verified` rather than a false success.
 
+   A third strategy, `locate_and_click_via_grid_search(app_name,
+   target_description, expected_outcome)`, was also tried and also
+   rejected (1/3 real hit rate - see `planning.md`) - it exists in
+   `mac_control.py` but is **not called from `click_ui` or anywhere else**.
+   Rather than trusting one vision coordinate guess, it tries up to 5
+   candidate points (a cross pattern around the guess, via
+   `_generate_grid_candidates`) and reuses `_verify_click_outcome` after
+   each to detect a hit, stopping early on success or on a wide-region diff
+   suggesting an accidental navigation. Kept in the codebase as a working,
+   tested building block (and because it fixed two real bugs along the way
+   - see `planning.md`), but not wired in since its hit rate wasn't
+   reliable enough to hand a real click through.
+
 Every click is dispatched via `_dispatch_click` (raw Quartz
 `CGEventCreateMouseEvent`/`CGEventPost` at the HID event tap level, chosen
 over AppleScript System Events clicks specifically to avoid focus/routing

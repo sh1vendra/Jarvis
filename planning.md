@@ -431,3 +431,84 @@ region-click-and-verify loop, or scanning a grid of candidate points and
 using `click_ui`'s own outcome verification to detect a hit) wasn't tried
 here and might be worth a dedicated follow-up if this limitation turns out
 to matter for the actual demo.
+
+---
+
+## Tried the grid-click-and-verify follow-up from the entry above - also rejected, 1/3 hit rate
+
+**What we tried:** `locate_and_click_via_grid_search` (`tools/mac_control.py`)
+- the exact follow-up idea from the previous entry. Rationale: instead of
+needing vision's single coordinate guess to be *precise*, only need it to
+be *roughly in the neighborhood*, then use several candidate points plus
+the outcome verification already proven reliable (real Spotify player
+state / pixel-diff-plus-vision) to find whichever one, if any, actually
+worked. A 5-point cross pattern (center + up/down/left/right, 120pt
+spacing) around vision's single whole-screen guess, stopping at the first
+verified hit, capped at 5 attempts, with a wide-region diff check after
+each miss to detect and stop on an accidental navigation rather than
+clicking blindly in a changed context.
+
+**A real structural finding before precision even mattered:** building a
+fresh ground truth for the *actual* demo query surfaced something the
+earlier "lofi hip hop radio" ground truth had accidentally sidestepped:
+the literal query the Action agent actually types (`"lo-fi"`, hyphenated,
+matching `type_in_field`'s real call) returns Spotify's genre-landing
+layout (a "lofi beats" genre tile + a "Jump in" row of playlist tiles),
+not the clean "Top result" card with a persistent, always-visible play
+button that a different query happened to return. Confirmed directly:
+clicking a playlist tile in this layout navigates to the playlist's own
+page - it does not start playback. So even a hypothetically perfect click
+locator would not satisfy "lo-fi music is playing" in one click for this
+exact query; getting real playback would need a second click (the
+playlist page's own prominent Play button) after the first. This is
+independent of click precision and worth knowing regardless of how the
+grid search performed.
+
+**Two real bugs found and fixed while building the test for this** (both
+committed separately, `cbcd87a` and `9c3c752`):
+1. `_looks_like_playback_outcome`'s keyword gate used plain substring
+   matching, so an outcome like "the playlist page opens" (pure
+   navigation, nothing to do with playback) matched `"play"` inside
+   `"playlist"` and got wrongly routed to Spotify's player-state check -
+   which then reported a false "no playback change" for something player
+   state was never able to speak to in the first place. Fixed to match on
+   word boundaries only.
+2. `_spotify_player_state()` had no handling for `subprocess.TimeoutExpired`
+   - under the grid search's rapid repeated queries, `osascript`
+   occasionally hung past its 10s timeout, and the uncaught exception
+   crashed the entire grid search instead of degrading to "state unknown"
+   the way every other failure mode in that function already did.
+
+**Real test result (isolated, 3 trials, same methodology as every other
+approach in this project):** 1/3. Trial 1 succeeded on its 3rd candidate.
+Trials 2 and 3 both exhausted all 5 candidates without a single verified
+hit. The failure pattern explains why: vision's single rough guess for
+those two trials landed near the screen's top-left corner, and the cross
+pattern's fixed 120pt spacing pushed two of the five candidates to
+*negative* coordinates - off-screen, guaranteed no-ops (`diff score 0.00`)
+that wasted 2 of the 5-attempt budget on nothing. The grid can only rescue
+a guess that's off by roughly one target-width in some direction; it can't
+rescue a guess that's off by hundreds of points or landed near a screen
+edge, which is exactly what was measured for this target across every
+approach so far (crop-zoom: 158-661pt error; single-shot: ~360pt error).
+
+**Decision: also rejected, not wired into `click_ui`.** 1/3 is not a
+reliable hit rate by any reasonable bar, and per the standard held
+throughout this whole investigation, a clear negative result is a stopping
+point, not a tuning opportunity. Widening the grid or increasing the
+attempt cap were both considered and deliberately not tried further here -
+the previous entry's crop-zoom numbers already show that even a generous
+error budget doesn't reliably bring vision's guess back to the true
+target for this specific element, so there's no strong reason to expect a
+wider grid to convert this from "sometimes" to "reliably."
+
+**Recommendation:** swap the demo command rather than keep chasing this
+target, per the fallback already agreed for this situation. Two
+independent, real problems now stack against "open Spotify and play some
+lo-fi music" specifically: click precision on the search results
+(unresolved despite three different approaches), and the query itself
+requiring two clicks to actually reach playback, not one. A command that
+avoids needing to click a small/ambiguous Electron-rendered result -
+e.g. one that stays within already-solid paths (`open_app`,
+`type_in_field`'s keyboard-shortcut route, `create_reminder`) - would
+demo reliably today; this one specific milestone would not.
