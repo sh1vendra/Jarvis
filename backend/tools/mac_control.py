@@ -27,20 +27,27 @@ from google.genai import types as genai_types
 from .perception import capture_screenshot, get_ui_tree
 
 
-def _build_applescript(task: str, due_date: datetime) -> str:
-    """Builds the AppleScript source that creates one reminder.
+def _build_applescript(task: str, due_date: datetime, list_name: str) -> str:
+    """Builds the AppleScript source that creates one reminder in a specific
+    named list, creating that list first if it doesn't already exist.
 
     Notes on the syntax, since AppleScript looks nothing like Python:
     - `tell application "Reminders" ... end tell` scopes the following
       commands to the Reminders app, like a `with` block targeting a specific
       app's scripting dictionary.
+    - `if not (exists list "X") then make new list with properties {...}`
+      is AppleScript's existence check - there's no get-or-create helper, so
+      we ask "does this named object exist" before creating it, same idea as
+      `if not os.path.exists(...): os.makedirs(...)`.
     - AppleScript has no native way to construct an arbitrary date from
       numbers in one call, so the idiom is: grab `(current date)` (today,
       right now) and then overwrite its `year`/`month`/`day`/`hours`/
       `minutes`/`seconds` properties one at a time until it represents the
       date/time we actually want.
-    - `default list` is Reminders' name for whichever list is set as the
-      user's default (usually "Reminders").
+    - `list "X"` refers to a specific named list by name, as opposed to
+      `default list` (whichever list is the user's default, usually
+      "Reminders") - we target a specific list explicitly so automated/test
+      reminders land somewhere separate from the user's real lists.
     - `make new reminder with properties {...}` is AppleScript's constructor
       pattern: create a new object of a given class with an initial property
       record, similar to calling `Reminder(name=..., due_date=...)`.
@@ -49,9 +56,13 @@ def _build_applescript(task: str, due_date: datetime) -> str:
       escaping.
     """
     safe_task = task.replace('"', '""')
+    safe_list_name = list_name.replace('"', '""')
 
     return f'''
 tell application "Reminders"
+    if not (exists list "{safe_list_name}") then
+        make new list with properties {{name:"{safe_list_name}"}}
+    end if
     set dueDate to (current date)
     set year of dueDate to {due_date.year}
     set month of dueDate to {due_date.month}
@@ -59,7 +70,7 @@ tell application "Reminders"
     set hours of dueDate to {due_date.hour}
     set minutes of dueDate to {due_date.minute}
     set seconds of dueDate to 0
-    tell default list
+    tell list "{safe_list_name}"
         make new reminder with properties {{name:"{safe_task}", due date:dueDate}}
     end tell
 end tell
@@ -67,13 +78,16 @@ return "ok"
 '''
 
 
-def create_reminder(task: str, due_date: str, due_time: str) -> dict:
-    """Creates a real reminder in the macOS Reminders app (default list).
+def create_reminder(task: str, due_date: str, due_time: str, list_name: str = "Jarvis Test") -> dict:
+    """Creates a real reminder in the macOS Reminders app.
 
     Args:
         task: The reminder text, e.g. "Call mom".
         due_date: A natural-language or ISO date, e.g. "tomorrow", "2026-08-13".
         due_time: A natural-language or clock time, e.g. "5pm", "17:00".
+        list_name: Which Reminders list to create it in. Defaults to
+            "Jarvis Test" (created automatically if it doesn't exist yet) so
+            automated/test reminders stay out of the user's real lists.
 
     Returns:
         A dict with:
@@ -92,7 +106,7 @@ def create_reminder(task: str, due_date: str, due_time: str) -> dict:
             "error": "date_parse_failed",
         }
 
-    script = _build_applescript(task, parsed)
+    script = _build_applescript(task, parsed, list_name)
 
     try:
         result = subprocess.run(
@@ -130,7 +144,7 @@ def create_reminder(task: str, due_date: str, due_time: str) -> dict:
 
     return {
         "success": True,
-        "message": f"Created reminder '{task}' due {parsed.strftime('%Y-%m-%d %H:%M')}.",
+        "message": f"Created reminder '{task}' due {parsed.strftime('%Y-%m-%d %H:%M')} in list '{list_name}'.",
         "error": None,
     }
 
