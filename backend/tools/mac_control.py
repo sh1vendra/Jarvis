@@ -641,6 +641,69 @@ def _verify_expected_app_frontmost(expected_app_name: str) -> dict | None:
     return None
 
 
+def _spotify_player_state() -> dict | None:
+    """Queries Spotify's actual player state via AppleScript - whether it's
+    playing/paused, and which track. Returns None if the query fails for
+    any reason (Spotify not running, no track loaded yet, unexpected
+    AppleScript error) - callers must treat None as "state unknown", not as
+    "not playing".
+
+    Confirmed directly: `player state` returns "playing" or "paused" as an
+    enum (read here `as string`), and `current track`'s `name`/`artist`
+    raise an AppleScript error rather than returning something falsy when
+    no track has ever been loaded - hence the try/on error wrapper, not a
+    None-check on the values. Also confirmed: `tell application "Spotify"`
+    launches Spotify if it isn't already running (standard AppleScript
+    behavior for any `tell application`) - not a concern for how this is
+    actually called here, since callers only reach this after already
+    confirming Spotify is the frontmost app, but worth knowing before
+    reusing this pattern elsewhere.
+
+    "|||" is used as a field delimiter when concatenating the three values
+    in one AppleScript return (rather than three separate osascript calls,
+    which would triple the subprocess overhead and risk state changing
+    between the calls) - not bulletproof against a track name containing
+    "|||" itself, but adequate for this use case.
+    """
+    script = (
+        'tell application "Spotify"\n'
+        "try\n"
+        "  set ps to player state as string\n"
+        "  set tn to name of current track\n"
+        "  set ta to artist of current track\n"
+        '  return ps & "|||" & tn & "|||" & ta\n'
+        "on error\n"
+        '  return "error||||"\n'
+        "end try\n"
+        "end tell"
+    )
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.strip().split("|||")
+    if len(parts) != 3 or parts[0] == "error":
+        return None
+    return {"player_state": parts[0], "track_name": parts[1], "track_artist": parts[2]}
+
+
+def _spotify_playback_changed(before: dict | None, after: dict | None) -> bool:
+    """True if Spotify's real player state shows playback meaningfully
+    changed between two _spotify_player_state() snapshots - either
+    transitioning into "playing" from something else, or the loaded track
+    itself changing. Either signal alone can indicate a real "play" click
+    worked: clicking play on a *different* track while something was
+    already playing changes the track without necessarily toggling
+    player_state; clicking play from a stopped/paused state changes
+    player_state without necessarily changing the track (e.g. resuming the
+    same track). Not yet used by any caller.
+    """
+    if before is None or after is None:
+        return False
+    started_playing = before["player_state"] != "playing" and after["player_state"] == "playing"
+    track_changed = (before["track_name"], before["track_artist"]) != (after["track_name"], after["track_artist"])
+    return started_playing or track_changed
+
+
 _VERIFY_REGION_SIZE = (400.0, 160.0)  # width, height in points, centered on the field
 _NO_CHANGE_DIFF_THRESHOLD = 2.0  # mean 0-255 grayscale diff below this = "nothing visibly happened"
 
