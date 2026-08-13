@@ -500,6 +500,39 @@ def _dispatch_click(x: float, y: float) -> None:
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
 
+def _dispatch_keyboard_shortcut(keycode: int, flags) -> None:
+    """Synthesizes a keyboard shortcut (e.g. Cmd+L) via the same low-level
+    Quartz event APIs _dispatch_click uses, for the same reason: it behaves
+    like a real keypress regardless of focus/routing quirks that an
+    AppleScript System Events keystroke can run into."""
+    key_down = Quartz.CGEventCreateKeyboardEvent(None, keycode, True)
+    Quartz.CGEventSetFlags(key_down, flags)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_down)
+    time.sleep(0.05)
+    key_up = Quartz.CGEventCreateKeyboardEvent(None, keycode, False)
+    Quartz.CGEventSetFlags(key_up, flags)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_up)
+
+
+# Some apps expose a keyboard shortcut that opens their search UI already
+# focused, sidestepping the need to click a small icon at all. Added after
+# measuring that vision's coordinate guessing for Spotify's collapsed
+# magnifying-glass icon has a real accuracy ceiling, not just noise: against
+# a known crop with a known ground-truth icon location, both a generic
+# description and a much more specific one landed on the same wrong spot
+# 7/7 tries - confidently and repeatably wrong, which iterative zooming
+# can't fix since zooming only helps when the miss is noise, not a
+# consistent misidentification. Not yet wired into type_in_field.
+#
+# Cmd+L is Spotify's real search shortcut - confirmed directly by reading
+# Spotify's own Edit menu via the Accessibility API (AXMenuItemCmdChar /
+# AXMenuItemCmdModifiers on the "Search" menu item), not assumed. Keycode
+# 37 is 'L' on a standard US keyboard layout.
+_APP_SEARCH_SHORTCUTS = {
+    "Spotify": (37, Quartz.kCGEventFlagMaskCommand),
+}
+
+
 # Descriptions that plausibly name a search entry point that might currently
 # be a collapsed icon rather than an open, visible field - e.g. Spotify's
 # Home view shows only a magnifying-glass icon until it's clicked. Confirmed
