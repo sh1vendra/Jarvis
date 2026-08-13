@@ -908,6 +908,30 @@ def _verify_click_outcome(
     return happened, detail
 
 
+# Grid-click-and-verify: for targets where a single vision coordinate guess
+# has already been measured unreliable (Spotify's search results - see
+# planning.md), rather than trying to make one guess more precise, try a
+# small number of candidate points around the guess and use the outcome
+# verification above (already proven reliable via real state checks) to
+# detect which one, if any, actually worked. Not yet wired into click_ui.
+_GRID_SEARCH_MAX_ATTEMPTS = 5
+_GRID_SEARCH_SPACING = 120.0  # points between adjacent candidates
+
+
+def _generate_grid_candidates(center_x: float, center_y: float, spacing: float) -> list[tuple[float, float]]:
+    """5-point cross pattern - center first (vision's own best guess is
+    still the single most likely candidate), then one spacing-unit up,
+    down, left, and right. Tried in this order so a near-miss in any one
+    direction is covered without needing a full grid."""
+    return [
+        (center_x, center_y),
+        (center_x, center_y - spacing),
+        (center_x, center_y + spacing),
+        (center_x - spacing, center_y),
+        (center_x + spacing, center_y),
+    ]
+
+
 def click_ui(target_description: str, expected_app_name: str, expected_outcome: str) -> dict:
     """Clicks a UI element described in plain language, in a specific app,
     and verifies the click actually produced its intended effect.
