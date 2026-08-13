@@ -19,7 +19,7 @@ from datetime import datetime
 
 import dateparser
 import Quartz
-from AppKit import NSScreen, NSWorkspace
+from AppKit import NSScreen
 from google import genai
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
@@ -143,13 +143,36 @@ create_reminder_tool = FunctionTool(create_reminder)
 
 
 def _frontmost_app_name() -> str | None:
-    """Returns the localized name of the currently frontmost app, e.g.
-    'Spotify', straight from AppKit's NSWorkspace - the same source macOS
-    itself uses to track window focus. This is the real signal for "is this
-    app actually in the foreground," independent of whether our own launch
-    command exited 0 or which app we intended to bring forward."""
-    app = NSWorkspace.sharedWorkspace().frontmostApplication()
-    return app.localizedName() if app else None
+    """Returns the name of the currently frontmost app via a fresh System
+    Events query.
+
+    This used to go through AppKit's NSWorkspace.frontmostApplication()
+    in-process, which turned out to be the actual root cause of a long,
+    confusing chase: in a script that fires many subprocess calls back to
+    back (exactly what open_app's poll loop and a real ADK agent run both
+    do), that in-process cached value can go stale and then never update
+    again for the rest of the process's lifetime - confirmed directly by
+    polling it for 15+ seconds while the real frontmost app (verified via
+    an independent System Events query at the same moments) had already
+    changed. It looked exactly like "the other app keeps stealing focus
+    back," but the other app had actually quit already; we were just
+    reading a frozen value. Querying via a brand new `osascript` process
+    each time has no such cache to go stale - each call is a fresh,
+    real answer.
+    """
+    result = subprocess.run(
+        [
+            "osascript",
+            "-e",
+            'tell application "System Events" to get name of first application process whose frontmost is true',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
 
 
 def open_app(app_name: str) -> dict:
