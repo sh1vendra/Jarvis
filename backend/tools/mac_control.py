@@ -360,6 +360,43 @@ def _ask_vision_for_coordinates(target_description: str) -> tuple[float, float] 
     return pixel_x / scale, pixel_y / scale
 
 
+def _crop_image(
+    image_bytes: bytes, center_x: float, center_y: float, crop_width: float, crop_height: float
+) -> tuple[bytes, float, float]:
+    """Crops a PNG (in pixel space, e.g. a full-screen screenshot) to a
+    crop_width x crop_height box centered on (center_x, center_y).
+
+    The box is clamped to stay fully within the source image's bounds
+    rather than letting PIL pad an off-edge crop with black - a black band
+    could easily be mistaken by vision for actual (dark) screen content.
+
+    Returns (cropped_png_bytes, left, top). (left, top) is the crop box's
+    origin in the *original* image's pixel space - callers need this to
+    translate any coordinate vision reports relative to the crop back into
+    the original image's coordinate system, since vision only ever sees
+    the cropped image and has no idea it was cropped from something larger.
+    """
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_width, img_height = img.size
+
+    left = max(0.0, min(center_x - crop_width / 2, img_width - crop_width))
+    top = max(0.0, min(center_y - crop_height / 2, img_height - crop_height))
+    right = left + crop_width
+    bottom = top + crop_height
+
+    cropped = img.crop((int(left), int(top), int(right), int(bottom)))
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG")
+    return buf.getvalue(), left, top
+
+
+def _translate_crop_coords(crop_x: float, crop_y: float, crop_left: float, crop_top: float) -> tuple[float, float]:
+    """Converts a coordinate vision reported relative to a cropped image's
+    own top-left origin back into the original (uncropped) image's pixel
+    space, by adding back the crop's offset."""
+    return crop_x + crop_left, crop_y + crop_top
+
+
 def _dispatch_click(x: float, y: float) -> None:
     """Synthesizes a real left-click at (x, y) in point-space using Quartz's
     low-level event APIs (CGEventCreateMouseEvent + CGEventPost), the same
