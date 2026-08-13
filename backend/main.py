@@ -14,7 +14,7 @@ from google.genai import types
 
 from agents.action import action_agent
 from agents.orchestrator import orchestrator_agent
-from agents.planner import MilestonePlan
+from agents.planner import Milestone, MilestonePlan
 
 # Load GOOGLE_API_KEY (and anything else) from .env before any ADK/Gemini
 # calls are made.
@@ -74,15 +74,26 @@ async def run_command(runner: InMemoryRunner, session_id: str, text: str) -> Mil
     return None
 
 
-async def run_action(runner: InMemoryRunner, session_id: str, milestone_goal: str) -> None:
-    """Sends one milestone goal to the Action agent and prints the tool call
-    it makes plus the tool's own success/failure result."""
+async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milestone) -> None:
+    """Sends one milestone (goal + success_signal) to the Action agent and
+    prints the tool call it makes plus the tool's own success/failure
+    result.
+
+    success_signal is included alongside goal (not just goal alone) so the
+    Action agent has a concrete, observable description to draw on when it
+    has to fill in click_ui's expected_outcome argument - goal alone is
+    often the desired end state in general terms ("lo-fi music is
+    playing"), while success_signal is meant to already be the specific,
+    observable signal for it ("audio is playing and a lo-fi track is shown
+    as currently playing"), which is exactly what expected_outcome needs.
+    """
 
     print(f"\n{'-' * 60}")
-    print(f"ACTION AGENT MILESTONE: {milestone_goal!r}")
+    print(f"ACTION AGENT MILESTONE: {milestone.goal!r}")
     print("-" * 60)
 
-    message = types.Content(role="user", parts=[types.Part(text=milestone_goal)])
+    message_text = f"Goal: {milestone.goal}\nSuccess signal: {milestone.success_signal}"
+    message = types.Content(role="user", parts=[types.Part(text=message_text)])
 
     async for event in runner.run_async(
         user_id=USER_ID,
@@ -126,7 +137,7 @@ async def main() -> None:
         action_runner = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
         action_session = await action_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
         for milestone in plan.milestones:
-            await run_action(action_runner, action_session.id, milestone.goal)
+            await run_action(action_runner, action_session.id, milestone)
 
     # Full Spotify command, executed for real end to end: Orchestrator ->
     # Planner produces a milestone plan, then every milestone goes to the
