@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from datetime import datetime
@@ -837,9 +838,19 @@ _APP_PLAYER_STATE_CHECKS = {
 # being incorrectly judged by a check that has nothing to say about it.
 _PLAYBACK_OUTCOME_HINTS = ("play", "pause", "track", "song", "music")
 
+# Matches _PLAYBACK_OUTCOME_HINTS as whole words only, not substrings. Found
+# necessary directly: a plain `in` check matched "play" inside "playlist",
+# so an outcome like "the playlist page opens" (pure navigation, nothing to
+# do with playback) was wrongly gated into the player-state check, which
+# then reported a false "no playback change" for something player state
+# was never able to speak to in the first place.
+_PLAYBACK_OUTCOME_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(hint) for hint in _PLAYBACK_OUTCOME_HINTS) + r")\b"
+)
+
+
 def _looks_like_playback_outcome(text: str) -> bool:
-    lowered = text.lower()
-    return any(hint in lowered for hint in _PLAYBACK_OUTCOME_HINTS)
+    return bool(_PLAYBACK_OUTCOME_PATTERN.search(text.lower()))
 
 
 def _verify_click_outcome(
