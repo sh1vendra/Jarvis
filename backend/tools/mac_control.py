@@ -801,6 +801,113 @@ def _verify_text_entered(
     return visible, detail
 
 
+# A click's success signal depends entirely on what the click was supposed
+# to do - there's no single universal "did the click work" check the way
+# there was for typed text (which always has the same signal: did the
+# expected text appear). Two verification paths, tried in order:
+#
+# 1. OS-level state, when the app exposes one relevant to the requested
+#    outcome. Strictly more reliable than any screenshot-based check when
+#    available, since it reads the actual application state rather than
+#    inferring it from pixels. Currently only Spotify/playback is wired up.
+# 2. pixel-diff-then-vision-tiebreaker (same base pattern as
+#    _verify_text_entered), for everything else. The vision call is asked
+#    about the *specific* expected_outcome the caller supplied, not a
+#    generic "did this work" - a vague question is exactly what produced
+#    the measured false positive that motivated pixel-diff-first in the
+#    type_in_field case.
+_APP_PLAYER_STATE_CHECKS = {
+    "Spotify": _spotify_player_state,
+}
+
+# Outcome descriptions that plausibly concern playback, and therefore that
+# Spotify's real player state (rather than a screenshot) can actually speak
+# to. A click whose expected outcome is unrelated to playback (e.g. "the
+# Podcasts filter is selected") wouldn't be confirmed OR refuted by player
+# state, so it should fall through to the pixel-diff/vision path instead of
+# being incorrectly judged by a check that has nothing to say about it.
+_PLAYBACK_OUTCOME_HINTS = ("play", "pause", "track", "song", "music")
+
+
+def _looks_like_playback_outcome(text: str) -> bool:
+    lowered = text.lower()
+    return any(hint in lowered for hint in _PLAYBACK_OUTCOME_HINTS)
+
+
+def _verify_click_outcome(
+    app_name: str,
+    expected_outcome: str,
+    before_player_state: dict | None,
+    before_region_png: bytes,
+    region_center: tuple[float, float],
+) -> tuple[bool, str]:
+    """Confirms a click actually produced its intended outcome, instead of
+    reporting success just because a click was dispatched without erroring.
+
+    before_player_state is the app's OS-level state (if any) captured
+    *before* the click - passed in rather than queried here so the caller
+    controls exactly when the "before" snapshot is taken relative to the
+    click. Not yet called by click_ui.
+    """
+    state_check = _APP_PLAYER_STATE_CHECKS.get(app_name)
+    if state_check is not None and before_player_state is not None and _looks_like_playback_outcome(expected_outcome):
+        after_player_state = state_check()
+        if after_player_state is not None:
+            changed = _spotify_playback_changed(before_player_state, after_player_state)
+            detail = (
+                f"Spotify's real player state before={before_player_state}, after={after_player_state}"
+            )
+            if changed:
+                return True, f"confirmed via Spotify's player state - {detail}"
+            return False, f"no playback change per Spotify's player state - {detail}"
+        # State check returned nothing usable - fall through to the
+        # screenshot-based path rather than treating that as a hard failure.
+
+    x, y = region_center
+    width, height = _VERIFY_REGION_SIZE
+    after_region_png = capture_region(x, y, width, height)
+    diff_score = _region_pixel_diff_score(before_region_png, after_region_png)
+
+    if diff_score < _NO_CHANGE_DIFF_THRESHOLD:
+        return False, (
+            f"no visual change detected near the click point (diff score {diff_score:.2f}) "
+            "- the click likely missed its target"
+        )
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-flash-lite-latest",
+        contents=[
+            genai_types.Part.from_bytes(data=after_region_png, mime_type="image/png"),
+            (
+                f"This screenshot was taken right after a click that was expected to cause: "
+                f"{expected_outcome!r}. Does this image show that this specific expected "
+                "outcome actually happened - not just that something changed, but that this "
+                'particular outcome did? Reply with ONLY raw JSON (no markdown fences): '
+                '{"outcome_happened": true or false}'
+            ),
+        ],
+    )
+    text = response.text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        parsed = json.loads(text)
+        happened = bool(parsed.get("outcome_happened"))
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        happened = False
+
+    detail = (
+        f"visual change detected near the click (diff score {diff_score:.2f}) and vision "
+        f"confirms {expected_outcome!r} happened"
+        if happened
+        else f"visual change detected near the click (diff score {diff_score:.2f}) but vision "
+        f"could not confirm {expected_outcome!r} happened"
+    )
+    return happened, detail
+
+
 def click_ui(target_description: str, expected_app_name: str) -> dict:
     """Clicks a UI element described in plain language, in a specific app.
 
