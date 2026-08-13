@@ -13,6 +13,7 @@ System Settings -> Privacy & Security -> Automation.
 import difflib
 import io
 import json
+import logging
 import os
 import subprocess
 import time
@@ -27,6 +28,8 @@ from google.genai import types as genai_types
 from PIL import Image, ImageChops
 
 from .perception import capture_region, capture_screenshot, get_field_values, get_ui_tree
+
+logger = logging.getLogger(__name__)
 
 
 def _build_applescript(task: str, due_date: datetime, list_name: str) -> str:
@@ -395,11 +398,20 @@ def _locate_via_vision_zoom(
     full_screenshot = capture_screenshot()
     coords = _ask_vision_for_coordinates_in_image(full_screenshot, target_description)
     if coords is None:
+        logger.info("zoom search for %r: initial whole-screen guess failed", target_description)
         return None
+    logger.info("zoom search for %r: level 0 (whole screen) guess = (%.0f, %.0f)", target_description, *coords)
 
     crop_width, crop_height = _ZOOM_CROP_SIZE
-    for _ in range(max_iterations):
+    for level in range(1, max_iterations + 1):
         if crop_width <= _ZOOM_TIGHT_THRESHOLD or crop_height <= _ZOOM_TIGHT_THRESHOLD:
+            logger.info(
+                "zoom search for %r: stopping before level %d - crop %.0fx%.0f already at/below tight threshold",
+                target_description,
+                level,
+                crop_width,
+                crop_height,
+            )
             break
 
         cropped_bytes, crop_left, crop_top = _crop_image(full_screenshot, coords[0], coords[1], crop_width, crop_height)
@@ -407,14 +419,27 @@ def _locate_via_vision_zoom(
         if refined is None:
             # This zoom level's vision call failed - keep the last good
             # guess rather than discarding all refinement progress so far.
+            logger.info("zoom search for %r: level %d vision call failed, keeping prior guess", target_description, level)
             break
 
         coords = _translate_crop_coords(refined[0], refined[1], crop_left, crop_top)
+        logger.info(
+            "zoom search for %r: level %d crop=%.0fx%.0f at (%.0f, %.0f) -> guess = (%.0f, %.0f)",
+            target_description,
+            level,
+            crop_width,
+            crop_height,
+            crop_left,
+            crop_top,
+            *coords,
+        )
         crop_width /= _ZOOM_SHRINK_FACTOR
         crop_height /= _ZOOM_SHRINK_FACTOR
 
     scale = _screen_scale_factor()
-    return coords[0] / scale, coords[1] / scale
+    final = (coords[0] / scale, coords[1] / scale)
+    logger.info("zoom search for %r: final point-space coordinates = (%.0f, %.0f)", target_description, *final)
+    return final
 
 
 def _crop_image(
