@@ -291,20 +291,73 @@ the keyboard-shortcut fallback and its three bug fixes)*
 
 ---
 
-## Known gap surfaced, not yet fixed: `click_ui` doesn't verify its own outcome
+## `click_ui` gains outcome verification: OS-level state first, pixel-diff-plus-vision fallback second
 
-**What we found:** Running the full three-milestone Spotify command through
-the real agent chain (`open_app` -> `type_in_field` -> `click_ui`),
+**What we found (recap):** Running the full three-milestone Spotify command
+through the real agent chain (`open_app` -> `type_in_field` -> `click_ui`),
 `click_ui` reported `success: True` for clicking "first search result play
 button" - but a screenshot taken immediately afterward showed the previous
 track was still the one playing; nothing new had started. `click_ui`
-dispatches a click at a vision-guessed coordinate and reports success as
-soon as the click is sent, with no equivalent to `type_in_field`'s
-`_verify_text_entered` step checking whether the click actually landed on
-anything real.
+dispatched a click at a vision-guessed coordinate and reported success as
+soon as the click was sent, with no equivalent to `type_in_field`'s
+`_verify_text_entered` step. This entry covers the fix.
 
-**Why this wasn't fixed here:** Out of scope for this build step, which was
-specifically about `type_in_field`'s click-precision problem. Recorded here
-so it isn't silently lost - `click_ui` needs the same category of fix
-`type_in_field` already got (Bug 2, above): don't report success just
-because the action was dispatched without erroring.
+**Decision:** `click_ui` now takes a required `expected_outcome` argument
+(the specific, observable effect the click should cause) and verifies it
+via `_verify_click_outcome`, in two tiers: (1) an app's real OS-level state,
+when one is registered (`_APP_PLAYER_STATE_CHECKS`, currently Spotify's
+player state via AppleScript) *and* `expected_outcome` plausibly concerns
+that state (`_looks_like_playback_outcome`); (2) otherwise, the same
+pixel-diff-then-vision-tiebreaker pattern `_verify_text_entered` already
+uses, except the vision question is anchored on the caller's specific
+`expected_outcome` rather than a generic "did this work."
+
+**Why click verification needed a different strategy than type verification:**
+Typed text has one universal success signal - did the expected text appear
+in the field, checkable by diffing/reading the same location before and
+after. A click's success signal depends entirely on what the click was
+*for* - playing audio changes an OS-level playback state (and maybe an
+icon, but not reliably at pixel level - Spotify's play/pause glyph is a
+subtle vector-icon swap, not a big visual change on its own); selecting a
+search result might navigate to a whole new page; toggling a checkbox
+changes one small visual region. There's no single before/after check that
+covers all of these, so unlike `_verify_text_entered`, `_verify_click_outcome`
+can't assume it knows what "changed" should look like - it has to be told
+(`expected_outcome`), and use whatever signal is actually strongest for
+that specific outcome.
+
+**Why OS-level state is preferred over vision when available:** A real
+state query reads the actual thing that matters (is Spotify actually
+playing, and what track) directly from the source of truth, with no
+inference step in between - it can't be confused by an unrelated visual
+change nearby, can't hallucinate, and doesn't depend on screen layout at
+all. Pixel-diff-plus-vision is a good fallback when no such state exists to
+query, but it's still inference from pixels; OS state is ground truth.
+Measured directly: a real click on Spotify's play/pause control was
+confirmed via player state transitioning `paused` -> `playing` with *no
+vision call made at all* - the state check resolved it on its own.
+
+**Why the OS-state check is gated by `_looks_like_playback_outcome`, not
+just "is this app Spotify":** Spotify's player state has nothing useful to
+say about a click whose real goal is unrelated to playback (e.g. selecting
+a filter tab) - trusting it unconditionally for every Spotify click would
+turn "no playback change" into a false failure for clicks that were never
+about playback in the first place. Gating on whether `expected_outcome`
+itself plausibly concerns playback keeps the OS-state check from being
+applied to outcomes it has no authority to judge, falling through to
+pixel-diff/vision instead for those.
+
+**Constraint:** Verified both directions live, not just the happy path -
+a genuine positive (a real click on Spotify's play control, confirmed via
+`before`/`after` player-state snapshots showing `paused` -> `playing`) and
+a genuine negative (a real click on an unrelated element - a playlist tile
+- while claiming a playback outcome, confirmed the tool correctly reported
+`success: False` because player state genuinely didn't change, not because
+the click missed its own real target).
+
+**What we didn't do:** Didn't build a generic "any outcome, any app" state
+registry - `_APP_PLAYER_STATE_CHECKS` only has Spotify's player state for
+now, added because it's the concrete case that motivated this work. Didn't
+try to make the OS-state check universal by inferring intent automatically
+across arbitrary apps - `_looks_like_playback_outcome`'s keyword gate is a
+narrow, explicit check, not a general outcome-classifier.

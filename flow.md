@@ -189,13 +189,52 @@ or `"keyboard_shortcut"`) actually resolved the target in their returned
 `tier` field, and `verifier_callbacks.py` surfaces that in its log line so
 it's visible during a live run which path a given interaction actually took.
 
-**Known gap:** `click_ui` has no equivalent of `_verify_text_entered` - it
-reports `success: True` as soon as a click is dispatched, regardless of
-whether it landed on anything real. Confirmed directly: in a full
-end-to-end run, `click_ui` reported success clicking Spotify's "first
-search result play button," but a screenshot taken right after showed the
-previously-playing track unchanged - nothing had actually started. See
-`planning.md`'s entry on this.
+**`click_ui`'s `_verify_click_outcome(app_name, expected_outcome,
+before_player_state, before_region_png, region_center)`** verifies a click
+actually produced its intended effect, instead of reporting success as soon
+as the click is dispatched (the gap that let `click_ui` once falsely report
+success clicking Spotify's "first search result play button" while the
+previously-playing track kept playing unchanged - see `planning.md`).
+Unlike typed text, a click has no single universal success signal - what
+"worked" depends entirely on what the click was for - so `click_ui` now
+takes a required `expected_outcome` argument (the specific, observable
+effect the click should cause, e.g. "a lo-fi track starts playing") and
+verifies it in two tiers:
+
+- **Tier A - OS-level state**, when the target app has one registered
+  (`_APP_PLAYER_STATE_CHECKS`, currently `{"Spotify":
+  _spotify_player_state}`) *and* `expected_outcome` plausibly concerns what
+  that state covers (`_looks_like_playback_outcome`, a keyword gate against
+  "play"/"pause"/"track"/"song"/"music"). `_spotify_player_state()` queries
+  Spotify's real `player state` and current track via AppleScript;
+  `_spotify_playback_changed(before, after)` compares a before/after pair -
+  true if playback started (`player_state` transitioned into `"playing"`)
+  or the loaded track itself changed. This reads the actual application
+  state directly, with no screenshot or inference involved, and is
+  strictly more reliable than any vision-based check when available -
+  confirmed directly: a real click on Spotify's play control resolved via
+  `paused` -> `playing` with no vision call made at all.
+- **Tier B - pixel-diff-then-vision-tiebreaker** (same base pattern as
+  `_verify_text_entered`), used when no state check is registered, the
+  outcome doesn't concern what the registered check covers, or the state
+  check itself returns nothing usable. The vision call is anchored on the
+  caller's specific `expected_outcome` ("does this image show that this
+  particular outcome happened") rather than a generic "did this work" -
+  asking a vague question is exactly what produced the measured false
+  positive that motivated pixel-diff-first for `type_in_field` in the
+  first place.
+
+`click_ui` captures `before_player_state` (via the registered state check,
+if any) and `before_region_png` *before* dispatching the click, exactly
+like `type_in_field` does for its own before/after diff.
+
+`agents/action.py`'s instruction tells the Action agent to derive
+`expected_outcome` from the current milestone's `success_signal` when one
+already describes the click's effect - `main.run_action` now sends both
+`goal` and `success_signal` to the Action agent (previously only `goal`),
+specifically so this concrete, observable description is available to fill
+in `expected_outcome` rather than the agent having to invent one from the
+goal text alone.
 
 ## 7. Reminders path (simpler, no perception needed)
 
