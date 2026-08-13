@@ -15,7 +15,6 @@ import tempfile
 import time
 
 import ApplicationServices as AS
-from AppKit import NSWorkspace
 
 # Roles worth surfacing to the caller - purely structural containers
 # (AXGroup, AXScrollArea, AXUnknown, ...) are skipped since they're never
@@ -40,10 +39,35 @@ _CACHE_TTL_SECONDS = 2.0
 
 
 def _pid_for_app(app_name: str) -> int | None:
-    for app in NSWorkspace.sharedWorkspace().runningApplications():
-        if app.localizedName() == app_name:
-            return app.processIdentifier()
-    return None
+    """Returns app_name's process ID via a fresh System Events query.
+
+    Not NSWorkspace.sharedWorkspace().runningApplications() - that was
+    measured to go stale under the same subprocess-heavy conditions that
+    caused mac_control._frontmost_app_name's staleness bug (see that
+    function's docstring for the original diagnosis). Confirmed directly
+    here too: after quitting and relaunching an app a few times in one
+    long-running process, this kept returning the *previous* instance's
+    already-dead PID instead of the new one, which meant every AX query
+    built on top of it (get_ui_tree, get_field_values,
+    get_frontmost_window_frame) was silently querying a process that no
+    longer existed. A fresh osascript query each call has no such cache.
+    """
+    result = subprocess.run(
+        [
+            "osascript",
+            "-e",
+            f'tell application "System Events" to get unix id of first process whose name is "{app_name}"',
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
 
 
 def _ax_attr(element, attribute):
