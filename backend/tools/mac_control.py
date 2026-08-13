@@ -897,9 +897,18 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
 
     tier_label = "keyboard_shortcut" if used_shortcut else located["tier"]
     if used_shortcut:
+        # located["tier"] can still be "vision" here if the window-frame
+        # lookup (with its retries) genuinely didn't resolve in time and
+        # _locate_element's fallback ran instead - say so plainly rather
+        # than always claiming the window-frame anchor was used.
+        region_source = (
+            "the app's own window frame"
+            if located["tier"] == "window_frame"
+            else f"a fallback {located['tier']} lookup, since the window frame wasn't available in time"
+        )
         tier_detail = (
             f"opened via {expected_app_name}'s keyboard shortcut instead of clicking a small icon; "
-            f"verification region anchored on the app's own window frame ({located['tier']})"
+            f"verification region anchored on {region_source}"
         )
     elif located["tier"] == "accessibility":
         tier_detail = f"matched AX label '{located['matched_label']}' (score {located['match_score']})"
