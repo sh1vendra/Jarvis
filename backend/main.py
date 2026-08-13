@@ -152,7 +152,7 @@ async def main() -> None:
         action_runner2 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
         action_session2 = await action_runner2.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
         for milestone in spotify_plan.milestones:
-            await run_action(action_runner2, action_session2.id, milestone.goal)
+            await run_action(action_runner2, action_session2.id, milestone)
 
 
 if __name__ == "__main__":
