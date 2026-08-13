@@ -27,7 +27,7 @@ from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 from PIL import Image, ImageChops
 
-from .perception import capture_region, capture_screenshot, get_field_values, get_ui_tree
+from .perception import capture_region, capture_screenshot, get_field_values, get_frontmost_window_frame, get_ui_tree
 
 logger = logging.getLogger(__name__)
 
@@ -556,12 +556,18 @@ def _looks_collapsible(target_description: str) -> bool:
     return any(hint in lowered for hint in _COLLAPSIBLE_FIELD_HINTS)
 
 
-def _locate_element(app_name: str, target_description: str, roles: set[str] | None = None) -> dict:
+def _locate_element(
+    app_name: str, target_description: str, roles: set[str] | None = None, skip_reveal: bool = False
+) -> dict:
     """Runs the two-tier location strategy and returns a dict describing
     what was found and how: {"x", "y", "tier": "accessibility" | "vision",
     "reveal_expanded": bool} or {"error": str} if both tiers failed.
     reveal_expanded is only ever True for the vision tier - see
-    _looks_collapsible."""
+    _looks_collapsible. skip_reveal forces the click-to-reveal step off even
+    for a collapsible-looking description - used when the caller already
+    knows the field is open (e.g. opened via a keyboard shortcut instead of
+    a click) and an extra speculative click here would risk landing on the
+    now-open UI unpredictably."""
     element, score = _best_ax_match(app_name, target_description, roles)
     if element is not None:
         return {
@@ -584,7 +590,7 @@ def _locate_element(app_name: str, target_description: str, roles: set[str] | No
         return {"error": f"Could not locate '{target_description}' via accessibility or vision."}
 
     reveal_expanded = False
-    if _looks_collapsible(target_description):
+    if not skip_reveal and _looks_collapsible(target_description):
         # The first guess might be a collapsed icon, not the real field -
         # click it, give the UI a moment to expand, then re-run the zoom
         # search against a fresh screenshot rather than trusting the first
@@ -801,14 +807,52 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
     if guard_error is not None:
         return guard_error
 
-    located = _locate_element(expected_app_name, target_description, roles={"AXTextField", "AXSearchField"})
-    if "error" in located:
-        # Text fields are frequently mislabeled/unlabeled even in apps with
-        # otherwise decent AX trees (we saw this with Spotify's search box),
-        # so if a role-restricted AX search fails, retry without the role
-        # filter before giving up to vision - a field's fuzzy-matched label
-        # is still useful signal even if its AXRole wasn't what we expected.
-        located = _locate_element(expected_app_name, target_description)
+    # If this app has a known keyboard shortcut for the kind of field we're
+    # after, use it instead of clicking - see _APP_SEARCH_SHORTCUTS for why.
+    # The shortcut opens the field already focused, so no click is needed.
+    shortcut = _APP_SEARCH_SHORTCUTS.get(expected_app_name)
+    used_shortcut = shortcut is not None and _looks_collapsible(target_description)
+
+    if used_shortcut:
+        _dispatch_keyboard_shortcut(*shortcut)
+        time.sleep(0.4)  # let the now-expanded search UI finish rendering
+
+    # We still need an approximate location to build the before/after
+    # verification region below. Re-running the vision zoom search for that
+    # purpose was measured to be just as unreliable as locating the
+    # original icon - it guessed everywhere from mid-window to the window's
+    # bottom edge, nowhere near the actual search bar. A window's own
+    # AX-reported frame doesn't depend on vision at all, so prefer it when
+    # we have a known offset for this app.
+    located = None
+    if used_shortcut:
+        field_offset = _APP_SEARCH_FIELD_OFFSET.get(expected_app_name)
+        window_frame = get_frontmost_window_frame(expected_app_name) if field_offset else None
+        if window_frame is not None:
+            win_x, win_y, win_w, _win_h = window_frame
+            x_fraction, y_offset = field_offset
+            located = {
+                "x": win_x + win_w * x_fraction,
+                "y": win_y + y_offset,
+                "tier": "window_frame",
+                "reveal_expanded": False,
+            }
+
+    if located is None:
+        # skip_reveal=True when used_shortcut, since the field is already
+        # open - an extra speculative reveal-click here would land blind on
+        # the now-open UI instead of the collapsed icon it's meant for.
+        located = _locate_element(
+            expected_app_name, target_description, roles={"AXTextField", "AXSearchField"}, skip_reveal=used_shortcut
+        )
+        if "error" in located:
+            # Text fields are frequently mislabeled/unlabeled even in apps
+            # with otherwise decent AX trees (we saw this with Spotify's
+            # search box), so if a role-restricted AX search fails, retry
+            # without the role filter before giving up to vision - a
+            # field's fuzzy-matched label is still useful signal even if
+            # its AXRole wasn't what we expected.
+            located = _locate_element(expected_app_name, target_description, skip_reveal=used_shortcut)
     if "error" in located:
         return {"success": False, "message": located["error"], "tier": None, "error": located["error"]}
 
@@ -819,8 +863,9 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
     region_center = (located["x"], located["y"])
     before_region_png = capture_region(*region_center, *_VERIFY_REGION_SIZE)
 
-    _dispatch_click(located["x"], located["y"])
-    time.sleep(0.2)  # give the field a moment to actually gain focus
+    if not used_shortcut:
+        _dispatch_click(located["x"], located["y"])
+        time.sleep(0.2)  # give the field a moment to actually gain focus
 
     # Typing via the clipboard (pbcopy + Cmd+V) is far more reliable than
     # synthesizing one CGEvent per character: it doesn't depend on mapping
@@ -837,7 +882,13 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
     Quartz.CGEventSetFlags(key_up, Quartz.kCGEventFlagMaskCommand)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_up)
 
-    if located["tier"] == "accessibility":
+    tier_label = "keyboard_shortcut" if used_shortcut else located["tier"]
+    if used_shortcut:
+        tier_detail = (
+            f"opened via {expected_app_name}'s keyboard shortcut instead of clicking a small icon; "
+            f"verification region anchored on the app's own window frame ({located['tier']})"
+        )
+    elif located["tier"] == "accessibility":
         tier_detail = f"matched AX label '{located['matched_label']}' (score {located['match_score']})"
     elif located.get("reveal_expanded"):
         tier_detail = "used Gemini vision - first click revealed a collapsed field, then vision re-located it"
@@ -855,20 +906,20 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
         return {
             "success": False,
             "message": (
-                f"Typed into '{target_description}' via {located['tier']} tier ({tier_detail}), "
+                f"Typed into '{target_description}' via {tier_label} ({tier_detail}), "
                 f"but could not verify the text actually landed: {verify_detail}."
             ),
-            "tier": located["tier"],
+            "tier": tier_label,
             "error": "type_not_verified",
         }
 
     return {
         "success": True,
         "message": (
-            f"Typed into '{target_description}' via {located['tier']} tier ({tier_detail}); "
+            f"Typed into '{target_description}' via {tier_label} ({tier_detail}); "
             f"verified: {verify_detail}."
         ),
-        "tier": located["tier"],
+        "tier": tier_label,
         "error": None,
     }
 
