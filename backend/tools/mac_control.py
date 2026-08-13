@@ -677,7 +677,16 @@ def _spotify_player_state() -> dict | None:
         "end try\n"
         "end tell"
     )
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    # Found necessary directly: under rapid repeated queries (e.g. a grid
+    # search's several attempts in quick succession), osascript occasionally
+    # hangs past the timeout rather than erroring cleanly - an uncaught
+    # subprocess.TimeoutExpired here would crash the entire caller instead
+    # of degrading to "state unknown" the way every other failure mode
+    # already does.
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0:
         return None
     parts = result.stdout.strip().split("|||")
@@ -827,7 +836,6 @@ _APP_PLAYER_STATE_CHECKS = {
 # state, so it should fall through to the pixel-diff/vision path instead of
 # being incorrectly judged by a check that has nothing to say about it.
 _PLAYBACK_OUTCOME_HINTS = ("play", "pause", "track", "song", "music")
-
 
 def _looks_like_playback_outcome(text: str) -> bool:
     lowered = text.lower()
