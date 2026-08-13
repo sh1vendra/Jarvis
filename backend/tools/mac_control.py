@@ -376,24 +376,34 @@ def _ask_vision_for_coordinates(target_description: str) -> tuple[float, float] 
 
 
 _ZOOM_CROP_SIZE = (600.0, 400.0)  # pixel width/height of the first zoomed-in crop
+_ZOOM_SHRINK_FACTOR = 2.0  # each subsequent zoom level crops half as wide/tall as the last
+_ZOOM_TIGHT_THRESHOLD = 180.0  # stop zooming once a crop would be this small (pixels) or smaller
+_MAX_ZOOM_ITERATIONS = 2  # caps total vision calls at 3 (1 whole-screen + up to 2 crops)
 
 
-def _locate_via_vision_zoom(target_description: str) -> tuple[float, float] | None:
-    """First iteration of an iterative crop-and-zoom vision search, meant to
-    replace _ask_vision_for_coordinates's single whole-screen guess for
-    small UI elements - measured directly, a whole-screen guess for
-    Spotify's collapsed search icon landed ~100pt off the real element.
+def _locate_via_vision_zoom(
+    target_description: str, max_iterations: int = _MAX_ZOOM_ITERATIONS
+) -> tuple[float, float] | None:
+    """Iteratively zooms in on a screenshot to get a more precise coordinate
+    guess for small UI elements than a single whole-screen vision call can
+    reliably give - measured directly, a whole-screen guess for Spotify's
+    collapsed search icon landed ~100pt off the real element.
 
-    Step 1: ask vision for a rough guess against the whole screenshot, same
-    as _ask_vision_for_coordinates_in_image does today.
-    Step 2: crop tightly around that guess and ask again on the smaller
-    image - the same element now occupies a much larger fraction of what
-    vision sees, which should make this second guess more precise.
+    Each iteration: crop tightly around the current best guess and ask
+    vision again on the smaller image - the same element occupies a much
+    larger fraction of what vision sees there, which should make each
+    successive guess more precise. Every crop is taken from the *original*
+    full screenshot (not crop-of-crop) so each iteration's answer only ever
+    needs one offset translation back to full-screenshot pixel space,
+    rather than compounding rounding error across nested crops. Capped at
+    max_iterations zoom levels (on top of the initial whole-screen guess) so
+    this can't spiral into unbounded latency, and stops early once the crop
+    would already be tighter than _ZOOM_TIGHT_THRESHOLD - a crop that small
+    has nothing meaningful left to zoom into.
 
-    Returns pixel-space coordinates in the *original* full screenshot's
-    coordinate system (not yet converted to point-space). Not wired into
-    click_ui/type_in_field yet - this only covers the first zoom level; a
-    second, tighter level and the final point-space conversion come next.
+    Returns final coordinates in point-space (already divided by the Retina
+    scale factor, ready for _dispatch_click), or None if even the initial
+    whole-screen guess fails.
     """
     full_screenshot = capture_screenshot()
     coords = _ask_vision_for_coordinates_in_image(full_screenshot, target_description)
@@ -401,12 +411,23 @@ def _locate_via_vision_zoom(target_description: str) -> tuple[float, float] | No
         return None
 
     crop_width, crop_height = _ZOOM_CROP_SIZE
-    cropped_bytes, crop_left, crop_top = _crop_image(full_screenshot, coords[0], coords[1], crop_width, crop_height)
-    refined = _ask_vision_for_coordinates_in_image(cropped_bytes, target_description)
-    if refined is None:
-        return coords
+    for _ in range(max_iterations):
+        if crop_width <= _ZOOM_TIGHT_THRESHOLD or crop_height <= _ZOOM_TIGHT_THRESHOLD:
+            break
 
-    return _translate_crop_coords(refined[0], refined[1], crop_left, crop_top)
+        cropped_bytes, crop_left, crop_top = _crop_image(full_screenshot, coords[0], coords[1], crop_width, crop_height)
+        refined = _ask_vision_for_coordinates_in_image(cropped_bytes, target_description)
+        if refined is None:
+            # This zoom level's vision call failed - keep the last good
+            # guess rather than discarding all refinement progress so far.
+            break
+
+        coords = _translate_crop_coords(refined[0], refined[1], crop_left, crop_top)
+        crop_width /= _ZOOM_SHRINK_FACTOR
+        crop_height /= _ZOOM_SHRINK_FACTOR
+
+    scale = _screen_scale_factor()
+    return coords[0] / scale, coords[1] / scale
 
 
 def _crop_image(
