@@ -532,6 +532,15 @@ _APP_SEARCH_SHORTCUTS = {
     "Spotify": (37, Quartz.kCGEventFlagMaskCommand),
 }
 
+# Where the opened field lands, as an offset from its window's own top-left
+# corner (x as a fraction of window width, y as an absolute point offset
+# from the window's top edge) - confirmed directly by screenshotting right
+# after dispatching the shortcut: Spotify's search bar renders near the top
+# of its window, spanning most of its width. Not yet used by any caller.
+_APP_SEARCH_FIELD_OFFSET = {
+    "Spotify": (0.5, 65.0),
+}
+
 
 # Descriptions that plausibly name a search entry point that might currently
 # be a collapsed icon rather than an open, visible field - e.g. Spotify's

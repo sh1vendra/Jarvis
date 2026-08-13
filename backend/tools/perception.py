@@ -169,6 +169,36 @@ def get_field_values(app_name: str) -> list[str]:
     return values
 
 
+def get_frontmost_window_frame(app_name: str) -> tuple[float, float, float, float] | None:
+    """Returns (x, y, width, height) in point-space of app_name's frontmost
+    window via the Accessibility API, or None if the app/window can't be
+    found.
+
+    Unlike get_ui_tree's interior elements, a window's own frame is
+    OS-reported chrome info rather than app-internal content, so even apps
+    that expose almost nothing else via AX (Electron/Chromium apps like
+    Spotify) still expose this reliably. Not yet used by any caller - added
+    as a building block for locating UI that appears in a predictable spot
+    relative to the window (e.g. a search bar that opens via keyboard
+    shortcut), since asking vision to re-locate that kind of target was
+    measured to guess wildly inconsistent, sometimes off-window locations.
+    """
+    pid = _pid_for_app(app_name)
+    if pid is None:
+        return None
+
+    app_ref = AS.AXUIElementCreateApplication(pid)
+    windows = _ax_attr(app_ref, "AXWindows") or []
+    if not windows:
+        return None
+
+    position = _ax_point(windows[0])
+    size = _ax_size(windows[0])
+    if position is None or size is None:
+        return None
+    return (position[0], position[1], size[0], size[1])
+
+
 def capture_region(x: float, y: float, width: float, height: float) -> bytes:
     """Captures a rectangular region of the screen, centered on point-space
     coordinates (x, y), and returns PNG bytes.
