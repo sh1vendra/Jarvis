@@ -908,8 +908,9 @@ def _verify_click_outcome(
     return happened, detail
 
 
-def click_ui(target_description: str, expected_app_name: str) -> dict:
-    """Clicks a UI element described in plain language, in a specific app.
+def click_ui(target_description: str, expected_app_name: str, expected_outcome: str) -> dict:
+    """Clicks a UI element described in plain language, in a specific app,
+    and verifies the click actually produced its intended effect.
 
     Tries the Accessibility API first; falls back to a screenshot + Gemini
     vision if the element can't be found that way. Refuses to act if the
@@ -921,11 +922,17 @@ def click_ui(target_description: str, expected_app_name: str) -> dict:
             e.g. "search button", "first search result".
         expected_app_name: The app this click is meant for, e.g. "Spotify".
             Must currently be the frontmost app, or the call is refused.
+        expected_outcome: Plain-language description of what this click
+            should actually cause, e.g. "a lo-fi track starts playing" or
+            "the Podcasts filter becomes selected". Used to verify the
+            click worked - be specific about the real, observable effect,
+            not just that "the click succeeds".
 
     Returns:
         A dict with:
-            success: bool
-            message: human-readable summary, including which tier was used
+            success: bool, True only if the expected outcome was verified
+            message: human-readable summary, including which tier and
+                verification path were used
             tier: "accessibility" or "vision" if a click was dispatched, else None
             error: raw error string if something went wrong, else None
     """
@@ -937,7 +944,13 @@ def click_ui(target_description: str, expected_app_name: str) -> dict:
     if "error" in located:
         return {"success": False, "message": located["error"], "tier": None, "error": located["error"]}
 
+    region_center = (located["x"], located["y"])
+    before_region_png = capture_region(*region_center, *_VERIFY_REGION_SIZE)
+    state_check = _APP_PLAYER_STATE_CHECKS.get(expected_app_name)
+    before_player_state = state_check() if state_check is not None else None
+
     _dispatch_click(located["x"], located["y"])
+    time.sleep(0.3)  # give the UI/app state a moment to actually update
 
     if located["tier"] == "accessibility":
         tier_detail = f"matched AX label '{located['matched_label']}' (score {located['match_score']})"
@@ -946,9 +959,33 @@ def click_ui(target_description: str, expected_app_name: str) -> dict:
     else:
         tier_detail = "used Gemini vision on a screenshot"
 
+    # Don't report success just because the click was dispatched without
+    # erroring - confirm it actually produced expected_outcome. This is
+    # exactly the check that was missing when this tool once reported
+    # success clicking Spotify's "first search result play button" while
+    # the previously-playing track kept playing unchanged.
+    verified, verify_detail = _verify_click_outcome(
+        expected_app_name, expected_outcome, before_player_state, before_region_png, region_center
+    )
+
+    if not verified:
+        return {
+            "success": False,
+            "message": (
+                f"Clicked '{target_description}' via {located['tier']} tier ({tier_detail}) at "
+                f"({located['x']:.0f}, {located['y']:.0f}), but could not verify the expected "
+                f"outcome: {verify_detail}."
+            ),
+            "tier": located["tier"],
+            "error": "click_outcome_not_verified",
+        }
+
     return {
         "success": True,
-        "message": f"Clicked '{target_description}' via {located['tier']} tier ({tier_detail}) at ({located['x']:.0f}, {located['y']:.0f}).",
+        "message": (
+            f"Clicked '{target_description}' via {located['tier']} tier ({tier_detail}) at "
+            f"({located['x']:.0f}, {located['y']:.0f}); verified: {verify_detail}."
+        ),
         "tier": located["tier"],
         "error": None,
     }
