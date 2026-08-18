@@ -140,54 +140,49 @@ and `type_in_field`:
    after a fresh launch), since re-asking vision to relocate the *now-open*
    field was measured to be just as unreliable as the original icon lookup.
 
-   **Known limitation, still unresolved: clicking Spotify's first search
-   result.** Unlike the collapsed search icon, there's no keyboard-shortcut
-   escape hatch for "select and play the first result." Both location
-   strategies were retested specifically for this target, against a real,
-   independently-verified ground truth (a saved screenshot where clicking
-   a known point was confirmed via `_spotify_player_state()` to start real
-   playback): `_locate_via_vision_zoom` scored 0/10 within any usable
-   tolerance (errors 158-661pt, worse than the single-shot whole-screen
-   guess it's supposed to improve on), and a full unfiltered AX dump of the
-   search-results window (depth 25, no role filtering) found every node
-   unlabeled with empty leaves - genuinely nothing to read, not a filtering
-   artifact. See `planning.md`'s entry for the full numbers. `click_ui` is
-   not special-cased for this target - it still tries vision (Tier 2) and
-   will very likely mis-click, but its outcome verification (below) is what
-   keeps this honest: a live end-to-end run correctly reports
-   `click_outcome_not_verified` rather than a false success.
+   **Vision-based location of Spotify's search results never became
+   reliable, across three different approaches** - `_locate_via_vision_zoom`
+   (0/10 against a verified ground truth, errors 158-661pt),
+   `locate_and_click_via_grid_search` (1/3, then 0/5 against a cleaner
+   target - see below), and a full unfiltered AX dump (genuinely nothing
+   to read, not a filtering artifact). All three are documented in
+   `planning.md`. `locate_and_click_via_grid_search` still exists in
+   `mac_control.py` as a working, tested building block, but is **not
+   called from `click_ui` or anywhere else** - its hit rate never cleared
+   the bar to hand a real click through.
 
-   A third strategy, `locate_and_click_via_grid_search(app_name,
-   target_description, expected_outcome)`, was also tried and also
-   rejected - it exists in `mac_control.py` but is **not called from
-   `click_ui` or anywhere else**. Rather than trusting one vision
-   coordinate guess, it tries up to 5 candidate points (a cross pattern
-   around the guess, via `_generate_grid_candidates`) and reuses
-   `_verify_click_outcome` after each to detect a hit, stopping early on
-   success or on a wide-region diff suggesting an accidental navigation.
-   Tested twice: 1/3 against the genre-page target, then 0/5 after the
-   demo command changed to a query with a cleaner, more consistent target
-   (see below) - the cleaner target didn't help, since the root cause
-   turned out to be a systematic bias in vision's initial guess for "first
-   search result" (consistently landing in the same sidebar-adjacent
-   region regardless of query or actual layout), not per-image imprecision
-   a local grid could correct. Kept in the codebase as a working, tested
-   building block (and because it fixed two real bugs along the way - see
-   `planning.md`), but not wired in since its hit rate wasn't reliable
-   enough to hand a real click through.
+   **What actually resolved milestone 2, for this specific demo command:**
+   two changes together, not vision precision. First, the demo command
+   changed (`backend/main.py`) from `"open Spotify and play some lo-fi
+   music"` to `"open Spotify and play Billie Jean by Michael Jackson"` - a
+   specific track/artist query reliably surfaces Spotify's "Top result"
+   card (a persistent, always-visible play button), not a genre page's
+   navigate-only tiles. Second, `click_ui` special-cases this exact card:
+   `_APP_TOP_RESULT_OFFSET` (`{"Spotify": (0.56, 179.0)}`) plus
+   `_looks_like_top_result(target_description)` resolve its location via
+   `_locate_via_window_offset` (a window-frame offset, the same shape as
+   `_APP_SEARCH_FIELD_OFFSET`) instead of vision entirely, labeled
+   `tier: "fixed_offset"`. This card's position was independently verified
+   fixed at point (448, 218) across two different queries. **This is an
+   explicitly-documented demo-only simplification for one specific,
+   confirmed-fixed target, not a general fix for search-result click
+   precision** - implemented only after the user was asked and confirmed
+   it was an acceptable tradeoff (see `planning.md`).
 
-   **Demo command changed as a result** (`backend/main.py`): from `"open
-   Spotify and play some lo-fi music"` to `"open Spotify and play Billie
-   Jean by Michael Jackson"`. A specific track/artist query reliably
-   surfaces Spotify's "Top result" card - a persistent, always-visible
-   play button that starts playback on a single click, unlike a genre
-   query's tiles (click navigates, doesn't play - a structural mismatch
-   independent of click precision). This card's position was independently
-   confirmed at the same point-space coordinates, (448, 218), across two
-   different queries - the milestone-2 click still isn't reliably
-   automated (same vision unreliability as above applies to locating this
-   card too), but the *target* is now at least a real, single-click-away
-   one, which the earlier genre-page target structurally was not.
+   Getting the *full agent chain* (not just direct calls) to reliably
+   reach and use this took four more fixes, all found live: the Action
+   agent's instruction was ambiguous about "X is searched" milestones
+   (clarified to mean `type_in_field`, not `click_ui`); the top-result
+   matcher was broadened from exact-phrase to position-word-plus-noun-word
+   matching after the agent phrased it as "first track result" and missed
+   the original exact check; `type_in_field` now sends Cmd+A before every
+   paste (not just for Spotify) after a screenshot caught leftover search
+   text silently concatenating instead of being replaced; and
+   `type_in_field`'s Spotify-shortcut path now presses Return after
+   pasting, since a paste alone only populates the autocomplete dropdown,
+   never the actual results page the fixed offset targets. Full 3-run
+   result: 3/3, every run's final `click_ui` call verified via a genuine
+   `paused` -> `playing` transition read from Spotify's real player state.
 
 Every click is dispatched via `_dispatch_click` (raw Quartz
 `CGEventCreateMouseEvent`/`CGEventPost` at the HID event tap level, chosen

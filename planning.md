@@ -575,3 +575,98 @@ click precision, but a targeted, explicitly-documented simplification for
 this one demo command. Not implemented yet - flagged for a decision before
 building it, since hardcoding a coordinate is exactly the kind of
 technicality this whole project has been careful not to lean on silently.
+
+**User decision: build it.** Asked directly rather than assumed, given
+hardcoding a coordinate is exactly the kind of technicality this whole
+project has been careful about - confirmed go-ahead to implement, clearly
+documented as a known simplification.
+
+---
+
+## Fixed window-offset for Spotify's Top result card - implemented, and four more real bugs found getting the full chain to actually work
+
+**Decision:** `click_ui` now special-cases Spotify's Top result card via
+`_APP_TOP_RESULT_OFFSET` (`{"Spotify": (0.56, 179.0)}`, a window-frame
+offset in the same shape as `_APP_SEARCH_FIELD_OFFSET`) and
+`_looks_like_top_result(target_description)`. When both the app matches
+and the description plausibly refers to a top/first result, the location
+is resolved via `_locate_via_window_offset` (a new shared helper,
+factored out of the retry-loop pattern `type_in_field` already had inline
+for its own window-frame lookup) instead of vision - completely
+sidestepping the measured, systematic guess bias. Explicitly labeled
+`tier: "fixed_offset"` in every result so it's never confused with a real
+location strategy in logs or reports.
+
+**Verified in isolation first: 3/3**, each a genuine `paused` ->
+`playing` transition confirmed via `_spotify_player_state()`, not just
+"a click was dispatched."
+
+**Four more real bugs surfaced getting the *full agent chain* (not just
+direct isolated calls) to actually reach and use this reliably - each
+found by testing live, not assumed:**
+
+1. **Search-phrasing gap in the Action agent's own instruction.** Every
+   live run immediately after the query swap had the agent try `click_ui`
+   on a "search button/tab" first - which doesn't exist as a distinct
+   clickable element the way the agent imagined - instead of calling
+   `type_in_field` directly. Root cause: milestone text phrased as "X is
+   searched" or "X is located" pattern-matched the agent's own
+   `click_ui` instruction example ("the first search result is
+   selected") before it matched `type_in_field`'s. Fixed by clarifying
+   `agents/action.py`'s instruction that "X is searched" means *type X
+   into the search field*, not click a search icon.
+2. **`_looks_like_top_result`'s exact-phrase matching was too brittle.**
+   Once the agent correctly called `type_in_field` first, it phrased the
+   *next* milestone's target as "the first track result for Billie Jean"
+   - which the original exact-phrase check (`"first search result"` /
+   `"top result"`) missed entirely, silently falling through to the slow,
+   already-proven-unreliable vision path instead of erroring loudly.
+   Fixed by matching "a position word (first/top) AND a result-ish word
+   (result/track/song)" both present, rather than one fixed phrase -
+   robust to the actual paraphrasing an LLM produces in practice.
+3. **Search text silently concatenated instead of replacing.** A
+   screenshot taken mid-debugging showed the search box containing
+   `"billie jean michael jackson billie jean is not my..."` - garbled,
+   multi-query leftovers. `type_in_field`'s paste-based typing never
+   selected existing field contents first, so if the field wasn't already
+   empty (e.g. Spotify resuming a previous session's query on relaunch),
+   the new text landed wherever the cursor happened to be instead of
+   replacing anything - corrupting the query with no error raised
+   anywhere. This is exactly the class of silent-wrong-state bug this
+   project has spent most of its effort catching, just in a spot nothing
+   was checking yet. Fixed by sending Cmd+A immediately before every
+   paste, unconditionally (not just for Spotify) - a select-all-then-paste
+   is strictly safer than a bare paste for any field, regardless of app.
+4. **Pasting into Spotify's search field never actually submitted the
+   search.** A screenshot taken right after a paste (no Return pressed)
+   showed only the live autocomplete dropdown - not the full results page
+   with the Top result card `_APP_TOP_RESULT_OFFSET` targets. Nothing in
+   the Action agent's toolset presses Enter, so the *real* chain would
+   click the fixed offset against a page that was never actually
+   reached - explaining an otherwise-confusing "fixed_offset tier used,
+   correct coordinates, but no playback change" result seen mid-testing.
+   Fixed by pressing Return automatically at the end of `type_in_field`'s
+   Spotify-shortcut path specifically (`used_shortcut` branch only) -
+   submitting is the near-universal correct completion of "type into a
+   search field opened via a search shortcut," so this is done for the
+   caller rather than left as a capability nothing has.
+
+**Final result, full agent chain, 3 clean runs in a row:** all 3
+milestones (`open_app` -> `type_in_field` -> `click_ui`) succeeded every
+time, with the final `click_ui` call verified via a genuine
+`paused`/`Billie Jean` -> `playing`/`Billie Jean` transition read from
+Spotify's real player state each time - not a screenshot guess, not "the
+click didn't error." One run also hit a real, unplanned focus interruption
+(VS Code became frontmost mid-chain) - the frontmost-app guard correctly
+refused the out-of-turn `click_ui` call, and the Action agent recovered on
+its own by calling `open_app` again before continuing, exactly the
+guard's intended behavior rather than a failure to route around.
+
+**Why this run of bugs matters beyond just "found and fixed":** none of
+them were in the fixed-offset mechanism itself, which worked correctly
+from its very first isolated test. They were all in the *path to* that
+mechanism - agent tool selection, description phrasing robustness, field
+state hygiene, and search submission - the connective tissue between a
+verified-working primitive and an actually-reliable end-to-end command.
+Testing only the primitive in isolation (as the 3/3 isolated result did)
+would have missed every one of these.
