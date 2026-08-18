@@ -55,10 +55,12 @@ model from collapsing into step-by-step output.
 
 ## 4. Action agent's tool selection and execution loop
 
-`agents/action.py` defines `action_agent`, given four tools -
+`agents/action.py` defines `action_agent`, given seven tools -
 `open_app_tool`, `click_ui_tool`, `type_in_field_tool`,
-`create_reminder_tool` - all `FunctionTool`-wrapped functions from
-`tools/mac_control.py`. It receives one milestone goal per turn (driven by
+`create_reminder_tool` (native macOS control, from `tools/mac_control.py`)
+plus `find_web_element_tool`, `click_web_element_tool`,
+`type_in_web_field_tool` (browser control, from `tools/browser_tools.py`,
+see section 8). It receives one milestone goal per turn (driven by
 `main.run_action()`, which loops over `plan.milestones` and sends each
 `milestone.goal` as a new message in the *same* session). Because milestones
 for one task share a session, the agent can infer context across calls -
@@ -70,9 +72,11 @@ The instruction maps milestone shape to tool choice: "app open/foreground"
 -> `open_app`; "something clicked" -> `click_ui` (requires
 `expected_app_name`); "text entered" -> `type_in_field` (same requirement);
 "reminder exists" -> `create_reminder` (extracts `task`/`due_date`/
-`due_time` as plain text, no manual date computation by the model). If no
-tool fits, or a tool refuses to act, the agent is told to report that
-plainly rather than retry blindly.
+`due_time` as plain text, no manual date computation by the model); a
+milestone about a specific element on a *web page* -> `find_web_element`
+first (to get a `ref_id`), then `click_web_element`/`type_in_web_field`
+with that `ref_id`. If no tool fits, or a tool refuses to act, the agent
+is told to report that plainly rather than retry blindly.
 
 `agents/verifier_callbacks.py`'s `log_tool_result_callback` is registered as
 `action_agent`'s `after_tool_callback` - ADK calls it after every tool
@@ -290,3 +294,106 @@ AppleScript program that creates the named list if it doesn't exist
 inside it via `osascript`. Permission denial (`-1743` / "not authorized") is
 detected from `stderr` and surfaced as a specific, actionable error message
 rather than a generic failure.
+
+## 8. Browser control path
+
+A parallel system to sections 5-6's native-app UI targeting, for web pages
+specifically. Where `click_ui`/`type_in_field` have to infer element
+locations from screenshots and the Accessibility API (macOS gives no
+structured view into an arbitrary app's UI), the browser bridge gets a
+real, structured view of the page for free, at the cost of needing a
+Chrome extension and a second WebSocket server. Adapted from a real
+reference architecture rather than designed from scratch - see
+`planning.md`'s "browser control" entry for the full reasoning, the
+deliberately-inherited known flaws, and what was trimmed from the
+original.
+
+**Processes involved, and how they actually connect:**
+- `backend/servers/browser_bridge_server.py` - a `websockets` server on
+  `ws://127.0.0.1:8765` (env-overridable via `JARVIS_BROWSER_BRIDGE_HOST`/
+  `JARVIS_BROWSER_BRIDGE_PORT`). Its `serve_forever()` coroutine runs as
+  an in-process `asyncio.create_task()` alongside wherever the Action
+  agent's tool calls execute - not a separate OS process - because the
+  `asyncio.Event` objects `browser/bridge.py` relies on are only safely
+  awaitable from the event loop that created them. A genuinely separate
+  process is only used for the isolated protocol test (a dumb scripted
+  client doesn't need shared Python state).
+- `chrome_extension/background.js` - an MV3 service worker that owns the
+  WebSocket connection *to* that server. Authenticates with a shared
+  token (`browser_bridge_hello`), then both pushes snapshots up and
+  receives queued actions pushed down over the same open connection.
+  Also polls every 5s as a fallback path that runs unconditionally
+  alongside push (a deliberately-inherited quirk, not a true fallback -
+  see `planning.md`).
+- `chrome_extension/content_script.js` - injected into every page
+  (`document_idle`, plus on-demand via `chrome.scripting.executeScript`
+  if the static injection didn't happen for some reason). Does the actual
+  DOM work: tagging, snapshotting, and executing actions.
+
+**Request flow, end to end, for e.g. `type_in_web_field`:**
+
+1. `find_web_element(description)` (`tools/browser_tools.py`) - a
+   synchronous, no-round-trip lookup against whatever `PageSnapshot` is
+   already stored in `browser/store.py`'s `browser_store`, scoring each
+   element's label/placeholder/aria-label/name against the query (exact
+   match beats substring match, in that field priority order). Returns a
+   `ref_id` like `"jw_12"`.
+2. `type_in_web_field(ref_id, text)` calls
+   `browser_bridge.queue_action(ActionRequest(action="type", ref_id=...,
+   text=...))`. `queue_action` attaches the element's captured fingerprint
+   (`dom_path`, `tag`, `role`, labels) as `metadata`, appends the request
+   to a pending queue, and immediately tries to push it over the open
+   extension WebSocket (`_try_push_actions`) rather than waiting for a
+   poll.
+3. `background.js` receives the pushed `browser_actions` message,
+   resolves the target tab, and relays it to `content_script.js` via
+   `chrome.tabs.sendMessage({type: "jarvis_execute_action", ...})`.
+4. `content_script.js`'s `findTargetForAction` resolves the actual DOM
+   node in three tiers: (1) O(1) lookup by the numeric `agent_id` tagged
+   onto the element at snapshot time (`data-agent-id`), (2) the same
+   lookup reached by parsing `"jw_" + N"` out of `ref_id` as a safety net,
+   (3) only if the tagged element is genuinely gone (e.g. an SPA
+   re-render replaced it) - a heuristic re-scan of currently-visible
+   elements, scoring each against the metadata from step 2
+   (`scoreCandidate`: `dom_path` match worth 300, tag/role match 40 each,
+   label similarity 60-120, viewport bonus 15 - and an action-type
+   mismatch is a hard `-1` disqualifier, never just a penalty). `executeType`
+   focuses and scrolls the resolved element into view first, then either
+   `document.execCommand("insertText", ...)` for `contenteditable` targets
+   (rich-text editors silently ignore direct value assignment) or a plain
+   `.value` assignment + synthetic `input`/`change` events otherwise.
+5. The result goes back up: content script -> background script ->
+   `browser_action_result` message -> `browser_bridge_server.py` ->
+   `browser_bridge.record_action_result()`, which sets (and swaps) the
+   per-`action_id` `asyncio.Event` that `type_in_web_field`'s
+   `await browser_bridge.wait_for_result(action_id)` is blocked on.
+6. Separately, `content_script.js`'s `MutationObserver` (debounced 300ms,
+   requires 5+ batched mutations) fires a fresh snapshot on its own once
+   the DOM actually settles - no explicit request needed.
+7. `type_in_web_field` awaits `browser_bridge.wait_for_snapshot(
+   min_generation=<the pre-action snapshot's generation>)`, which only
+   returns once a snapshot with a **strictly greater** generation exists
+   in the store. `generation` is not a backend-assigned counter - it's the
+   browser's own `Date.now()` at snapshot-build time
+   (`content_script.js`'s `buildSnapshot`), forwarded untouched all the
+   way through. This comparison is the actual mechanism that replaces a
+   fixed sleep with "wait until the DOM genuinely changed."
+8. Even that isn't the final check: `type_in_web_field` reads the fresh
+   snapshot's element back out of the store and confirms its real `value`
+   field actually contains the typed text, the same "don't trust the
+   action's own success report - read the real state back" principle
+   `mac_control.py`'s AX-value check uses, just via DOM state instead of
+   the Accessibility API.
+
+`click_web_element` follows the same shape without the final value-check
+step (a click has no single universal post-condition to verify against, so
+"a newer snapshot arrived at all" is the confirmation).
+
+**The `asyncio.Event` "set-then-swap" pattern**, used for both the shared
+snapshot event and every per-action result event
+(`browser/bridge.py`): `event.set()` wakes whoever was already waiting;
+immediately replacing the attribute with a brand new, unset `Event()`
+stops any *future* waiter from returning instantly on a stale "already
+set" flag. Without the swap, every wait after the first snapshot would
+return immediately regardless of whether a new snapshot had actually
+arrived.

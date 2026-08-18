@@ -670,3 +670,165 @@ state hygiene, and search submission - the connective tissue between a
 verified-working primitive and an actually-reliable end-to-end command.
 Testing only the primitive in isolation (as the 3/3 isolated result did)
 would have missed every one of these.
+
+---
+
+## Browser control: reproducing a real reference architecture instead of designing from scratch
+
+**Decision:** built browser automation (a Chrome MV3 extension + a second
+WebSocket server + backend tools) by faithfully adapting a real, working
+reference architecture pulled from a separate project (`moonwalk-
+reference`), rather than designing a simpler approach from first
+principles. Explicitly acknowledged going in as the highest-risk, least-
+precedented piece of this whole build - browser extension JavaScript is a
+stack nothing else in Jarvis touches, and the failure modes (MV3 service
+worker eviction, single-page-app DOM churn, the perceive-act race) are
+exactly the kind of thing that's expensive to discover by trial and error
+but already-documented lessons in the reference.
+
+**Why fidelity over a simpler design:** every piece of this architecture
+that looks like unnecessary complexity turned out, on reading the
+reference's own notes, to be a direct fix for a real failure mode that was
+presumably hit in production once already:
+
+- **Generation as a raw `Date.now()` timestamp, forwarded verbatim, never
+  a backend-incremented counter.** A counter the backend owns would need
+  the backend and the content script to agree on when to bump it - the
+  timestamp sidesteps that entirely: whichever side asks "is this newer
+  than what I had," the browser's own clock is the one source of truth,
+  and the comparison is always strict `>`.
+- **The "set-then-swap" `asyncio.Event` pattern**
+  (`browser/bridge.py`'s `register_snapshot` and `record_action_result`):
+  `event.set()` wakes exactly the waiters that already existed;
+  immediately replacing it with a fresh, unset `Event()` stops future
+  callers from returning instantly on a stale "already set" flag. Skipping
+  the swap would make every `wait_for_snapshot` after the very first
+  snapshot return immediately with no new snapshot having actually
+  arrived - a subtle bug that would look like it worked in a quick test
+  and then silently stop verifying anything.
+- **Two decoupled singletons (`BrowserBridge` for connection/queue/events,
+  `BrowserStore` for snapshot/element data)** rather than one class doing
+  both. `queue_action` reads from the store but the store has no idea the
+  bridge exists - kept exactly this way rather than merged, since the
+  separation is what keeps "how do I wait for things" cleanly separate
+  from "what do I actually know about the page."
+- **Three-tier element resolution in the content script**
+  (`agent_id` map lookup -> `ref_id` parse of the same map -> heuristic
+  re-scan) is what makes an action survive a single-page app re-rendering
+  the DOM between when a `ref_id` was captured in a snapshot and when the
+  action actually executes. Tier 3's scoring hard-disqualifies on
+  action-type mismatch rather than treating it as a penalty - verified
+  directly in isolation (see below) that this can't be relaxed to "closest
+  available match," which matters because a page frequently has a
+  visually-similar-but-wrong element (e.g. a link near a button) that
+  would otherwise win on label similarity alone.
+- **Push-primary delivery**: queued actions are sent immediately over the
+  open WebSocket rather than waiting for the extension's next poll cycle,
+  because a 5-second poll interval would make every action feel laggy for
+  no reason when a live connection already exists to push over.
+
+**Adaptations made, not verbatim copies, per the explicit instruction to
+write fresh code against the patterns rather than reuse code directly:**
+
+- **Runtime-state/observability integration dropped.** The reference
+  calls into a `runtime_state_store` (connection tracking, action-result
+  history, a dashboard-style readability-extraction record) that has no
+  equivalent anywhere in Jarvis. Replaced with plain `logger.info` calls
+  at the same points - the *shape* of the state machine is unchanged,
+  only the "who else gets told about it" integration was cut, since
+  building a whole parallel observability subsystem wasn't asked for.
+- **Trimmed action surface.** The reference supports `scroll`, `highlight`,
+  `scanning_start`/`scanning_stop`, `extract_data`, and
+  `extract_readability` (the last needing a vendored Mozilla Readability.js
+  library) in addition to `click`/`type`/`select`/`refresh_snapshot`. Only
+  the four needed for the actual tools being built
+  (`click_web_element`/`type_in_web_field`, plus `refresh_snapshot` as the
+  one snapshotless action) were implemented. `Readability.js` isn't
+  vendored in, and the manifest doesn't load it. Extending this later is a
+  matter of adding more branches to `content_script.js`'s `executeAction`
+  switch and `background.js`'s action dispatch, not restructuring anything.
+- **No tab ledger in `BrowserStore`.** The reference's own extraction notes
+  say this part was "omitted for brevity" even in the source material, so
+  there was no concrete pattern to adapt here - `_current_session_id`
+  alone covers what Jarvis's single-tab-at-a-time use actually needs.
+- **No options page or extension popup UI.** The manifest skips
+  `options_page`/`default_popup` entirely; the bridge URL and token are
+  hardcoded defaults (`ws://127.0.0.1:8765`, `dev-bridge-token`),
+  overridable via `chrome.storage.sync` if ever needed, matching the
+  reference's own settings-loading code, just with no UI built yet to
+  actually change them.
+- **Internal message-type names changed from `moonwalk_*` to `jarvis_*`**
+  (`jarvis_snapshot`, `jarvis_execute_action`, `jarvis_collect_snapshot`) -
+  these are purely internal `chrome.runtime.onMessage` types between this
+  extension's own background script and content script, not part of the
+  wire protocol to the backend, so renaming them for this project carries
+  zero behavioral risk. The backend-facing WebSocket protocol message
+  types (`browser_bridge_hello`, `browser_snapshot`, etc.) were already
+  generically named and kept as-is.
+- **Token env var renamed** `MOONWALK_BROWSER_BRIDGE_TOKEN` ->
+  `JARVIS_BROWSER_BRIDGE_TOKEN` (same for the host/port vars) - purely a
+  naming-consistency change with this project's own conventions.
+
+**Deliberately-inherited flaws - reproduced, not fixed, as instructed:**
+
+1. **`_try_push_actions`'s drain-before-confirmed-send ordering.** The
+   pending action is removed from `_pending_actions` as soon as the push
+   payload is built, *before* the `ws.send()` (itself fire-and-forget via
+   `loop.create_task`) has actually completed. If the send fails after
+   this point, the action is already gone from the queue - the `except:
+   pass` "falls back to polling," but there's nothing left in the queue
+   for a poll to find. A real gap: a failed push can silently drop an
+   action with no retry path. Kept as-is for fidelity to the reference
+   rather than fixed by draining only after a confirmed send.
+2. **Push and poll both run unconditionally once authenticated**
+   (`background.js`), not poll-only-as-a-true-fallback. Both paths can
+   fire close together; `actionExecutionInFlight` is the only guard
+   against double-execution, not a real mutual-exclusion mechanism. A
+   cleaner design (e.g. only poll if no push has arrived in N seconds)
+   was consciously not built, per the instruction to document this as a
+   known, inherited limitation rather than improve on the reference at
+   this stage.
+
+**A genuine architectural decision the reference itself leaves ambiguous,
+resolved for Jarvis:** the reference's own extraction notes flag
+uncertainty about whether its bridge server runs as a literal separate OS
+process or shares memory with a main agent server via the module-level
+singleton pattern - noting these two framings are in tension for actual
+separate processes (Python module state genuinely can't be shared across
+separate `python x.py` invocations). Jarvis has no persistent "main agent
+server" to begin with (`main.py` is a one-shot script), so this had to be
+resolved concretely rather than left ambiguous: **`browser_bridge_server
+.py`'s `serve_forever()` runs as an in-process `asyncio.create_task()`
+alongside wherever the Action agent's tool calls execute, sharing one
+event loop** - not a separate subprocess for the wired-in case. This is
+required for correctness, not just convenience: `browser_bridge`'s
+`asyncio.Event` objects are only safely awaitable from the event loop that
+created them, so `browser_tools.py`'s `click_web_element`/
+`type_in_web_field` (real `async def` functions - confirmed directly that
+ADK's `FunctionTool` supports async callables via
+`inspect.iscoroutinefunction`) and the server's WebSocket handler must run
+on the same loop to see each other's state at all. A genuinely separate
+OS process for `browser_bridge_server.py` is still used, correctly, for
+the stage 1-3 isolated protocol test below, since a dumb scripted client
+talking pure WebSocket JSON has no need for shared Python state.
+
+**Real test results so far (isolated, before touching the extension):**
+a fully in-process test - the bridge server started as a background task,
+a scripted fake client connected over a real WebSocket, `queue_action`
+called directly from the same process - confirmed the entire pipeline for
+real: the fake client received its action via the **pushed**
+`browser_actions` message (never polled), with the correct metadata
+attached (`dom_path`/`role`/`tag`/`label`/`agent_id`, all pulled from the
+snapshot's stored `ElementRef`); `wait_for_result` correctly unblocked
+only after the fake client's `browser_action_result` arrived; and
+`wait_for_snapshot(min_generation=...)` correctly returned only once a
+snapshot with a strictly greater generation existed, with the newly-typed
+field's value visible in it. The pure scoring/matching logic (exact-label
+match > substring match, action-type mismatch as a hard `-1` disqualifier,
+`dom_path` match weighted at 300 vs. 40 for a bare tag/role match) was
+verified directly in Node against the real `scoreCandidate` function, not
+just read and trusted.
+
+**Not yet tested at the time of this entry:** the real Chrome extension
+loaded via Developer Mode, and the live flight-search case - both pending
+manual browser interaction. Will be appended once run for real.
