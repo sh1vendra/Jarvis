@@ -888,14 +888,37 @@ _APP_PLAYER_STATE_CHECKS = {
 # Podcasts filter is selected") wouldn't be confirmed OR refuted by player
 # state, so it should fall through to the pixel-diff/vision path instead of
 # being incorrectly judged by a check that has nothing to say about it.
-_PLAYBACK_OUTCOME_HINTS = ("play", "pause", "track", "song", "music")
+_PLAYBACK_OUTCOME_HINTS = (
+    "play",
+    "playing",
+    "played",
+    "plays",
+    "pause",
+    "paused",
+    "pausing",
+    "pauses",
+    "track",
+    "tracks",
+    "song",
+    "songs",
+    "music",
+)
 
 # Matches _PLAYBACK_OUTCOME_HINTS as whole words only, not substrings. Found
-# necessary directly: a plain `in` check matched "play" inside "playlist",
-# so an outcome like "the playlist page opens" (pure navigation, nothing to
-# do with playback) was wrongly gated into the player-state check, which
-# then reported a false "no playback change" for something player state
-# was never able to speak to in the first place.
+# necessary directly, twice: first, a plain `in` check matched "play" inside
+# "playlist", so an outcome like "the playlist page opens" (pure navigation,
+# nothing to do with playback) was wrongly gated into the player-state
+# check, which then reported a false "no playback change" for something
+# player state was never able to speak to in the first place. Second, after
+# fixing that by matching only the bare word "play", a real playback
+# outcome phrased as "...now playing bar displays..." (a completely normal,
+# common phrasing) stopped matching at all, since "playing" isn't the exact
+# word "play" - missing the OS-state check entirely and falling through to
+# the less reliable vision fallback for a case player state could have
+# answered directly. Fixed by listing the actual word forms instead of
+# trying to stem them (English's spelling irregularities - e.g. "pause" ->
+# "pausing" drops the "e" - make a generic suffix regex more error-prone
+# than just enumerating the forms that actually occur in practice).
 _PLAYBACK_OUTCOME_PATTERN = re.compile(
     r"\b(?:" + "|".join(re.escape(hint) for hint in _PLAYBACK_OUTCOME_HINTS) + r")\b"
 )
