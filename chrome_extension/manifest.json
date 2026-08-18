@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Jarvis Browser Bridge",
+  "version": "1.0.0",
+  "description": "Stable DOM bridge connecting Jarvis's backend to the active browser tab.",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' ws://127.0.0.1:* http://127.0.0.1:*;"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Jarvis Browser Bridge"
+  }
+}
