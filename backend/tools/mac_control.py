@@ -586,6 +586,29 @@ def _looks_collapsible(target_description: str) -> bool:
     return any(hint in lowered for hint in _COLLAPSIBLE_FIELD_HINTS)
 
 
+def _locate_via_window_offset(app_name: str, offset: tuple[float, float]) -> tuple[float, float] | None:
+    """Resolves a point-space (x, y) as an offset from app_name's own
+    window frame - x as a fraction of window width, y as an absolute point
+    offset from the window's top edge (the same offset shape
+    _APP_SEARCH_FIELD_OFFSET and _APP_TOP_RESULT_OFFSET both use). Retries
+    briefly since a freshly-launched window can report itself frontmost
+    slightly before its AX window is actually queryable - the same race
+    type_in_field's inline version of this logic (search field lookup)
+    already retries for. Returns None if the window frame never resolves.
+    """
+    window_frame = None
+    for _ in range(3):
+        window_frame = get_frontmost_window_frame(app_name)
+        if window_frame is not None:
+            break
+        time.sleep(0.2)
+    if window_frame is None:
+        return None
+    win_x, win_y, win_w, _win_h = window_frame
+    x_fraction, y_offset = offset
+    return (win_x + win_w * x_fraction, win_y + y_offset)
+
+
 def _locate_element(
     app_name: str, target_description: str, roles: set[str] | None = None, skip_reveal: bool = False
 ) -> dict:
