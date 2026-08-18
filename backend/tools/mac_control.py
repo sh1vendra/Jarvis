@@ -543,6 +543,35 @@ _APP_SEARCH_FIELD_OFFSET = {
 }
 
 
+# Demo-only simplification, not a general fix - see planning.md's "demo
+# command swapped" entry for the full reasoning. Vision's coordinate guess
+# for "first search result" was measured to have a systematic bias, not
+# per-image imprecision: both a single-shot whole-screen guess and a 5-point
+# grid search around it consistently landed in the same sidebar-adjacent
+# region regardless of query or actual on-screen content (0/5 hit rate
+# against this exact target). Meanwhile, Spotify's "Top result" card - the
+# thing a specific track/artist query surfaces - has a fixed position
+# confirmed directly, twice, on two independent queries: clicking point
+# (448, 218) started real playback both times, verified via
+# _spotify_player_state(). Expressed as a window-frame offset (same pattern
+# as _APP_SEARCH_FIELD_OFFSET) rather than a bare screen coordinate so it
+# still tracks the window if it's ever moved/resized.
+_APP_TOP_RESULT_OFFSET = {
+    "Spotify": (0.56, 179.0),
+}
+
+# Descriptions that plausibly refer to Spotify's "Top result" card - the
+# specific, narrow case _APP_TOP_RESULT_OFFSET covers. Deliberately narrow
+# (not "search result" alone) so this doesn't accidentally claim results
+# further down a list, which this fixed offset knows nothing about.
+_TOP_RESULT_HINTS = ("first search result", "top result")
+
+
+def _looks_like_top_result(target_description: str) -> bool:
+    lowered = target_description.lower()
+    return any(hint in lowered for hint in _TOP_RESULT_HINTS)
+
+
 # Descriptions that plausibly name a search entry point that might currently
 # be a collapsed icon rather than an open, visible field - e.g. Spotify's
 # Home view shows only a magnifying-glass icon until it's clicked. Confirmed
