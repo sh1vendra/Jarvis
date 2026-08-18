@@ -124,7 +124,7 @@ async def main() -> None:
     # Real task - the orchestrator should transfer to the planner, which
     # should return an ordered, outcome-based milestone plan.
     session2 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-    await run_command(orchestrator_runner, session2.id, "open Spotify and play some lo-fi music")
+    await run_command(orchestrator_runner, session2.id, "open Spotify and play Billie Jean by Michael Jackson")
 
     # Real task that ends in an actual Mac-control action: Orchestrator ->
     # Planner produces a milestone plan, then we hand the reminder-creation
@@ -142,11 +142,15 @@ async def main() -> None:
     # Full Spotify command, executed for real end to end: Orchestrator ->
     # Planner produces a milestone plan, then every milestone goes to the
     # Action agent, which now has open_app, click_ui, and type_in_field
-    # available - open Spotify, type "lo-fi" into its search field, click
-    # the first result. click_ui/type_in_field print which tier (AX vs
-    # vision) actually resolved each target via their tool result dicts.
+    # available - open Spotify, search a specific track, click the Top
+    # result card's play button. A specific track/artist query (rather
+    # than a genre term like "lo-fi") reliably surfaces a "Top result"
+    # card with a persistent, directly clickable play button - unlike a
+    # genre-landing page, where a click navigates instead of playing (see
+    # planning.md). click_ui/type_in_field print which tier actually
+    # resolved each target via their tool result dicts.
     session4 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-    spotify_plan = await run_command(orchestrator_runner, session4.id, "open Spotify and play some lo-fi music")
+    spotify_plan = await run_command(orchestrator_runner, session4.id, "open Spotify and play Billie Jean by Michael Jackson")
 
     if spotify_plan is not None:
         action_runner2 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
