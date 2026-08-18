@@ -1133,14 +1133,34 @@ def click_ui(target_description: str, expected_app_name: str, expected_outcome: 
             success: bool, True only if the expected outcome was verified
             message: human-readable summary, including which tier and
                 verification path were used
-            tier: "accessibility" or "vision" if a click was dispatched, else None
+            tier: "accessibility", "vision", or "fixed_offset" if a click was
+                dispatched, else None
             error: raw error string if something went wrong, else None
     """
     guard_error = _verify_expected_app_frontmost(expected_app_name)
     if guard_error is not None:
         return guard_error
 
-    located = _locate_element(expected_app_name, target_description)
+    # Demo-only simplification for one specific, confirmed-fixed target -
+    # see _APP_TOP_RESULT_OFFSET's comment and planning.md for why: vision
+    # measurably can't locate "first search result" reliably (0/5 even with
+    # a grid search), but Spotify's "Top result" card sits at a fixed,
+    # independently-verified position relative to its window. Only takes
+    # effect for this narrow description match - anything else still goes
+    # through the normal two-tier location below.
+    located = None
+    if expected_app_name in _APP_TOP_RESULT_OFFSET and _looks_like_top_result(target_description):
+        offset_point = _locate_via_window_offset(expected_app_name, _APP_TOP_RESULT_OFFSET[expected_app_name])
+        if offset_point is not None:
+            located = {
+                "x": offset_point[0],
+                "y": offset_point[1],
+                "tier": "fixed_offset",
+                "reveal_expanded": False,
+            }
+
+    if located is None:
+        located = _locate_element(expected_app_name, target_description)
     if "error" in located:
         return {"success": False, "message": located["error"], "tier": None, "error": located["error"]}
 
@@ -1152,7 +1172,12 @@ def click_ui(target_description: str, expected_app_name: str, expected_outcome: 
     _dispatch_click(located["x"], located["y"])
     time.sleep(0.3)  # give the UI/app state a moment to actually update
 
-    if located["tier"] == "accessibility":
+    if located["tier"] == "fixed_offset":
+        tier_detail = (
+            f"used a known, fixed offset from {expected_app_name}'s window frame "
+            "(demo-specific simplification for this one target - see planning.md)"
+        )
+    elif located["tier"] == "accessibility":
         tier_detail = f"matched AX label '{located['matched_label']}' (score {located['match_score']})"
     elif located.get("reveal_expanded"):
         tier_detail = "used Gemini vision - first click revealed a collapsed field, then vision re-located it"
