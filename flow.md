@@ -63,8 +63,8 @@ model from collapsing into step-by-step output.
 `milestone.goal` as a new message in the *same* session). Because milestones
 for one task share a session, the agent can infer context across calls -
 e.g. if it already called `open_app('Spotify')` for milestone 1, it infers
-milestone 2 ("lo-fi is playing") is still about Spotify without being told
-again.
+milestone 2 ("Billie Jean is playing") is still about Spotify without
+being told again.
 
 The instruction maps milestone shape to tool choice: "app open/foreground"
 -> `open_app`; "something clicked" -> `click_ui` (requires
@@ -159,16 +159,35 @@ and `type_in_field`:
 
    A third strategy, `locate_and_click_via_grid_search(app_name,
    target_description, expected_outcome)`, was also tried and also
-   rejected (1/3 real hit rate - see `planning.md`) - it exists in
-   `mac_control.py` but is **not called from `click_ui` or anywhere else**.
-   Rather than trusting one vision coordinate guess, it tries up to 5
-   candidate points (a cross pattern around the guess, via
-   `_generate_grid_candidates`) and reuses `_verify_click_outcome` after
-   each to detect a hit, stopping early on success or on a wide-region diff
-   suggesting an accidental navigation. Kept in the codebase as a working,
-   tested building block (and because it fixed two real bugs along the way
-   - see `planning.md`), but not wired in since its hit rate wasn't
-   reliable enough to hand a real click through.
+   rejected - it exists in `mac_control.py` but is **not called from
+   `click_ui` or anywhere else**. Rather than trusting one vision
+   coordinate guess, it tries up to 5 candidate points (a cross pattern
+   around the guess, via `_generate_grid_candidates`) and reuses
+   `_verify_click_outcome` after each to detect a hit, stopping early on
+   success or on a wide-region diff suggesting an accidental navigation.
+   Tested twice: 1/3 against the genre-page target, then 0/5 after the
+   demo command changed to a query with a cleaner, more consistent target
+   (see below) - the cleaner target didn't help, since the root cause
+   turned out to be a systematic bias in vision's initial guess for "first
+   search result" (consistently landing in the same sidebar-adjacent
+   region regardless of query or actual layout), not per-image imprecision
+   a local grid could correct. Kept in the codebase as a working, tested
+   building block (and because it fixed two real bugs along the way - see
+   `planning.md`), but not wired in since its hit rate wasn't reliable
+   enough to hand a real click through.
+
+   **Demo command changed as a result** (`backend/main.py`): from `"open
+   Spotify and play some lo-fi music"` to `"open Spotify and play Billie
+   Jean by Michael Jackson"`. A specific track/artist query reliably
+   surfaces Spotify's "Top result" card - a persistent, always-visible
+   play button that starts playback on a single click, unlike a genre
+   query's tiles (click navigates, doesn't play - a structural mismatch
+   independent of click precision). This card's position was independently
+   confirmed at the same point-space coordinates, (448, 218), across two
+   different queries - the milestone-2 click still isn't reliably
+   automated (same vision unreliability as above applies to locating this
+   card too), but the *target* is now at least a real, single-click-away
+   one, which the earlier genre-page target structurally was not.
 
 Every click is dispatched via `_dispatch_click` (raw Quartz
 `CGEventCreateMouseEvent`/`CGEventPost` at the HID event tap level, chosen

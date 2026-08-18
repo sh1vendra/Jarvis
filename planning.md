@@ -512,3 +512,66 @@ avoids needing to click a small/ambiguous Electron-rendered result -
 e.g. one that stays within already-solid paths (`open_app`,
 `type_in_field`'s keyboard-shortcut route, `create_reminder`) - would
 demo reliably today; this one specific milestone would not.
+
+---
+
+## Demo command swapped to a specific track query - and a second, more revealing negative result on the retest
+
+**Decision:** the demo command changed from `"open Spotify and play some
+lo-fi music"` to `"open Spotify and play Billie Jean by Michael Jackson"`
+(`backend/main.py`).
+
+**Why this specific change, not just a different genre term:** a genre or
+mood query (`"lo-fi"`) reliably lands Spotify on a genre-landing page,
+where the top items are playlist/genre tiles that *navigate* on click,
+not play - a structural mismatch with "play some lo-fi music" regardless
+of click precision (see the entry above). A specific track/artist query
+reliably surfaces a different layout entirely: a "Top result" card with a
+persistent, always-visible green play button that starts playback
+directly on a single click - confirmed twice now, independently, on two
+different queries (`"lofi hip hop radio"` earlier, and this session's
+`"Billie Jean Michael Jackson"`), both resolving to the *same* point-space
+coordinates, (448, 218) - strong evidence this card's position is a fixed
+layout element, not query-dependent placement.
+
+**Retest: does the grid search do better against this cleaner, more
+consistent target?** Directly measured, no: **0/5**, worse than the 1/3
+scored against the genre-page target. The reason is more revealing than
+"still imprecise," though. A fresh single-shot whole-screen guess against
+the new ground truth (`"Billie Jean Michael Jackson"` results,
+independently confirmed by clicking (448, 218) and watching
+`_spotify_player_state()` transition `paused`/`Spanish Castle` ->
+`playing`/`Billie Jean`) landed at pixel (190-194, 182-196) across 5
+tries - tightly clustered (<15px spread, so not noisy) but ~372pt from the
+true target. That's the *same* region (point-space roughly (95,95),
+near the left sidebar) that the *previous* target's single-shot guess
+also landed in, on a completely different query and a visually different
+results layout. The live grid search reproduced this: 4 of 5 trials
+guessed within a few pixels of (131, 98) point-space, again in that same
+sidebar-adjacent region, regardless of the actual on-screen content. This
+looks like a systematic bias in how the model answers "find the first
+search result" - not per-image imprecision that a wider search radius
+could fix. A grid of any practical size centered on a guess that's
+anchored to the wrong part of the screen *by default* won't reach a
+target 370+pt away. (Also newly observed, though secondary to the above:
+2 of each trial's 5 candidates landed at negative, off-screen coordinates
+- guaranteed no-ops that wasted 40% of the attempt budget every trial -
+not worth fixing given the deeper problem makes it moot.)
+
+**Decision: not wired into `click_ui`, same as the first grid-search
+attempt.** A cleaner, more consistent target was the stated hypothesis for
+why this retest might go differently, and it didn't - if anything the
+result got worse (0/5 vs 1/3). This rules out "the earlier target was
+just unusually hard" as an explanation and points at something more
+fundamental about how vision answers this specific kind of question.
+
+**Open question for a pragmatic demo-only fix:** since this Top-result
+card's play button position is now confirmed fixed at point (448, 218)
+across two independent queries, a hardcoded coordinate (or an offset
+computed from `get_frontmost_window_frame`, the same pattern already used
+for Spotify's search field after Cmd+L) could reliably hit it *for this
+one specific card layout* - not a general solution to search-result
+click precision, but a targeted, explicitly-documented simplification for
+this one demo command. Not implemented yet - flagged for a decision before
+building it, since hardcoding a coordinate is exactly the kind of
+technicality this whole project has been careful not to lean on silently.
