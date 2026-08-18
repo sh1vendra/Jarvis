@@ -561,15 +561,26 @@ _APP_TOP_RESULT_OFFSET = {
 }
 
 # Descriptions that plausibly refer to Spotify's "Top result" card - the
-# specific, narrow case _APP_TOP_RESULT_OFFSET covers. Deliberately narrow
-# (not "search result" alone) so this doesn't accidentally claim results
-# further down a list, which this fixed offset knows nothing about.
-_TOP_RESULT_HINTS = ("first search result", "top result")
+# specific, narrow case _APP_TOP_RESULT_OFFSET covers. Matching an exact
+# phrase like "first search result" turned out too brittle in practice:
+# the Action agent phrased the same real milestone as "the first track
+# result for Billie Jean" in one live run, which the original exact-phrase
+# check missed entirely, silently falling through to the slow, unreliable
+# vision path this whole thing exists to avoid. Matching on "a position
+# word (first/top) AND a result-ish word (result/track/song)" both being
+# present is more robust to that kind of natural paraphrasing, without
+# being so broad it fires on unrelated targets - and even a wrong fire
+# here is caught downstream by click_ui's own outcome verification rather
+# than silently reported as success.
+_TOP_RESULT_POSITION_WORDS = ("first", "top")
+_TOP_RESULT_NOUN_WORDS = ("result", "track", "song")
 
 
 def _looks_like_top_result(target_description: str) -> bool:
     lowered = target_description.lower()
-    return any(hint in lowered for hint in _TOP_RESULT_HINTS)
+    has_position = any(word in lowered for word in _TOP_RESULT_POSITION_WORDS)
+    has_noun = any(word in lowered for word in _TOP_RESULT_NOUN_WORDS)
+    return has_position and has_noun
 
 
 # Descriptions that plausibly name a search entry point that might currently
