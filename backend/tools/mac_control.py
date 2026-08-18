@@ -1379,6 +1379,26 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
     Quartz.CGEventSetFlags(key_up, Quartz.kCGEventFlagMaskCommand)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_up)
 
+    if used_shortcut:
+        # Pasting into Spotify's search field only populates the live
+        # autocomplete dropdown - it does not by itself navigate to the
+        # full results page (with the "Top result" card click_ui's
+        # fixed-offset path targets). Found necessary directly: without
+        # this, a screenshot taken immediately after the paste showed only
+        # the dropdown, with nothing resembling a results page at all -
+        # the caller would then be clicking blind at a page that doesn't
+        # exist yet. Pressing Return is the natural completion of "search
+        # for X" for this shortcut-opened field specifically, so it's
+        # done here rather than left for a caller that has no tool to do
+        # it itself.
+        time.sleep(0.15)
+        return_down = Quartz.CGEventCreateKeyboardEvent(None, 36, True)  # 36 = Return
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, return_down)
+        time.sleep(0.05)
+        return_up = Quartz.CGEventCreateKeyboardEvent(None, 36, False)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, return_up)
+        time.sleep(0.6)  # let the results page finish rendering
+
     tier_label = "keyboard_shortcut" if used_shortcut else located["tier"]
     if used_shortcut:
         # located["tier"] can still be "vision" here if the window-frame
