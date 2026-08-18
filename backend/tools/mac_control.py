@@ -1346,6 +1346,24 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
         _dispatch_click(located["x"], located["y"])
         time.sleep(0.2)  # give the field a moment to actually gain focus
 
+    # Select-all before pasting so the paste always *replaces* the field's
+    # contents rather than inserting at wherever the cursor happens to be.
+    # Found necessary directly: a field that already had leftover text in
+    # it (e.g. a relaunched app resuming its last search rather than
+    # starting blank) ended up with the new text silently concatenated
+    # onto the old instead of replacing it, corrupting the query with no
+    # error anywhere - exactly the kind of silent-wrong-state bug this
+    # project has been built to catch, just this time in a place nothing
+    # was checking yet.
+    select_all_down = Quartz.CGEventCreateKeyboardEvent(None, 0, True)  # 0 = 'a'
+    Quartz.CGEventSetFlags(select_all_down, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, select_all_down)
+    time.sleep(0.05)
+    select_all_up = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
+    Quartz.CGEventSetFlags(select_all_up, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, select_all_up)
+    time.sleep(0.05)
+
     # Typing via the clipboard (pbcopy + Cmd+V) is far more reliable than
     # synthesizing one CGEvent per character: it doesn't depend on mapping
     # every character to a virtual keycode (which breaks for anything
