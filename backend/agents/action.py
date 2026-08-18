@@ -5,6 +5,11 @@ create_reminder for Reminders.app.
 
 from google.adk.agents import LlmAgent
 
+from tools.browser_tools import (
+    click_web_element_tool,
+    find_web_element_tool,
+    type_in_web_field_tool,
+)
 from tools.mac_control import (
     click_ui_tool,
     create_reminder_tool,
@@ -57,6 +62,18 @@ action_agent = LlmAgent(
         "  - due_date: the date mentioned or implied (e.g. 'tomorrow', "
         "'2026-08-13') - pass it as plain text, don't compute it yourself\n"
         "  - due_time: the time mentioned or implied (e.g. '5pm', '17:00')\n\n"
+        "For milestones about a web page in the browser (not a native Mac "
+        "app), use these instead of open_app/click_ui/type_in_field:\n"
+        "- find_web_element: use this FIRST whenever a milestone refers to "
+        "a specific element on the current web page (e.g. 'the destination "
+        "field', 'the search button') - it returns a ref_id you then pass "
+        "to click_web_element or type_in_web_field. Never guess a ref_id "
+        "yourself; always look it up first.\n"
+        "- click_web_element: clicks the element with the given ref_id. "
+        "Verified automatically by the tool via a fresh page snapshot - "
+        "you don't need to pass an expected outcome.\n"
+        "- type_in_web_field: types text into the field with the given "
+        "ref_id. Also self-verifying.\n\n"
         "If the milestone doesn't match any available tool, or a tool "
         "refuses to act (e.g. wrong_frontmost_app), don't retry blindly - "
         "report plainly what happened and that the milestone wasn't "
@@ -65,6 +82,14 @@ action_agent = LlmAgent(
         "actually succeeded, based on the tool's own result - don't claim "
         "success if the tool reported failure."
     ),
-    tools=[open_app_tool, click_ui_tool, type_in_field_tool, create_reminder_tool],
+    tools=[
+        open_app_tool,
+        click_ui_tool,
+        type_in_field_tool,
+        create_reminder_tool,
+        find_web_element_tool,
+        click_web_element_tool,
+        type_in_web_field_tool,
+    ],
     after_tool_callback=log_tool_result_callback,
 )
