@@ -132,6 +132,13 @@ class BrowserBridge:
         self._connected_session_id = snapshot.session_id
         self._last_seen_at = time.time()
         self._snapshot_generation = getattr(snapshot, "generation", 0)
+        logger.info(
+            "browser bridge: snapshot registered (session=%s, generation=%s, elements=%d, url=%s)",
+            snapshot.session_id,
+            self._snapshot_generation,
+            len(snapshot.elements),
+            snapshot.url,
+        )
         self._snapshot_event.set()
         self._snapshot_event = asyncio.Event()  # set-then-swap - see module docstring
 
