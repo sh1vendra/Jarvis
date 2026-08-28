@@ -832,3 +832,56 @@ just read and trusted.
 **Not yet tested at the time of this entry:** the real Chrome extension
 loaded via Developer Mode, and the live flight-search case - both pending
 manual browser interaction. Will be appended once run for real.
+
+---
+
+## Real Chrome extension load: connection, an unplanned reconnect test, and a real-world page snapshot
+
+**What happened:** the extension was loaded unpacked in Chrome and, without
+any scripted client standing in for it, produced a real
+`browser_bridge_hello` handshake against the running bridge server
+(`session=chrome-session-<timestamp>, name=jarvis-browser-bridge`). The
+active tab at the time was a genuine, unscripted Wikipedia article - not a
+page built or chosen to make the test easy.
+
+**Why testing against an arbitrary real page mattered, not just a
+controlled fixture:** every isolated test up to this point (the in-process
+push/event test, the Node-level scoring checks) used hand-built
+`PageSnapshot`/`ElementRef` data - useful for testing the *bridge's* logic
+in isolation, but it can't validate `content_script.js`'s actual DOM
+tagging and snapshot-building code at all, since that code never ran
+against real markup in any of those tests. A real Wikipedia page has none
+of the conveniences a purpose-built test fixture would - inconsistent
+markup, deeply nested layout, ads/chrome/navigation boilerplate, elements
+with no helpful `aria-label`. Getting a clean **89-element snapshot** back
+from it on the first real attempt is a materially stronger signal than
+any number of passing fixture-based tests that the `INTERACTIVE_SELECTOR`/
+`READABLE_SELECTOR` queries, `isVisible`/`isReadableCandidate` filtering,
+and `serializeElement` field-mapping all actually hold up against markup
+nobody wrote with this project in mind.
+
+**The reconnect logic got a genuine, unplanned real-world test.** The
+plan at this step was only to confirm the initial connection and a
+snapshot. Adding a logging line to `register_snapshot` (needed because
+that method had no visibility into the server log at all - a real, small
+gap noticed while trying to confirm the snapshot had arrived) required
+restarting the running bridge server process. That restart wasn't a
+scripted disconnect test - it killed the extension's live WebSocket out
+from under it with no warning, exactly the kind of interruption
+`background.js`'s `scheduleReconnect()`/`RECONNECT_DELAY_MS` logic exists
+for, but this specific scenario was never deliberately exercised before
+now. It worked: the extension's `close` handler fired, it reconnected
+within the expected ~1.5s window, and it re-sent a fresh snapshot without
+any manual intervention. Worth being honest about exactly what happened
+here - this wasn't a planned reconnection test, it was a side effect of
+fixing an unrelated logging gap, and it validated the reconnect path
+anyway. An accidental real-world validation like this is arguably more
+convincing than a deliberately scripted one, precisely because nothing
+about the timing or trigger was arranged to make it succeed.
+
+**Fixed along the way:** `register_snapshot` (`browser/bridge.py`) had no
+logging at all, unlike every other state-changing method in the class -
+made it impossible to confirm from the server log whether a snapshot had
+actually landed versus just trusting the client-side `browser_snapshot_ack`
+response. Added a `logger.info` call reporting session, generation,
+element count, and URL - purely additive, no behavior change.
