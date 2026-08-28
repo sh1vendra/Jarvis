@@ -308,6 +308,21 @@ reference architecture rather than designed from scratch - see
 deliberately-inherited known flaws, and what was trimmed from the
 original.
 
+**Verified so far, for real, not just in isolation:** the extension loads
+cleanly in Chrome (Developer Mode, unpacked), performs a real
+`browser_bridge_hello` handshake against a running
+`browser_bridge_server.py`, and a real page (an arbitrary, unscripted
+Wikipedia article - see `planning.md`) produces a real snapshot: 89
+elements, correctly tagged and serialized by `content_script.js`'s actual
+DOM-walking code, not a hand-built fixture. The reconnect path
+(`background.js`'s `scheduleReconnect`) was also exercised for real, if
+unplanned - see `planning.md`. **Still unverified live:** the full
+action-dispatch path (a queued `click`/`type` action actually reaching
+`content_script.js`'s `executeAction` and producing a real DOM change) -
+so far that path has only been confirmed with a scripted fake client (see
+the in-process push/event test above), not the real extension. The
+upcoming Google Flights test is what closes that gap.
+
 **Processes involved, and how they actually connect:**
 - `backend/servers/browser_bridge_server.py` - a `websockets` server on
   `ws://127.0.0.1:8765` (env-overridable via `JARVIS_BROWSER_BRIDGE_HOST`/
