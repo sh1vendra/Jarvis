@@ -885,3 +885,80 @@ made it impossible to confirm from the server log whether a snapshot had
 actually landed versus just trusting the client-side `browser_snapshot_ack`
 response. Added a `logger.info` call reporting session, generation,
 element count, and URL - purely additive, no behavior change.
+
+**A real, recurring operational gotcha, not fixed - documented instead:**
+getting from "extension loaded" to "a live test can actually run" required
+far more manual intervention than expected, and the cause is now
+understood clearly enough to record rather than chase further. Every time
+the bridge server process was killed and a new one started in quick
+succession (needed repeatedly here, since `browser_tools.py`'s
+`click_web_element`/`type_in_web_field` require sharing a process with
+the server - see the architecture entry above), the MV3 service worker
+would frequently fail to reconnect at all, with zero log evidence it even
+attempted to - consistent with Chrome evicting the worker outright rather
+than it just being slow. A `chrome://extensions` manual reload reliably
+fixed it every single time; simply waiting never did, even over several
+minutes. Practical lesson for demoing or testing this further: don't
+cycle the bridge server rapidly - start it once, confirm the connection
+is live and stable first, and only then run whatever needs the combined
+in-process server+tool-call setup, reloading the extension by hand if a
+restart was unavoidable.
+
+---
+
+## Google Flights live test: two real, distinct failures, both honestly caught, neither forced past
+
+**Attempt 1 - wrong element found.** `find_web_element("destination")`
+matched `ref_id=jw_80`, labeled "Popular flight destinations from United
+States" - a real element on the real page, but not the input field. Not a
+scoring bug: dumping the actual page structure showed the real destination
+field (`jw_17`) has `aria_label="Where to? "` / `placeholder="Where to?"` -
+the word "destination" does not appear anywhere on or near it. "destination"
+matched jw_80 purely because that unrelated element's text happened to
+contain the substring, exactly the class of accidental collision the
+priority-ordered, exact-beats-substring scoring is built to minimize but
+can't eliminate when the query word genuinely isn't present on the real
+target at all. `type_in_web_field` then correctly timed out trying to type
+into it (`error: "result_timeout"`) rather than reporting a false success -
+`jw_80` isn't a text-input-capable element, so `content_script.js`'s
+`executeType` had nothing to act on.
+
+Confirmed the fix needed was query wording, not matcher logic: re-running
+`find_web_element` with `"where to"`, `"Where to?"`, and `"Where to"` all
+correctly found `jw_17` on the same snapshot. Documented per the standard
+set for this whole step: don't force a wrong match through, tell the user
+plainly what was tried and what the real page structure actually looks
+like, let them decide the next query rather than guessing further alone.
+
+**Attempt 2 - right element, real DOM reaction, but the typed text never
+landed.** With `"Where to?"` correctly resolving to `jw_17`,
+`type_in_web_field` queued and dispatched the type action for real:
+element count jumped from 85 to 102 (+17, almost certainly Google
+Flights' own autocomplete dropdown opening in response to focus/typing)
+and the snapshot generation genuinely increased
+(`1788034508270` -> `1788034514059`). But the field's real `value` in
+that newer snapshot was still `""` - the second-layer check
+(`type_in_web_field` reads the field's actual value back, not just "did a
+newer generation arrive") caught this and correctly reported
+`success: False, error: "value_not_verified"` rather than trusting the
+generation bump alone as proof of success. This is exactly why that
+second check exists, not a redundant belt-and-suspenders addition - a
+snapshot with a materially different element count is about as convincing
+a "something happened" signal as this architecture can produce, and it
+still wasn't sufficient on its own here.
+
+**Diagnosis, not yet fixed:** `content_script.js`'s `executeType` sets
+`el.value = text` directly and dispatches plain `input`/`change` events.
+Google Flights' destination field is almost certainly a React-controlled
+input - React tracks value changes through its own wrapped native setter,
+and a raw `.value` assignment is a well-documented case where React's
+internal state doesn't observe the change even though the DOM briefly
+reacts to it (explaining the dropdown appearing while the bound value
+stayed empty). The standard fix for automating a React-controlled input
+is calling the *native* `HTMLInputElement.prototype.value` setter
+directly (bypassing whatever setter React has patched onto the instance)
+before dispatching the `input` event, so React's own change detection
+actually fires. Not implemented yet - flagged for a decision before
+building it, same as the fixed-offset simplification earlier in this
+project: a real, scoped code change, not something to guess into working
+silently.
