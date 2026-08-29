@@ -383,6 +383,47 @@
     return { ok: true, message: "Clicked." };
   }
 
+  // Plain `el.value = text` doesn't reliably work on framework-controlled
+  // inputs (React and similar reactive frameworks). These frameworks
+  // override the `value` property setter on the element *instance* (or
+  // intercept it via a synthetic event system) so they can sync their own
+  // internal state whenever a value changes - a naive assignment goes
+  // through THAT overridden setter, which frequently no-ops or gets
+  // clobbered on the framework's next re-render, since as far as the
+  // framework's own state is concerned, nothing happened. Confirmed
+  // directly: this is exactly what was observed against Google Flights'
+  // destination field - the DOM visibly reacted (an autocomplete dropdown
+  // opened, proving the input/focus events did fire) but the field's own
+  // value stayed empty, because React's change tracking never fired.
+  //
+  // The fix is the standard technique for this, not a workaround: grab
+  // the *native* value setter directly off the element's prototype
+  // (HTMLInputElement.prototype / HTMLTextAreaElement.prototype) - this
+  // is the browser's own original setter, defined before any framework
+  // instance-level override exists - and call it explicitly. That bypasses
+  // the framework's interception entirely and writes the real, underlying
+  // DOM property. Dispatching a real `input` event afterward is what
+  // actually makes React (and similar frameworks) notice the change at
+  // all, since they listen for that event rather than polling the
+  // property on every tick.
+  //
+  // This is the default typing mechanism for every plain value-carrying
+  // element, not a Google-Flights-specific special case - the same
+  // failure mode applies to any framework-controlled input, and a native
+  // setter + real events is strictly correct (not just "also works") for
+  // plain, non-framework inputs too, since that's what a native controls
+  // 'value =' assignment already reduces to.
+  function setNativeValue(el, value) {
+    const tag = el.tagName.toLowerCase();
+    const proto = tag === "textarea" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const nativeSetter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (nativeSetter) {
+      nativeSetter.call(el, value);
+    } else {
+      el.value = value; // fallback, shouldn't be reachable in a real browser
+    }
+  }
+
   function executeType(el, text, clearFirst) {
     focusAndReveal(el);
     if (el.isContentEditable) {
@@ -395,11 +436,11 @@
       return { ok: true, message: "Typed via execCommand into contenteditable." };
     }
     if ("value" in el) {
-      if (clearFirst || el.value) el.value = "";
-      el.value = text;
+      if (clearFirst || el.value) setNativeValue(el, "");
+      setNativeValue(el, text);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      return { ok: true, message: "Typed via value assignment." };
+      return { ok: true, message: "Typed via native value setter + input/change events." };
     }
     return { ok: false, message: "Element does not support text input." };
   }
