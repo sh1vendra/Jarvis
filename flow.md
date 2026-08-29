@@ -311,17 +311,31 @@ original.
 **Verified so far, for real, not just in isolation:** the extension loads
 cleanly in Chrome (Developer Mode, unpacked), performs a real
 `browser_bridge_hello` handshake against a running
-`browser_bridge_server.py`, and a real page (an arbitrary, unscripted
-Wikipedia article - see `planning.md`) produces a real snapshot: 89
-elements, correctly tagged and serialized by `content_script.js`'s actual
-DOM-walking code, not a hand-built fixture. The reconnect path
-(`background.js`'s `scheduleReconnect`) was also exercised for real, if
-unplanned - see `planning.md`. **Still unverified live:** the full
-action-dispatch path (a queued `click`/`type` action actually reaching
-`content_script.js`'s `executeAction` and producing a real DOM change) -
-so far that path has only been confirmed with a scripted fake client (see
-the in-process push/event test above), not the real extension. The
-upcoming Google Flights test is what closes that gap.
+`browser_bridge_server.py`, and real pages (an arbitrary Wikipedia
+article, and Google Flights) produce real snapshots correctly tagged and
+serialized by `content_script.js`'s actual DOM-walking code, not a
+hand-built fixture. The reconnect path (`background.js`'s
+`scheduleReconnect`) was also exercised for real, if unplanned - see
+`planning.md`. `find_web_element` was confirmed against real page
+structure - correctly resolving `"Where to?"`/`"where to"` to Google
+Flights' actual destination field once given wording that matches the
+site's real copy (see `planning.md` for the wrong-match case that
+preceded this). The full action-dispatch path (queued action -> pushed to
+the extension -> `content_script.js`'s `executeAction` -> a real DOM
+reaction) is also now confirmed live - `type_in_web_field` triggered a
+genuine, observable change (85 -> 102 elements, generation increased).
+
+**Still unverified / a known real gap:** the typed text does not actually
+land in the destination field's bound value - `type_in_web_field`'s
+second-layer check (reading the field's real `value` back from a fresh
+snapshot, not just trusting that a newer generation arrived) correctly
+caught this and reported `value_not_verified` rather than a false
+success. Diagnosed as Google Flights' destination field very likely being
+a React-controlled input, where `executeType`'s current plain
+`el.value = text` assignment doesn't update React's own tracked state -
+see `planning.md` for the specific fix this needs (calling the native
+input value setter directly, bypassing React's patched one) and why it
+wasn't built yet without a decision on it first.
 
 **Processes involved, and how they actually connect:**
 - `backend/servers/browser_bridge_server.py` - a `websockets` server on
