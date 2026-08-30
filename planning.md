@@ -1293,3 +1293,74 @@ not a new gap. A future improvement could have `click_web_element`
 accept an optional expected-URL-substring or content check for cases like
 this one, mirroring how `mac_control.py`'s `click_ui` takes an
 `expected_outcome`.
+
+---
+
+## Push-to-talk hotkey instead of Porcupine wake-word detection
+
+**Decision:** Jarvis will be triggered by a push-to-talk keyboard hotkey,
+not by an always-listening "Hey Jarvis" wake word. Porcupine (and
+wake-word detection generally) is dropped from scope entirely - not
+deferred, not stubbed, just not built.
+
+**Why:** Wake-word detection is a real audio-pipeline subsystem with its
+own failure modes - false positives (triggering on background speech or
+TV), false negatives (not triggering when the room is noisy), a
+continuously-open microphone stream that has to coexist with the OS mic
+permission model, and Porcupine's own access-key/model-file setup. None
+of that is visible in a recorded demo video: on camera, "user presses a
+key, then speaks" and "user says a wake word, then speaks" look
+identical - a beat, then a command. The wake word adds a whole class of
+things that can go wrong during a take without adding anything the
+viewer can see. A hotkey is deterministic: it fires exactly when pressed
+and never when not.
+
+**Constraints:** This is a demo-reliability call, made with the same
+reasoning as the Kayak-over-Google-Flights swap - pick the path with
+fewer live failure modes when the alternative buys no visible value. The
+real Electron global-hotkey UI is a frontend concern and comes later;
+for now the push-to-talk trigger is a plain Python `input()` prompt
+(press Enter to start, Enter again to stop), which is enough to prove
+the STT mechanism against real microphone audio.
+
+**What we didn't do:** No Porcupine dependency, no `.ppn` model files, no
+always-on `RawInputStream`, no voice-activity-detection tuning. If a
+wake word is ever wanted post-demo it's an additive change at the
+capture layer - nothing downstream of `transcribe_audio` knows or cares
+how recording was triggered.
+
+---
+
+## Voice pipeline built STT-output-first: simulated transcripts before a real microphone
+
+**Decision:** Build and test the voice -> agent path in stages, starting
+from the *output* of speech-to-text (a known text string) and working
+backward toward real audio, rather than starting from a microphone.
+
+1. `voice/stt.py` with `transcribe_audio(audio_data)` wrapping Google's
+   free endpoint, plus a `SimulatedAudio` object that carries a known
+   transcript `transcribe_audio` returns verbatim - no network, no audio.
+2. Wire a `SimulatedAudio` transcript through the existing
+   Orchestrator -> Planner -> Action chain in `main.py`, as a test case
+   shaped exactly like the existing Spotify/Reminders/Kayak ones.
+3. Only then build real capture (`sounddevice` push-to-talk) and feed
+   real `AudioData` to the same `transcribe_audio`.
+4. Record a real spoken command, transcribe it, run it through the full
+   chain for real.
+
+**Why:** Two subsystems are new at once - a voice capture/transcription
+layer and its handoff into the agent chain. Testing them together from
+the start means every failure is ambiguous: did the mic not capture, did
+Google mis-transcribe, or did the agent chain choke on the text? Feeding
+a known-good transcript through first proves the handoff is structurally
+sound in isolation, so that when real audio is introduced the only new
+variable is the audio itself. The `SimulatedAudio` path isn't throwaway
+test scaffolding either - it's the same seam a future text-input mode
+(typing a command instead of speaking it) would use.
+
+**What we didn't do:** No mock of the `speech_recognition` library
+internals or Google's HTTP response - the simulation is at the clean
+boundary (`transcribe_audio`'s input), not inside it, so the real
+recognition code path is exercised untouched the first time real audio
+reaches it. No attempt to test real-audio and agent-chain integration
+before the simulated handoff was proven.

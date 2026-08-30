@@ -7,3 +7,4 @@ pyobjc-framework-ApplicationServices
 pyobjc-framework-Quartz
 Pillow
 websockets
+SpeechRecognition
