@@ -119,6 +119,39 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
                     print(f"[{event.author}] {part.text.strip()}")
 
 
+async def run_milestones_until_approval(
+    action_runner: InMemoryRunner, session_id: str, milestones: list[Milestone]
+) -> Milestone | None:
+    """Executes milestones via the Action agent in order, but stops BEFORE
+    ever executing the first one with requires_approval=True - that
+    milestone is returned, never sent to run_action here, so a caller
+    (eventually a real approval-modal UI; a simulated approval step in
+    tests today) decides whether it actually runs at all.
+
+    This is deliberately enforced here, at the orchestration level (the
+    loop that decides which milestone to run next), rather than inside
+    the Action agent itself - the Action agent's job is executing one
+    milestone it's been handed, not deciding whether it should have been
+    handed one in the first place. Putting the gate any lower (e.g. inside
+    click_web_element) would mean trusting the agent to police its own
+    execution, which is exactly the kind of self-reported gate this
+    project has repeatedly found unreliable elsewhere (see planning.md).
+
+    Returns the paused Milestone, or None if every milestone ran without
+    hitting an approval gate.
+    """
+    for milestone in milestones:
+        if milestone.requires_approval:
+            print(f"\n{'!' * 60}")
+            print(f"AWAITING APPROVAL: {milestone.goal!r}")
+            print(f"(success_signal: {milestone.success_signal!r})")
+            print("Execution paused here - this milestone was NOT run.")
+            print("!" * 60)
+            return milestone
+        await run_action(action_runner, session_id, milestone)
+    return None
+
+
 async def main() -> None:
     # The browser bridge server (backend/servers/browser_bridge_server.py)
     # runs as an in-process background task sharing this event loop, not a
@@ -199,6 +232,18 @@ async def main() -> None:
     # URL, only for acting on whatever page is already open, same
     # precondition the Spotify/Reminders cases above have for their
     # respective apps already being in a known state.
+    #
+    # This is Jarvis's plan-approval-modal command: the Planner is
+    # instructed to give the final, consequential step (submitting the
+    # search) its own milestone with requires_approval=true, and
+    # run_milestones_until_approval enforces the pause - it stops before
+    # ever running that milestone rather than trusting the Action agent to
+    # decide not to. There's no real approval-modal UI yet, so approval is
+    # simulated below with an explicit follow-up run_action call standing
+    # in for a user's "approve" click, proving the pause-and-resume
+    # mechanics work (same ADK session throughout, so the Action agent
+    # still has full context from the milestones that already ran) ahead
+    # of that UI existing.
     session5 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
     kayak_plan = await run_command(
         orchestrator_runner, session5.id, "on the Kayak website that's already open, search for a flight to New York"
@@ -207,8 +252,11 @@ async def main() -> None:
     if kayak_plan is not None:
         action_runner3 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
         action_session3 = await action_runner3.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-        for milestone in kayak_plan.milestones:
-            await run_action(action_runner3, action_session3.id, milestone)
+        pending_milestone = await run_milestones_until_approval(action_runner3, action_session3.id, kayak_plan.milestones)
+
+        if pending_milestone is not None:
+            print(f"\n[TEST] Simulating explicit user approval for: {pending_milestone.goal!r}")
+            await run_action(action_runner3, action_session3.id, pending_milestone)
 
 
 if __name__ == "__main__":
