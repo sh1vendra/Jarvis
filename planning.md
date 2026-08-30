@@ -962,3 +962,64 @@ actually fires. Not implemented yet - flagged for a decision before
 building it, same as the fixed-offset simplification earlier in this
 project: a real, scoped code change, not something to guess into working
 silently.
+
+---
+
+## The native-setter fix was built correctly, and it still didn't work - a deeper, likely unfixable-from-a-content-script cause
+
+**What was built:** `content_script.js`'s `executeType` now calls
+`Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set`
+directly on the element before dispatching real `input`/`change` events,
+exactly the standard technique for React-controlled inputs described in
+the entry above. Confirmed present and correct on disk at test time (not
+assumed - grepped the actual file content immediately before concluding
+anything, after the first post-fix test looked suspiciously identical to
+the pre-fix failure).
+
+**Retested clean, twice, both still failed identically:** after
+confirming (via the field's own `label`/`value` in a fresh snapshot) that
+the destination field was genuinely empty before typing - not a
+contaminated page state like the earlier false alarm - `type_in_web_field`
+still reported `value_not_verified` both times, with the exact same
+symptom as before the fix: element count jumps 85 -> 102 (Google's
+autocomplete dropdown opening, proving focus/click events land), snapshot
+generation genuinely increases, but the field's real `value` in that newer
+snapshot stays `""`.
+
+**Real root cause, confirmed directly, not just theorized:** every event a
+content script dispatches via `element.dispatchEvent(...)` - regardless of
+which value-setting technique preceded it - carries `event.isTrusted ===
+false`. This is a read-only browser property; no JavaScript running on the
+page (content script or otherwise) can ever set it to `true`. Some Google
+products are known to gate input handling on `isTrusted`, specifically to
+reject exactly this class of automation. Tested the hypothesis directly
+rather than left it as a guess: with the automated attempt still showing
+an empty value, the user manually typed "New York" into the same field
+with a real keyboard - it worked immediately, and the URL picked up a real
+`tfs=` search-state parameter. Same field, same page, same moment in time,
+only the input's trust level differed. That's about as close to a
+controlled comparison as this could get without instrumenting the page
+itself, and it isolates the variable cleanly: **real keystrokes work,
+synthetic ones - by any DOM-API technique - do not.**
+
+**Why this isn't fixable from within a content script at all:** the native-
+setter-plus-event technique is the correct, complete fix for the class of
+problem it targets (a framework's controlled-input state not observing a
+plain property write) - it worked as designed in the sense that it does
+exactly what it's supposed to do. It just doesn't touch `isTrusted`,
+because nothing running in the page's own JS context can. Actually
+producing a trusted input event requires simulating input at the OS or
+browser-process level (e.g. the Chrome DevTools Protocol's
+`Input.dispatchKeyEvent`, which Chrome itself treats as trusted since it
+originates outside the page) - a fundamentally different, much larger
+mechanism than anything `content_script.js` can do from inside the page,
+requiring the `chrome.debugger` permission and a different automation
+path entirely, not a refinement of the current one.
+
+**Not pursued further at this stage - a demo-command decision, not a code
+decision, is the right next step here**, consistent with how the earlier
+Spotify click-precision dead end was handled: when a target genuinely
+can't be reached with the current architecture, the answer is to
+reconsider which target the demo uses, not to keep forcing the same
+approach. Discussion follows in the next planning entry once that decision
+is made.
