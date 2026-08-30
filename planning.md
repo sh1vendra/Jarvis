@@ -1156,3 +1156,95 @@ call, real value `'New York'` confirmed after, user independently verified
 they had not typed it themselves) - this run adds a different kind of
 evidence (real agent autonomy, honest failure reporting under a
 non-ideal starting state) rather than repeating that one.
+
+---
+
+## Two real gaps fixed: exact-match short-circuit, and an orchestration-level approval gate
+
+**Gap 1 - exact-match short-circuit in `type_in_web_field`.** The
+previous entry's milestone-1 failure (`no_newer_snapshot` on a field that
+already held the correct text) traced to a real limitation of
+generation-based verification: retyping an already-correct value doesn't
+reliably produce a fresh snapshot, since nothing observably changes for
+the content script's `MutationObserver` batch threshold to cross. Rather
+than loosen the generation check (which would also weaken it for the case
+it actually exists to catch - detecting a click/type that silently did
+nothing), `type_in_web_field` now checks the field's current real value in
+the latest snapshot *before* queuing any action at all, and returns
+immediate success with no action dispatched if it already matches. This
+is a strictly more honest check than the thing it replaces for this case:
+"the value is already correct" is directly observable and doesn't need an
+action's side effect to confirm it.
+
+**Verified live, cleanly:** against a real Kayak destination field already
+holding `'New York'`, calling `type_in_web_field('jw_21', 'New York')`
+returned `success: True` in `0.00s` with `"nothing to type, no action
+dispatched"` - not a generation bump, not a dispatched action, an
+immediate, honest short-circuit. Also unit-tested the fall-through path
+(field holds a *different* value) against a deliberately-disconnected
+bridge, confirming it still correctly proceeds to the real dispatch path
+(`queue_failed`, not silently short-circuited) rather than this change
+accidentally swallowing the case it's not meant to handle.
+
+**Gap 2 - a real approval gate, enforced at the orchestration level, not
+inside the Action agent.** `agents/planner.py`'s `Milestone` model gained
+a `requires_approval: bool` field, with instruction guidance to give a
+task's final, hard-to-reverse, consequential step (submitting a search,
+completing a purchase, etc.) its own separate milestone and mark only
+that one `requires_approval=true`. `main.py`'s new
+`run_milestones_until_approval` is the actual enforcement point: it runs
+milestones through the Action agent in order, but the moment it reaches
+one with `requires_approval=true`, it returns that milestone *without
+ever calling `run_action` on it* - the Action agent never even sees it,
+let alone gets a chance to decide whether to run it. This was a
+deliberate placement choice: putting the gate inside the Action agent (or
+inside `click_web_element`) would mean trusting the same
+self-reporting agent this whole project has repeatedly found unreliable
+elsewhere (Bug 2's false success, the Google Flights `isTrusted` chase,
+etc.) to also police its own execution - the gate needed to sit somewhere
+that doesn't depend on the agent's own judgment at all, i.e., the loop
+that decides which milestone gets sent to the agent in the first place.
+
+There's no real approval-modal UI yet, so approval is simulated in
+`main.py`/test scripts with an explicit follow-up `run_action(...)` call
+for the paused milestone, standing in for a future "approve" click -
+deliberately reusing the *same* ADK session throughout the pause, so the
+mechanics of "does context survive the pause" get tested for real rather
+than assumed.
+
+**Verified two ways, honestly, including a real limitation of the current
+test setup (not the fix itself):**
+
+1. **Unit-level, unambiguous:** a milestone list where the *first*
+   milestone already has `requires_approval=true` was run through
+   `run_milestones_until_approval` with a deliberately invalid
+   `action_runner`/session (`None`, `"unused-session"`) - it returned the
+   pending milestone immediately without erroring, proving the gate
+   short-circuits *before* touching the action runner at all, not just
+   before completing.
+2. **Live, via the real agent chain:** the Planner, unprompted beyond the
+   updated instruction, correctly produced `requires_approval: false` for
+   "enter the destination" and `requires_approval: true` for "initiate
+   the search" as two separate milestones - exactly the intended shape.
+   `run_milestones_until_approval` printed the pause banner and did not
+   run milestone 2 automatically; only after the simulated approval call
+   did the Action agent actually attempt it. This confirms the gate's
+   control flow works correctly in a real run, not just in a synthetic
+   unit test.
+
+**What this live run does NOT prove, stated plainly rather than rounded
+up:** in this specific run, `browser_store` never received a real
+snapshot at all (both milestones failed with `no_snapshot`, and a
+follow-up retry that waited up to 60s for a live Kayak snapshot before
+even issuing the command still never got one - Kayak was very likely no
+longer the active tab by that point in a long testing session). So while
+the *approval gate's control flow* is proven live, a single continuous
+run where milestone 1 actually types into a real field, the gate pauses,
+approval is given, and milestone 2 actually clicks Search and lands on a
+real results page - all in one unbroken sequence - has not yet happened.
+The two things that *are* independently, cleanly proven (the exact-match
+short-circuit, live; the gate's control flow, both in a unit test and
+live) compose correctly by construction (neither touches the other's code
+path), but a single unbroken run tying all of it together is the natural
+next verification step, blocked only on Kayak being the live active tab
+when it runs - not on anything in the fix itself.
