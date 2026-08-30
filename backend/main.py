@@ -16,6 +16,7 @@ from agents.action import action_agent
 from agents.orchestrator import orchestrator_agent
 from agents.planner import Milestone, MilestonePlan
 from servers.browser_bridge_server import serve_forever as serve_browser_bridge_forever
+from voice.stt import SimulatedAudio, transcribe_audio
 
 # Load GOOGLE_API_KEY (and anything else) from .env before any ADK/Gemini
 # calls are made.
@@ -152,6 +153,22 @@ async def run_milestones_until_approval(
     return None
 
 
+async def run_voice_command(runner: InMemoryRunner, session_id: str, audio) -> MilestonePlan | None:
+    """The voice entry point: transcribe captured audio to text, then send
+    that text through exactly the same Orchestrator path a typed command
+    takes (`run_command`).
+
+    `audio` is whatever the capture layer produces - a real
+    `speech_recognition.AudioData` once a microphone is wired in, or a
+    `voice.stt.SimulatedAudio` carrying a known transcript for testing the
+    handoff without one. `transcribe_audio` handles both; nothing below this
+    line knows or cares which it was.
+    """
+    transcript = transcribe_audio(audio)
+    print(f"\n[VOICE] transcript: {transcript!r}")
+    return await run_command(runner, session_id, transcript)
+
+
 async def main() -> None:
     # The browser bridge server (backend/servers/browser_bridge_server.py)
     # runs as an in-process background task sharing this event loop, not a
@@ -257,6 +274,27 @@ async def main() -> None:
         if pending_milestone is not None:
             print(f"\n[TEST] Simulating explicit user approval for: {pending_milestone.goal!r}")
             await run_action(action_runner3, action_session3.id, pending_milestone)
+
+    # Voice pipeline, structural test: a SimulatedAudio carrying a known
+    # transcript goes through run_voice_command -> transcribe_audio (which
+    # returns the transcript verbatim, no network, no microphone) -> the
+    # exact same Orchestrator -> Planner -> Action chain every typed command
+    # above uses. This proves the voice-to-agent handoff is sound before a
+    # real microphone is involved: the only thing stubbed is STT's output,
+    # and it's stubbed at the clean boundary (transcribe_audio's input), so
+    # the agent chain runs completely unmodified. Uses the reminder command
+    # because it exercises the full chain including a real Action-agent tool
+    # call, and it's the command chosen for the real-audio test later (clear,
+    # common words, no dependency on a pre-open app or browser tab).
+    session6 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+    simulated_audio = SimulatedAudio("set a reminder to call mom tomorrow at 5pm")
+    voice_plan = await run_voice_command(orchestrator_runner, session6.id, simulated_audio)
+
+    if voice_plan is not None:
+        action_runner4 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
+        action_session4 = await action_runner4.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+        for milestone in voice_plan.milestones:
+            await run_action(action_runner4, action_session4.id, milestone)
 
 
 if __name__ == "__main__":

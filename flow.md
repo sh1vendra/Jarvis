@@ -6,11 +6,28 @@ lifecycle or a component's behavior changes.
 
 ## 1. Entry point
 
-`backend/main.py` is the only entry point right now (no voice/UI layer yet).
+`backend/main.py` is the only runnable entry point (no UI layer yet).
 `load_dotenv()` pulls `GOOGLE_API_KEY` from the repo-root `.env` before any
 ADK/Gemini call is made. `logging.basicConfig(level=logging.INFO, ...)` is
 set up here so that `agents/verifier_callbacks.py`'s logger and
 `tools/mac_control.py`'s zoom-search logger both actually print.
+
+There are now two ways a command enters the chain, and they converge
+immediately:
+- **Typed** - `run_command(runner, session_id, text)` sends the text
+  straight to the Orchestrator.
+- **Voice** - `run_voice_command(runner, session_id, audio)` first calls
+  `voice.stt.transcribe_audio(audio)` to get a transcript string, then
+  calls `run_command` with it. `audio` is either a real
+  `speech_recognition.AudioData` (from `voice/capture.py`'s push-to-talk
+  recorder) or a `voice.stt.SimulatedAudio` carrying a known transcript
+  that `transcribe_audio` returns verbatim - no network, no microphone.
+  Nothing downstream of `transcribe_audio` can tell which it was; the
+  Orchestrator receives an ordinary text string either way.
+
+See `voice/stt.py` (section 9) for how transcription and the simulated
+bypass work, and `planning.md` for why the trigger is a push-to-talk
+hotkey rather than wake-word detection.
 
 Two ADK runner types are used, each wrapping one agent:
 - `InMemoryRunner(agent=orchestrator_agent, ...)` - drives a text command
@@ -19,8 +36,11 @@ Two ADK runner types are used, each wrapping one agent:
   time through the Action agent.
 
 Each logical run gets its own session (`session_service.create_session`), so
-`main()`'s four test cases in the file don't share conversation state with
-each other.
+`main()`'s test cases in the file don't share conversation state with each
+other. One of those cases (`session6`) drives a `SimulatedAudio` transcript
+through `run_voice_command` and on through the full Orchestrator -> Planner
+-> Action chain, shaped exactly like the typed Spotify/Reminders/Kayak
+cases.
 
 ## 2. Orchestrator's decision logic
 
@@ -493,3 +513,32 @@ stops any *future* waiter from returning instantly on a stale "already
 set" flag. Without the swap, every wait after the first snapshot would
 return immediately regardless of whether a new snapshot had actually
 arrived.
+
+## 9. Voice path: capture and transcription
+
+`backend/voice/stt.py` is the speech-to-text layer. `transcribe_audio(
+audio_data, *, language="en-US")` is the one function the rest of the
+system calls:
+
+- Given a `SimulatedAudio` (a small object wrapping a known transcript
+  string), it returns `.transcript.strip()` directly - no network, no
+  audio. This is the seam that let the whole voice -> agent chain be
+  built and tested before a microphone existed, and is also what a future
+  "type a command instead of speaking it" mode would reuse.
+- Given a real `speech_recognition.AudioData`, it constructs an
+  `sr.Recognizer` and calls `recognizer.recognize_google(audio_data,
+  language=...)` - the library's free Google endpoint (generic key baked
+  into `speech_recognition`, no key of ours, no billing). `UnknownValueError`
+  (unintelligible speech) and `RequestError` (network down, rate-limited,
+  key revoked) are both re-raised as `voice.stt.TranscriptionError` so
+  callers have one exception type to handle.
+
+`SAMPLE_RATE = 16_000` / `SAMPLE_WIDTH = 2` (16 kHz mono 16-bit PCM) are
+defined here and shared with the capture layer so the two can't drift.
+`audio_from_wav(path)` loads a saved clip into an `AudioData` for
+re-transcription without re-recording; `save_wav(audio_data, path)` writes
+one out via the stdlib `wave` module for inspection.
+
+Real microphone capture (a push-to-talk recorder feeding real `AudioData`
+into `transcribe_audio`) is the next build stage; until then the voice
+path is exercised only through `SimulatedAudio`.
