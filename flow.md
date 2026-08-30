@@ -41,7 +41,10 @@ which agent (`event.author`) actually produced it.
 
 `agents/planner.py` defines two Pydantic models:
 - `Milestone`: `step_number`, `goal` (an outcome, never a literal action),
-  `success_signal` (an observable signal that the outcome was reached).
+  `success_signal` (an observable signal that the outcome was reached),
+  `requires_approval` (bool, default `False` - true only for a milestone
+  whose completion performs a final, hard-to-reverse, consequential
+  action; see section 8's plan-approval-pause entry).
 - `MilestonePlan`: `milestones: list[Milestone]`.
 
 `planner_agent` is a leaf agent (no `sub_agents`, no tools) with
@@ -51,7 +54,9 @@ that validates against `MilestonePlan`, so `main.run_command()` can do
 free text. The instruction explicitly contrasts an outcome-shaped milestone
 ("Spotify is open and in the foreground") against a forbidden
 action-shaped one ("click the Spotify icon at position X,Y") to keep the
-model from collapsing into step-by-step output.
+model from collapsing into step-by-step output, and separately instructs
+the model to give a task's final consequential action its own milestone
+with `requires_approval=true` rather than folding it into an earlier step.
 
 ## 4. Action agent's tool selection and execution loop
 
@@ -342,20 +347,49 @@ framework's own overridden setter) before dispatching real `input`/
 `change` events - confirmed working cleanly on Kayak: `type_in_web_field`
 reported `success: True`, a genuinely newer snapshot generation, and the
 field's real value read back as `'New York'`, independently confirmed by
-the user as coming from the automated call and not their own typing. A
-full, real run of the Kayak demo command through the actual agent chain
-also completed - the Action agent worked through several `find_web_element`
-guesses on its own (same wrong-match-then-right-match pattern as above)
-and, on that particular run, correctly reported the destination-field
-milestone as *unverified* rather than a false success, because the field
-already held the same text from an earlier test and retyping an identical
-value didn't produce a fresh snapshot within the timeout - a real,
-narrow edge case in generation-based verification (identical-value
-writes can look like no-ops to the MutationObserver), not a regression in
-the underlying fix. See `planning.md` for the full walkthrough, including
-that this same run's second milestone (clicking Search) succeeded and
-was fully verified, and that it went on to submit a real, live Kayak
-search with no stop-before-submit boundary set for this particular run.
+the user as coming from the automated call and not their own typing.
+
+**`type_in_web_field`'s verification now has two paths, checked in this
+order** (`tools/browser_tools.py`): (1) if the field's real value in the
+*current* snapshot already matches the target text, return success
+immediately with no action dispatched at all - added after a real failure
+mode surfaced live: retyping an already-correct value doesn't reliably
+produce a fresh snapshot (nothing observably changes for the content
+script's `MutationObserver` batch threshold to cross), which made an
+already-correct field report a false `no_newer_snapshot` failure. (2)
+Otherwise, the original path: queue the type action, wait for the
+extension's result, then wait for a genuinely newer snapshot generation
+and read the field's real value back from it. Confirmed live: an
+already-`'New York'`-holding field now returns success in `0.00s` with no
+action dispatched, and the disconnected-bridge fallback case was unit-
+tested to confirm it still correctly falls through to real dispatch
+rather than this change accidentally swallowing that path.
+
+**Plan-approval pause, enforced at the orchestration level.**
+`agents/planner.py`'s `Milestone` now carries `requires_approval: bool`,
+with instruction guidance to give a task's final, consequential step
+(submitting a search, completing a purchase, etc.) its own separate
+milestone marked `requires_approval=true`. `main.py`'s
+`run_milestones_until_approval` is the actual gate: it runs milestones
+through the Action agent in order, but the moment it reaches one with
+`requires_approval=true`, it returns that milestone *without ever calling
+`run_action` on it* - deliberately placed in the orchestration loop
+rather than inside the Action agent or any tool, so the pause doesn't
+depend on the same self-reporting agent this project has repeatedly found
+unreliable elsewhere. There's no real approval-modal UI yet; `main.py`'s
+Kayak demo case simulates approval with an explicit follow-up
+`run_action(...)` call for the paused milestone, reusing the same ADK
+session throughout so the pause-and-resume mechanics (does context
+survive the pause) get tested for real, not assumed. Verified two ways:
+a unit-level test where the gate stops before ever touching the action
+runner at all (not just before completing), and a live run where the
+Planner correctly tagged only the "initiate search" milestone as
+requiring approval, the gate correctly paused there, and the Action agent
+only attempted it after the simulated approval call. See `planning.md`
+for what this live run does and doesn't fully close out (the gate's
+control flow is proven live; a single unbroken run where typing,
+pausing, approving, and clicking Search all succeed in one sequence is
+still pending a live Kayak connection to test against).
 
 **Processes involved, and how they actually connect:**
 - `backend/servers/browser_bridge_server.py` - a `websockets` server on
