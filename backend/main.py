@@ -15,6 +15,7 @@ from google.genai import types
 from agents.action import action_agent
 from agents.orchestrator import orchestrator_agent
 from agents.planner import Milestone, MilestonePlan
+from servers.browser_bridge_server import serve_forever as serve_browser_bridge_forever
 
 # Load GOOGLE_API_KEY (and anything else) from .env before any ADK/Gemini
 # calls are made.
@@ -114,6 +115,18 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
 
 
 async def main() -> None:
+    # The browser bridge server (backend/servers/browser_bridge_server.py)
+    # runs as an in-process background task sharing this event loop, not a
+    # separate OS process - required so browser_tools.py's
+    # click_web_element/type_in_web_field can await the same asyncio.Event
+    # objects the server's WebSocket handler sets. See planning.md's
+    # "browser bridge" entry for the full reasoning. A brief sleep gives it
+    # a moment to actually bind before anything tries to use it; if the
+    # Chrome extension isn't loaded/connected, browser-tool calls simply
+    # report "bridge is not connected" rather than hanging silently.
+    asyncio.create_task(serve_browser_bridge_forever())
+    await asyncio.sleep(0.5)
+
     orchestrator_runner = InMemoryRunner(agent=orchestrator_agent, app_name=APP_NAME)
 
     # Conversational input - the orchestrator should answer this itself and
@@ -157,6 +170,32 @@ async def main() -> None:
         action_session2 = await action_runner2.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
         for milestone in spotify_plan.milestones:
             await run_action(action_runner2, action_session2.id, milestone)
+
+    # Full browser-control command, executed for real end to end: same
+    # Orchestrator -> Planner -> Action chain, but this milestone's Action
+    # agent calls resolve to find_web_element/type_in_web_field
+    # (tools/browser_tools.py) instead of any native-app tool. Kayak, not
+    # Google Flights - Google Flights' destination field rejects
+    # JS-dispatched input entirely (every synthetic event has
+    # event.isTrusted === false, and its input handling appears to check
+    # for that specifically), confirmed via a direct side-by-side test
+    # against Kayak's own, comparably React-controlled field, which
+    # accepted the same code path with no changes. See planning.md's
+    # "browser bridge" entries for the full diagnosis. Assumes Kayak is
+    # already the active tab - there is no tool yet for navigating to a
+    # URL, only for acting on whatever page is already open, same
+    # precondition the Spotify/Reminders cases above have for their
+    # respective apps already being in a known state.
+    session5 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+    kayak_plan = await run_command(
+        orchestrator_runner, session5.id, "on the Kayak website that's already open, search for a flight to New York"
+    )
+
+    if kayak_plan is not None:
+        action_runner3 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
+        action_session3 = await action_runner3.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+        for milestone in kayak_plan.milestones:
+            await run_action(action_runner3, action_session3.id, milestone)
 
 
 if __name__ == "__main__":
