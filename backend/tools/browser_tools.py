@@ -192,6 +192,31 @@ async def type_in_web_field(ref_id: str, text: str) -> dict:
             generation: the confirming snapshot's generation, if successful
             error: raw error string if something went wrong, else None
     """
+    # If the field already holds the target text, there's nothing to type
+    # and nothing that dispatching a type action could newly verify -
+    # found necessary directly: retyping an already-correct value doesn't
+    # reliably produce a fresh snapshot (nothing observably changes, so
+    # the content script's MutationObserver batch threshold may never be
+    # crossed), which made a real, already-correct field report a false
+    # *failure* (`no_newer_snapshot`) rather than the true state. Checking
+    # the current value first and treating an exact match as an immediate
+    # success sidesteps that entirely, rather than trying to make
+    # generation-based verification more lenient in a way that would also
+    # weaken it for the case it actually exists to catch.
+    current_snapshot = browser_store.get_snapshot()
+    if current_snapshot is not None:
+        current_element = browser_store.get_element(ref_id, current_snapshot.session_id)
+        if current_element is not None and text.strip().lower() in (current_element.value or "").lower():
+            return {
+                "success": True,
+                "message": (
+                    f"{ref_id} already contains {text!r} (value={current_element.value!r}) - "
+                    "nothing to type, no action dispatched."
+                ),
+                "generation": current_snapshot.generation,
+                "error": None,
+            }
+
     queued = browser_bridge.queue_action(ActionRequest(action="type", ref_id=ref_id, text=text))
     if not queued.ok:
         return {"success": False, "message": queued.message, "generation": None, "error": "queue_failed"}
