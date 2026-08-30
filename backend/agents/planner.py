@@ -11,6 +11,14 @@ class Milestone(BaseModel):
     step_number: int = Field(description="1-indexed position of this milestone in the plan")
     goal: str = Field(description="The outcome/goal this milestone represents, not a specific action")
     success_signal: str = Field(description="An observable signal that tells us this milestone is complete")
+    requires_approval: bool = Field(
+        default=False,
+        description=(
+            "True only if completing this milestone performs a final, hard-to-reverse, or "
+            "consequential real-world action (e.g. submitting a search, completing a purchase, "
+            "sending a message). False for every other milestone."
+        ),
+    )
 
 
 class MilestonePlan(BaseModel):
@@ -37,7 +45,15 @@ planner_agent = LlmAgent(
         "Each milestone needs:\n"
         "- step_number: its 1-indexed position in the plan\n"
         "- goal: the outcome to reach\n"
-        "- success_signal: an observable signal that tells us the goal was reached\n\n"
+        "- success_signal: an observable signal that tells us the goal was reached\n"
+        "- requires_approval: true ONLY if reaching this milestone performs a final, "
+        "hard-to-reverse, or consequential real-world action - e.g. submitting a search, "
+        "completing a purchase, sending a message. False for every other milestone "
+        "(opening an app, filling in a field, navigating, reading information are never "
+        "hard-to-reverse). If a task's last step is this kind of action, give it its own "
+        "separate final milestone - don't fold it into an earlier one - and mark only that "
+        "milestone requires_approval=true, so execution can pause there for approval before "
+        "it actually runs.\n\n"
         "Keep the plan minimal — only the milestones actually needed to "
         "accomplish the task, in the order they must happen."
     ),
