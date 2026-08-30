@@ -1248,3 +1248,48 @@ live) compose correctly by construction (neither touches the other's code
 path), but a single unbroken run tying all of it together is the natural
 next verification step, blocked only on Kayak being the live active tab
 when it runs - not on anything in the fix itself.
+
+---
+
+## The unbroken run: both fixes proven together, in one continuous live sequence
+
+**With Kayak confirmed as the live active tab and the destination field
+genuinely blank, the full sequence ran clean, start to finish, no
+simulated steps besides the approval itself:**
+
+1. `find_web_element("the destination field")` failed honestly
+   (`no_match`); `find_web_element("Where to?")` correctly found the real
+   field (`jw_21`).
+2. `type_in_web_field(jw_21, "New York")` went through the *real*
+   dispatch-and-verify path this time (the field was genuinely empty, so
+   the exact-match short-circuit didn't apply - that path was already
+   proven separately, live, in the previous entry) - real generation
+   `1788116627948`, real value `'New York'` confirmed.
+3. The approval gate held: `run_milestones_until_approval` printed
+   `AWAITING APPROVAL` and did not run milestone 2. The real page state at
+   the pause point was checked directly - `url=https://www.kayak.com/`,
+   no search-result parameters - confirming Search genuinely had not been
+   clicked yet, not just that the code path hadn't been reached.
+4. Simulated approval issued; the Action agent then found the real
+   `Search` button (`jw_25`) and clicked it, verified via a real
+   generation increase (`1788116628755` -> `1788116630908`).
+
+**This closes the gap the previous entry left open** - the exact-match
+short-circuit and the approval gate are no longer just independently
+proven; they're proven composing correctly in one real, continuous run,
+which is what actually matters for the demo.
+
+**One honest limitation, not glossed over:** the post-click snapshot's
+`url` field stayed the base `https://www.kayak.com/`, with no
+search-results query parameters. The generation increase and the click's
+own success are real, verified signals that something changed - but
+"the search results page is displayed," milestone 2's `success_signal`,
+is the Action agent's own text summary of what it expects happened, not
+something `click_web_element`'s verification independently confirms.
+`click_web_element` was always documented as having no universal
+post-click content check (see the earlier click-outcome-verification
+entry) - this is that same, already-disclosed limitation showing up here,
+not a new gap. A future improvement could have `click_web_element`
+accept an optional expected-URL-substring or content check for cases like
+this one, mirroring how `mac_control.py`'s `click_ui` takes an
+`expected_outcome`.
