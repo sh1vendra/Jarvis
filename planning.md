@@ -1066,3 +1066,93 @@ flight-search demo, since a comparable, real site (Kayak) already works
 end-to-end with the current architecture. Whether to still pursue Google
 Flights specifically (via CDP) is now a separate, lower-urgency decision
 rather than a blocker.
+
+---
+
+## Kayak locked in as the flight-search demo target; wired into main.py; one more real bug found running it for real
+
+**Decision:** the flight-search demo command is now Kayak, not Google
+Flights (`backend/main.py`: `"on the Kayak website that's already open,
+search for a flight to New York"`, mirroring the Spotify/Reminders demo
+cases' pattern - Orchestrator -> Planner -> Action agent, run for real).
+Reasoning is entirely the diagnostic from the entry above: Google Flights'
+own input handling appears to specifically gate on `event.isTrusted`,
+rejecting the standard, correct native-setter-plus-event technique that
+every other part of this architecture uses successfully - confirmed via a
+direct, controlled comparison (same code path, same fix, no
+site-specific special-casing) against Kayak's comparably React-controlled
+destination field, which worked cleanly. This is not a flaw in the browser
+bridge or in `type_in_web_field`'s verification logic - it's one specific
+site's deliberate anti-automation defense, and Kayak doesn't have it (or
+at least doesn't apply it to this field).
+
+**A real bug found wiring this into `main.py` itself, not just ad-hoc test
+scripts:** `asyncio.create_task(serve_browser_bridge_forever())` without
+keeping a reference to the returned `Task` let Python's garbage collector
+reap the bridge server mid-run - confirmed directly, the server would die
+within seconds every time, well before any browser-tool call could reach
+it, throwing `RuntimeError: coroutine ignored GeneratorExit` and `Task was
+destroyed but it is pending!`. This is a well-documented asyncio gotcha
+(the docs explicitly warn: keep a reference to a task or it can vanish
+mid-execution, since `asyncio` itself only holds a weak one). Fixed by
+storing it in a module-level `_browser_bridge_task` rather than discarding
+the return value - a real, necessary fix, not defensive style.
+
+**Full milestone test, run for real via the actual Orchestrator -> Planner
+-> Action chain (not a hand-scripted diagnostic):**
+
+The Planner produced two milestones on its own: (1) destination field set
+to New York, (2) the search executed. The Action agent worked through
+`find_web_element` on its own, trying several description guesses before
+landing on the right one - `"destination input field"` and `"Enter
+origin, destination, or hotel"` both correctly failed with `no_match`,
+`"To"` matched a wrong element (`"Jump to content"`, a skip-navigation
+link) the same way `"destination"` did against Kayak earlier, and
+`"Where to?"` finally found the real field (`jw_21`). This is the agent
+genuinely doing what `find_web_element`'s design intends - trying
+descriptions and accepting honest failures - without any milestone-
+specific coaching from this session.
+
+**Milestone 1 result: reported unverified, honestly, not a false
+success** - and for a genuinely interesting reason. The field already
+showed "New York" *before* this run's own `type_in_web_field` call, left
+over from the diagnostic test earlier in this session (a fresh Kayak
+navigation had been requested beforehand, but evidently didn't fully
+reset the field - Kayak likely persists the last query client-side).
+`type_in_web_field` then retyped the identical text "New York" into a
+field that already held "New York," and no newer snapshot arrived within
+the 5s window - plausibly because writing the same value produces less
+DOM disturbance (no new autocomplete suggestions rendering differently,
+etc.) than writing a genuinely new value, and never crossed the
+MutationObserver's 5-mutations-per-batch threshold. The tool correctly
+reported `no_newer_snapshot` rather than declaring success because the
+field happened to already show the right text - exactly the right call,
+since it did not verify *this action* did anything, regardless of what
+the field's contents were for unrelated reasons.
+
+**Milestone 2 result: genuine success, fully verified.**
+`find_web_element("Search button")` correctly found the real button
+(`jw_25`); `click_web_element` reported success with a real newer
+generation (`1788114565576` -> `1788114631578`), confirming the click
+genuinely changed the page.
+
+**Worth flagging plainly:** this run had no "stop before submitting"
+boundary the way the earlier Google Flights work deliberately did - the
+Planner included search execution as its own milestone, and the Action
+agent completed it for real, submitting an actual live Kayak flight
+search. Low-stakes (a search query, not a purchase or any commitment),
+but a real external action nonetheless, worth naming rather than leaving
+implicit.
+
+**What this run does and doesn't prove, stated plainly:** it proves the
+full agent chain can pick tools, recover from wrong `find_web_element`
+guesses, and refuse to claim an unverified success - genuinely valuable,
+since none of that was hand-scripted this time. It does *not* cleanly
+re-prove `type_in_web_field`'s core mechanism against a truly blank field
+through the full chain, since the field wasn't blank going in. That clean
+proof already exists from the direct diagnostic test earlier in this
+session (blank field confirmed first, single automated `type_in_web_field`
+call, real value `'New York'` confirmed after, user independently verified
+they had not typed it themselves) - this run adds a different kind of
+evidence (real agent autonomy, honest failure reporting under a
+non-ideal starting state) rather than repeating that one.
