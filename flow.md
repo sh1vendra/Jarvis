@@ -308,45 +308,71 @@ reference architecture rather than designed from scratch - see
 deliberately-inherited known flaws, and what was trimmed from the
 original.
 
-**Verified so far, for real, not just in isolation:** the extension loads
-cleanly in Chrome (Developer Mode, unpacked), performs a real
-`browser_bridge_hello` handshake against a running
-`browser_bridge_server.py`, and real pages (an arbitrary Wikipedia
-article, and Google Flights) produce real snapshots correctly tagged and
-serialized by `content_script.js`'s actual DOM-walking code, not a
-hand-built fixture. The reconnect path (`background.js`'s
-`scheduleReconnect`) was also exercised for real, if unplanned - see
-`planning.md`. `find_web_element` was confirmed against real page
-structure - correctly resolving `"Where to?"`/`"where to"` to Google
-Flights' actual destination field once given wording that matches the
-site's real copy (see `planning.md` for the wrong-match case that
-preceded this). The full action-dispatch path (queued action -> pushed to
-the extension -> `content_script.js`'s `executeAction` -> a real DOM
-reaction) is also now confirmed live - `type_in_web_field` triggered a
-genuine, observable change (85 -> 102 elements, generation increased).
+**Demo target: Kayak, not Google Flights.** `backend/main.py`'s browser
+demo command is `"on the Kayak website that's already open, search for a
+flight to New York"`. Google Flights' destination field rejects
+JS-dispatched input specifically - every event a content script dispatches
+carries `event.isTrusted === false` (an unspoofable browser property), and
+Google Flights' input handling appears to gate on it. Confirmed via a
+direct, controlled comparison: the exact same `executeType` code, no
+site-specific branching, worked cleanly on Kayak's comparably
+React-controlled destination field and did not on Google Flights'. See
+`planning.md`'s browser-bridge entries for the full diagnosis - this is a
+site-specific defense, not a flaw in the bridge, the verification logic,
+or `executeType`'s fix.
 
-**Still unverified / a known real gap:** the typed text does not actually
-land in the destination field's bound value - `type_in_web_field`'s
-second-layer check (reading the field's real `value` back from a fresh
-snapshot, not just trusting that a newer generation arrived) correctly
-caught this and reported `value_not_verified` rather than a false
-success. Diagnosed as Google Flights' destination field very likely being
-a React-controlled input, where `executeType`'s current plain
-`el.value = text` assignment doesn't update React's own tracked state -
-see `planning.md` for the specific fix this needs (calling the native
-input value setter directly, bypassing React's patched one) and why it
-wasn't built yet without a decision on it first.
+**Verified live, end to end, including a real run of the actual
+Orchestrator -> Planner -> Action chain (not just hand-scripted
+diagnostics):** the extension loads cleanly in Chrome (Developer Mode,
+unpacked), performs a real `browser_bridge_hello` handshake against a
+running `browser_bridge_server.py`, and real pages (Wikipedia, Google
+Flights, Kayak) produce real snapshots correctly tagged and serialized by
+`content_script.js`'s actual DOM-walking code. The reconnect path
+(`background.js`'s `scheduleReconnect`) was exercised for real, if
+unplanned - see `planning.md`. `find_web_element` correctly resolves a
+description once it matches the site's actual copy, and correctly reports
+`no_match` rather than a wrong guess when a description doesn't - tested
+live on both Google Flights and Kayak, where an initial guess
+("destination") both times matched an unrelated decorative element before
+the real field's own wording ("Where to?"/"To?") was tried.
+
+`content_script.js`'s `executeType` now uses the native
+`HTMLInputElement`/`HTMLTextAreaElement` value setter (bypassing any
+framework's own overridden setter) before dispatching real `input`/
+`change` events - confirmed working cleanly on Kayak: `type_in_web_field`
+reported `success: True`, a genuinely newer snapshot generation, and the
+field's real value read back as `'New York'`, independently confirmed by
+the user as coming from the automated call and not their own typing. A
+full, real run of the Kayak demo command through the actual agent chain
+also completed - the Action agent worked through several `find_web_element`
+guesses on its own (same wrong-match-then-right-match pattern as above)
+and, on that particular run, correctly reported the destination-field
+milestone as *unverified* rather than a false success, because the field
+already held the same text from an earlier test and retyping an identical
+value didn't produce a fresh snapshot within the timeout - a real,
+narrow edge case in generation-based verification (identical-value
+writes can look like no-ops to the MutationObserver), not a regression in
+the underlying fix. See `planning.md` for the full walkthrough, including
+that this same run's second milestone (clicking Search) succeeded and
+was fully verified, and that it went on to submit a real, live Kayak
+search with no stop-before-submit boundary set for this particular run.
 
 **Processes involved, and how they actually connect:**
 - `backend/servers/browser_bridge_server.py` - a `websockets` server on
   `ws://127.0.0.1:8765` (env-overridable via `JARVIS_BROWSER_BRIDGE_HOST`/
   `JARVIS_BROWSER_BRIDGE_PORT`). Its `serve_forever()` coroutine runs as
-  an in-process `asyncio.create_task()` alongside wherever the Action
-  agent's tool calls execute - not a separate OS process - because the
-  `asyncio.Event` objects `browser/bridge.py` relies on are only safely
-  awaitable from the event loop that created them. A genuinely separate
-  process is only used for the isolated protocol test (a dumb scripted
-  client doesn't need shared Python state).
+  an in-process background task (`main.py`'s `_browser_bridge_task`)
+  alongside wherever the Action agent's tool calls execute - not a
+  separate OS process - because the `asyncio.Event` objects
+  `browser/bridge.py` relies on are only safely awaitable from the event
+  loop that created them. The task's reference is deliberately kept in a
+  module-level variable, not discarded - confirmed directly that
+  `asyncio.create_task(...)` without keeping a reference lets the
+  garbage collector reap the task mid-run (a well-documented asyncio
+  gotcha), which silently killed the bridge server within seconds every
+  time before this was fixed. A genuinely separate process is only used
+  for the isolated protocol test (a dumb scripted client doesn't need
+  shared Python state).
 - `chrome_extension/background.js` - an MV3 service worker that owns the
   WebSocket connection *to* that server. Authenticates with a shared
   token (`browser_bridge_hello`), then both pushes snapshots up and
