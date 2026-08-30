@@ -42,6 +42,12 @@ through `run_voice_command` and on through the full Orchestrator -> Planner
 -> Action chain, shaped exactly like the typed Spotify/Reminders/Kayak
 cases.
 
+`python main.py --voice` skips all of that and runs `run_live_voice()`
+instead: `voice/capture.py`'s `record_push_to_talk()` -> `transcribe_audio`
+-> the same Orchestrator -> Planner -> Action chain, approval gate
+(`run_milestones_until_approval`) included. This is the real-microphone
+end-to-end path; it needs the macOS mic permission granted (see section 9).
+
 ## 2. Orchestrator's decision logic
 
 `agents/orchestrator.py` defines `orchestrator_agent`, an ADK `LlmAgent`

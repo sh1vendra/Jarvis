@@ -169,6 +169,34 @@ async def run_voice_command(runner: InMemoryRunner, session_id: str, audio) -> M
     return await run_command(runner, session_id, transcript)
 
 
+async def run_live_voice() -> None:
+    """Stage-4 live path: record a real spoken command via push-to-talk,
+    transcribe it with Google STT, and run the transcript through the full
+    Orchestrator -> Planner -> Action chain - the approval gate included.
+
+    Kept out of `main()` (behind `python main.py --voice`) because it needs
+    a microphone, a granted macOS mic permission, and a person to speak;
+    `main()`'s other cases must stay runnable headless.
+    """
+    from voice.capture import record_push_to_talk
+
+    orchestrator_runner = InMemoryRunner(agent=orchestrator_agent, app_name=APP_NAME)
+    session = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+
+    audio = record_push_to_talk()
+    plan = await run_voice_command(orchestrator_runner, session.id, audio)
+    if plan is None:
+        print("\n[VOICE] orchestrator handled this conversationally - no plan to execute.")
+        return
+
+    action_runner = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
+    action_session = await action_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+    pending = await run_milestones_until_approval(action_runner, action_session.id, plan.milestones)
+    if pending is not None:
+        print(f"\n[TEST] Simulating explicit user approval for: {pending.goal!r}")
+        await run_action(action_runner, action_session.id, pending)
+
+
 async def main() -> None:
     # The browser bridge server (backend/servers/browser_bridge_server.py)
     # runs as an in-process background task sharing this event loop, not a
@@ -298,4 +326,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+
+    if "--voice" in sys.argv[1:]:
+        asyncio.run(run_live_voice())
+    else:
+        asyncio.run(main())
