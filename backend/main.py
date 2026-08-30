@@ -28,6 +28,11 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 APP_NAME = "jarvis"
 USER_ID = "test_user"
 
+# Holds the running browser bridge server's asyncio.Task - see main()'s
+# comment on why this must be a real, held reference, not a fire-and-forget
+# asyncio.create_task() call.
+_browser_bridge_task = None
+
 
 async def run_command(runner: InMemoryRunner, session_id: str, text: str) -> MilestonePlan | None:
     """Sends one text command through the Orchestrator agent and prints
@@ -124,7 +129,15 @@ async def main() -> None:
     # a moment to actually bind before anything tries to use it; if the
     # Chrome extension isn't loaded/connected, browser-tool calls simply
     # report "bridge is not connected" rather than hanging silently.
-    asyncio.create_task(serve_browser_bridge_forever())
+    #
+    # The task reference is kept in a module-global (not just a local
+    # variable) deliberately - asyncio only holds a weak reference to a
+    # task otherwise, so with nothing else referencing it, the garbage
+    # collector can and does reap it mid-run. Confirmed directly: without
+    # this, the bridge server would die within seconds of starting, well
+    # before any browser-tool call ever got to use it.
+    global _browser_bridge_task
+    _browser_bridge_task = asyncio.create_task(serve_browser_bridge_forever())
     await asyncio.sleep(0.5)
 
     orchestrator_runner = InMemoryRunner(agent=orchestrator_agent, app_name=APP_NAME)
