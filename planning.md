@@ -1023,3 +1023,46 @@ can't be reached with the current architecture, the answer is to
 reconsider which target the demo uses, not to keep forcing the same
 approach. Discussion follows in the next planning entry once that decision
 is made.
+
+---
+
+## Cheap diagnostic before committing to a CDP-based fix: is `isTrusted` rejection Google-Flights-specific or universal?
+
+**The question:** before investing in the much larger CDP-based
+(`chrome.debugger`) input-simulation approach that would actually defeat an
+`isTrusted` check, worth first confirming the wall is Google Flights'
+own defense and not something the native-setter-plus-event technique
+fundamentally can't do on *any* React-controlled input - a cheap test
+against a different, similarly React-driven booking site settles that
+before any bigger architectural commitment.
+
+**Test: Kayak.com's destination field.** Same methodology as every other
+live test in this project - real snapshot, real `find_web_element` call,
+real `type_in_web_field` call, real generation numbers.
+
+Same false-positive pattern showed up first, for the same reason as
+Google Flights: `find_web_element("destination")` matched a decorative
+link ("Group destinations under $238"), not the real field - the word
+"destination" simply isn't Kayak's actual field copy either. Its real
+field: `aria_label="Destination location"`, `placeholder="To?"`. Using
+`"To?"` correctly resolved to it (`ref_id=jw_21`, `tag=input`,
+`role=combobox`).
+
+**Result: genuine success, not a false positive.**
+`type_in_web_field(jw_21, "New York")` returned `success: True`, generation
+went from `1788113466596` to `1788113469633`, and the field's real value
+in that fresh snapshot was confirmed as `'New York'` - the same two-layer
+verification (newer generation + real value read-back) that correctly
+caught the Google Flights failure now correctly confirms a real success
+here, on the same code path, same fix, no site-specific special-casing.
+
+**Conclusion:** the `isTrusted` rejection is Google Flights' own defense,
+not a universal limitation of the native-setter-plus-event technique or
+of this architecture more broadly. The fix built earlier is correct and
+general, exactly as intended - it simply cannot clear a specific,
+deliberate anti-automation gate that not every site has. This changes the
+demo-command calculus: a CDP-based fix is not needed to unblock a working
+flight-search demo, since a comparable, real site (Kayak) already works
+end-to-end with the current architecture. Whether to still pursue Google
+Flights specifically (via CDP) is now a separate, lower-urgency decision
+rather than a blocker.
