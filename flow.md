@@ -380,16 +380,23 @@ unreliable elsewhere. There's no real approval-modal UI yet; `main.py`'s
 Kayak demo case simulates approval with an explicit follow-up
 `run_action(...)` call for the paused milestone, reusing the same ADK
 session throughout so the pause-and-resume mechanics (does context
-survive the pause) get tested for real, not assumed. Verified two ways:
-a unit-level test where the gate stops before ever touching the action
-runner at all (not just before completing), and a live run where the
-Planner correctly tagged only the "initiate search" milestone as
-requiring approval, the gate correctly paused there, and the Action agent
-only attempted it after the simulated approval call. See `planning.md`
-for what this live run does and doesn't fully close out (the gate's
-control flow is proven live; a single unbroken run where typing,
-pausing, approving, and clicking Search all succeed in one sequence is
-still pending a live Kayak connection to test against).
+survive the pause) get tested for real, not assumed.
+
+**Verified as one continuous, real, unbroken run** (see `planning.md` for
+the full walkthrough with real generation numbers): destination field
+found and typed via the real dispatch-and-verify path (not the
+exact-match short-circuit - the field was genuinely blank going in),
+verified via a real newer snapshot generation; the gate then held -
+confirmed by checking the real page state at the pause point showed no
+search-result URL parameters, i.e. Search genuinely had not fired yet;
+simulated approval was given; the Action agent then found and clicked the
+real Search button, verified via another real generation increase. One
+disclosed limitation carried over from `click_web_element`'s own design
+(no universal post-click content check, same as documented in the
+click-outcome-verification entry above): the confirming snapshot's URL
+didn't show search-result parameters, so "the results page is displayed"
+is the Action agent's own summary, not something independently verified
+beyond "a real DOM change happened after a real click."
 
 **Processes involved, and how they actually connect:**
 - `backend/servers/browser_bridge_server.py` - a `websockets` server on
