@@ -1364,3 +1364,44 @@ boundary (`transcribe_audio`'s input), not inside it, so the real
 recognition code path is exercised untouched the first time real audio
 reaches it. No attempt to test real-audio and agent-chain integration
 before the simulated handoff was proven.
+
+---
+
+## Real-audio capture: built and library-verified, real-microphone run blocked on a macOS permission gate
+
+**What's proven, for real:**
+- `SpeechRecognition==3.17.0` installs and imports on this repo's Python
+  3.14 (its classifiers stop at 3.13 and comment 3.14 out, but
+  `requires-python` is `>=3.9` and the 3.13+ shims it pulls -
+  `standard-aifc`, `audioop-lts` - resolve fine on 3.14). `recognize_google`
+  is still present and still free (generic key baked into the library,
+  `speech_recognition/recognizers/google.py`); signature
+  `recognize_google(audio_data, key=None, language="en-US", pfilter=0,
+  show_all=False, with_confidence=False)` - not deprecated, not moved.
+- `SimulatedAudio` -> `transcribe_audio` -> Orchestrator -> Planner
+  handoff runs clean (real Gemini call, real 3-milestone `MilestonePlan`
+  parsed back).
+- `sounddevice==0.5.6` installs with its own bundled PortAudio (no
+  Homebrew `portaudio`), enumerates the real input devices (MacBook Air
+  Microphone is default input, index 2), and `sr.AudioData` builds from
+  raw int16 bytes.
+
+**What's NOT yet proven, and why:** an actual microphone recording.
+`sounddevice.RawInputStream`'s first open blocks indefinitely on the macOS
+TCC microphone gate when launched from inside the IDE/agent process tree -
+the permission prompt never surfaces (a headless parent process can't show
+it), so the open just hangs instead of erroring. This is the documented
+"tell the user what to approve rather than work around it" case. Real
+capture + real transcription + real end-to-end agent execution (build
+stages 3-verification and 4) need to be run by hand from a normal
+terminal: `cd backend && python -m voice.capture`, approve the Microphone
+prompt for the terminal app, then the full run via `main.py`.
+
+**Demo command chosen for the real-audio test: "set a reminder to call mom
+tomorrow at 5pm."** Reasons: every word is common vocabulary (no proper
+nouns like "Spotify" or "Billie Jean" for Google STT to mangle), it's
+easy to say identically across repeated takes, and it has no precondition
+- unlike the Spotify command (needs Spotify in a known state) or the
+Kayak command (needs kayak.com as the active tab). Its only side effect
+is a reminder entry on the "Jarvis Test" list, trivially deleted between
+takes.

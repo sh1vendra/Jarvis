@@ -539,6 +539,23 @@ defined here and shared with the capture layer so the two can't drift.
 re-transcription without re-recording; `save_wav(audio_data, path)` writes
 one out via the stdlib `wave` module for inspection.
 
-Real microphone capture (a push-to-talk recorder feeding real `AudioData`
-into `transcribe_audio`) is the next build stage; until then the voice
-path is exercised only through `SimulatedAudio`.
+`backend/voice/capture.py` is the real-audio push-to-talk recorder.
+`record_push_to_talk()` prints "Press Enter to start recording...", opens a
+`sounddevice.RawInputStream` (int16, mono, `SAMPLE_RATE`) whose callback
+stashes each buffer on a `queue.Queue` from PortAudio's thread, waits on a
+second Enter to stop, joins the buffers, and returns
+`sr.AudioData(raw, sample_rate, SAMPLE_WIDTH)` - the same object
+`transcribe_audio` takes. `sounddevice`'s wheel bundles PortAudio, so
+there's no Homebrew dependency. This keyboard trigger is a backend-only
+stand-in; the shipped trigger is an Electron global hotkey (frontend,
+later), but nothing downstream cares how recording was started. Running
+`python -m voice.capture` records one clip and prints what Google heard.
+
+**macOS microphone permission:** the first `RawInputStream` open blocks on
+the system TCC gate. The permission must be granted to the process hosting
+Python - the terminal app (Terminal / iTerm) when run from a shell, or
+"Visual Studio Code" / "Code Helper" when run from the IDE - under System
+Settings > Privacy & Security > Microphone. If that process can't surface
+the prompt (a headless/helper parent), the stream open hangs silently
+rather than erroring; the fix is to run `python -m voice.capture` once
+directly from a normal terminal, approve the prompt, then re-run.

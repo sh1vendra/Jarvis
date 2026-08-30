@@ -8,3 +8,4 @@ pyobjc-framework-Quartz
 Pillow
 websockets
 SpeechRecognition
+sounddevice
