@@ -69,6 +69,14 @@ function createWindow() {
   mainWindow.webContents.on("did-fail-load", (_e, code, desc) => {
     console.error(`[main] renderer failed to load (${code}): ${desc}`);
   });
+
+  // Renderer console output does not reach the terminal by default, which
+  // hides module-load errors completely - a failed import just leaves the
+  // previous build running with no visible cause. Mirror it here.
+  mainWindow.webContents.on("console-message", (event) => {
+    const level = ["debug", "info", "warning", "error"][event.level] ?? event.level;
+    console.log(`[renderer:${level}] ${event.message}`);
+  });
 }
 
 function sendToRenderer(channel, payload) {
