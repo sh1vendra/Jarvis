@@ -1331,6 +1331,49 @@ how recording was triggered.
 
 ---
 
+## Voice is the entry point, not an add-on - and "STT works" is not the completion bar
+
+**Decision:** Jarvis has no text-input mode in the real product. Real
+spoken voice is the only way a command enters the system. A demo command
+(Spotify, Reminders, Kayak) does not count as *done* until it has been
+executed end to end from real microphone audio - not typed text, not a
+`SimulatedAudio` transcript. All three must clear that bar before any
+frontend work starts.
+
+**Why:** Every earlier milestone in this build used typed commands in
+`main.py` as the entry point. That was the right call at the time - it
+isolated the agent logic (orchestrator classification, planner milestone
+shape, action tool selection, verification) from the audio pipeline, so
+failures had one obvious cause. But it means everything "proven" so far
+was proven against an input path the product will never actually use.
+The real path adds real failure modes: mistranscription of proper nouns
+("Spotify", "Billie Jean", "Kayak"), the free Google endpoint's latency
+and rate limits, background-noise sensitivity, the macOS mic-permission
+gate, and device-selection surprises (the default input device changes
+when AirPods connect). None of that shows up in a typed test. If the
+demo is recorded with real voice - which it will be - then real voice is
+what has to be tested.
+
+**Why all three, not one:** "STT technically works" would be satisfied by
+transcribing a single easy sentence once. That proves the library call,
+not the product. Each demo command stresses STT differently: Spotify has
+two proper nouns and a brand name; the reminder is all common words but
+carries a time expression ("tomorrow at 5 p.m.") the planner has to
+parse out of the transcript; Kayak has a brand name plus the
+approval-gate flow, which has to pause and resume correctly even when the
+command that triggered it came from voice. Testing one and extrapolating
+would hide exactly the failures that matter for a reliable recording.
+
+**What we didn't do:** Did not keep typed commands as an equal entry
+point. `main.py`'s default is now the voice session; the typed pass
+survives only as `python main.py --typed`, explicitly labelled as
+agent-logic regression scaffolding, not a completion check. Did not
+auto-approve the approval gate in the voice flow - it waits on a real
+Enter press so the pause is visibly real (see the approval-gate entry
+above).
+
+---
+
 ## Voice pipeline built STT-output-first: simulated transcripts before a real microphone
 
 **Decision:** Build and test the voice -> agent path in stages, starting
@@ -1365,6 +1408,12 @@ recognition code path is exercised untouched the first time real audio
 reaches it. No attempt to test real-audio and agent-chain integration
 before the simulated handoff was proven.
 
+**Superseded:** the `SimulatedAudio` test case was removed from `main.py`
+once the real voice session landed - it had done its job (proving the
+handoff) and keeping it would have muddied the "voice is the only entry
+point" line. `SimulatedAudio` the class stays in `voice/stt.py` for unit
+tests; it's just no longer wired into the default run.
+
 ---
 
 ## Real-audio capture: built and library-verified, real-microphone run blocked on a macOS permission gate
@@ -1382,26 +1431,43 @@ before the simulated handoff was proven.
   handoff runs clean (real Gemini call, real 3-milestone `MilestonePlan`
   parsed back).
 - `sounddevice==0.5.6` installs with its own bundled PortAudio (no
-  Homebrew `portaudio`), enumerates the real input devices (MacBook Air
-  Microphone is default input, index 2), and `sr.AudioData` builds from
-  raw int16 bytes.
+  Homebrew `portaudio`) and `sr.AudioData` builds from raw int16 bytes.
 
-**What's NOT yet proven, and why:** an actual microphone recording.
-`sounddevice.RawInputStream`'s first open blocks indefinitely on the macOS
-TCC microphone gate when launched from inside the IDE/agent process tree -
-the permission prompt never surfaces (a headless parent process can't show
-it), so the open just hangs instead of erroring. This is the documented
-"tell the user what to approve rather than work around it" case. Real
-capture + real transcription + real end-to-end agent execution (build
-stages 3-verification and 4) need to be run by hand from a normal
-terminal: `cd backend && python -m voice.capture`, approve the Microphone
-prompt for the terminal app, then the full run via `main.py`.
+**Device selection is resolved fresh on every recording, not cached.**
+`sounddevice`'s default input device changes at runtime - between two
+sessions here the default went from "MacBook Air Microphone" (48 kHz) to
+"Shivendra's AirPods Pro" (24 kHz) just by connecting the AirPods.
+`record_push_to_talk` therefore re-resolves `None -> concrete index` on
+every call, verifies the device actually has input channels, records at
+the device's *native* sample rate (Google's endpoint takes anything
+>= 8 kHz, so there's no reason to force-resample on the way in), and
+prints a peak-amplitude figure so an all-silent capture (permission
+denied, or wrong device) is obvious immediately rather than surfacing as
+a mystery mistranscription. `python main.py --list-devices` and
+`--device N` exist for when the default isn't the right mic.
 
-**Demo command chosen for the real-audio test: "set a reminder to call mom
-tomorrow at 5pm."** Reasons: every word is common vocabulary (no proper
-nouns like "Spotify" or "Billie Jean" for Google STT to mangle), it's
-easy to say identically across repeated takes, and it has no precondition
-- unlike the Spotify command (needs Spotify in a known state) or the
-Kayak command (needs kayak.com as the active tab). Its only side effect
-is a reminder entry on the "Jarvis Test" list, trivially deleted between
-takes.
+**What's NOT yet proven, and why:** actual microphone recordings of the
+three commands. `sounddevice.RawInputStream`'s first open blocks
+indefinitely on the macOS TCC microphone gate when launched from inside
+the IDE/agent process tree - the permission prompt never surfaces (a
+headless parent can't show it), so the open hangs instead of erroring.
+This is the documented "tell the user what to approve rather than work
+around it" case. The real run has to be done by hand from a normal
+terminal: `cd backend && python main.py`, approve the Microphone prompt
+for the terminal app on the first recording, then speak each command when
+prompted.
+
+**All three demo commands are tested by real voice, back to back**, not
+one representative command:
+- **Spotify** - "open Spotify and play Billie Jean by Michael Jackson":
+  three proper nouns, the hardest STT case. Precondition: Spotify app
+  running.
+- **Reminder** - "set a reminder to call mom tomorrow at 5 p.m.": common
+  words, but the planner has to pull a time expression out of the
+  transcript. No precondition; side effect is one entry on the "Jarvis
+  Test" list.
+- **Kayak** - "on the Kayak website that is already open, search for a
+  flight to New York": brand name plus the approval-gate flow, which must
+  pause before submitting the search and resume on a (simulated) approval
+  even though the command came from voice. Precondition: kayak.com is the
+  active Chrome tab, Jarvis extension loaded.
