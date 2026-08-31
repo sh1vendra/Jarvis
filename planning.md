@@ -1466,8 +1466,64 @@ one representative command:
   words, but the planner has to pull a time expression out of the
   transcript. No precondition; side effect is one entry on the "Jarvis
   Test" list.
-- **Kayak** - "on the Kayak website that is already open, search for a
-  flight to New York": brand name plus the approval-gate flow, which must
-  pause before submitting the search and resume on a (simulated) approval
-  even though the command came from voice. Precondition: kayak.com is the
-  active Chrome tab, Jarvis extension loaded.
+- **Kayak** - "open Kayak and search for a flight to New York": brand name,
+  plus Jarvis has to open Chrome and navigate to Kayak itself (first
+  milestone), plus the approval-gate flow, which must pause before
+  submitting the search and resume on a (simulated) approval even though
+  the command came from voice. No manual browser setup (see the entry
+  below); only assumption is the Jarvis extension being installed.
+
+---
+
+## The Kayak command had a hidden manual precondition that contradicted Jarvis's whole design
+
+**Finding:** every version of the Kayak flight-search command up to this
+point assumed Chrome was already open with kayak.com as the active tab.
+That assumption was baked into `main.py`'s command text ("on the Kayak
+website that's already open, ...") and into the milestone plan, which
+started at "type New York into the destination field" - there was no
+milestone for getting to Kayak at all. So a "working" Kayak demo actually
+required the operator to open Chrome and navigate to kayak.com by hand
+first. That directly contradicts the core premise: a spoken command
+should be sufficient on its own, and Jarvis should execute every real
+step, browser included. It was a demo that only worked because the
+environment was pre-staged off-camera.
+
+This is different in kind from Spotify's "app already running" assumption.
+"Open Spotify" is a real milestone the Planner emits and the Action agent
+executes via `open_app` - launching it is handled. The Kayak gap was a
+step that no milestone covered and no tool could perform.
+
+**Fix:**
+1. New `navigate_to_url` tool (`tools/browser_tools.py`). It runs
+   `open -a "Google Chrome" <url>` (launches Chrome if needed, loads the
+   URL), forces the foreground switch and polls `_frontmost_app_name()`
+   until Chrome is really frontmost (same pattern as `open_app`), then -
+   the real verification - waits for the browser bridge to receive a page
+   snapshot whose own URL is on the target host. That one snapshot
+   confirms three things at once: the page loaded, the extension is
+   connected, and its content script is live on the right page. A
+   newer-but-wrong-host snapshot (the tab that was already open) just
+   raises the generation floor and it keeps waiting; strict `>` on
+   generation means it can't pass on a stale snapshot it already had.
+2. Planner instruction now requires the first milestone of any website
+   task to be "the browser is open showing that site," naming the address
+   (e.g. "Google Chrome is open with www.kayak.com loaded"). Verified
+   across 3 runs: the Kayak plan now reliably starts with that milestone,
+   approval gate still lands on the final submit-search milestone.
+3. Action agent instruction maps that milestone shape to `navigate_to_url`
+   and tells it to turn a site name into a URL itself (Kayak ->
+   `https://www.kayak.com`), and to never call `find_web_element` before
+   it.
+4. `main.py`'s command is now "open Kayak and search for a flight to New
+   York"; the manual precondition is gone.
+
+**Verified for real (non-voice integration test, bridge + real extension +
+real Chrome):** `navigate_to_url("https://www.kayak.com")` returned
+`success=True` with the confirming snapshot's real URL
+(`https://www.kayak.com/`) and generation. Re-run after seeding Chrome
+onto a different page first: it correctly waited past the stale snapshot
+for a genuinely newer kayak.com one (generation `...167116` -> `...172685`)
+rather than passing on the page that was already there. The full
+voice-driven chain (navigate -> type -> approval gate -> approved ->
+submit) still needs the real voice run to be end-to-end confirmed.

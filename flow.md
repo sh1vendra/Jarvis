@@ -40,9 +40,11 @@ set up here so that `agents/verifier_callbacks.py`'s logger and
 `run_voice_session(only=None, device=None)` is the loop over the three demo
 commands. It starts the in-process browser bridge task first (the Kayak
 command needs it; harmless for the others), then for each command prints
-its precondition, waits for Enter so that precondition can be set up
-(Spotify running / kayak.com the active tab), and calls
-`run_spoken_command`. `python main.py spotify|reminder|kayak` runs just one;
+its precondition, waits for Enter, and calls `run_spoken_command`. The only
+real precondition left is Spotify being installed and running - the Kayak
+command opens Chrome and navigates to Kayak itself (first milestone,
+`navigate_to_url`); the reminder command has none. `python main.py
+spotify|reminder|kayak` runs just one;
 `python main.py --list-devices` prints the input devices and exits;
 `--device N` forces an input-device index.
 
@@ -99,12 +101,13 @@ with `requires_approval=true` rather than folding it into an earlier step.
 
 ## 4. Action agent's tool selection and execution loop
 
-`agents/action.py` defines `action_agent`, given seven tools -
+`agents/action.py` defines `action_agent`, given eight tools -
 `open_app_tool`, `click_ui_tool`, `type_in_field_tool`,
 `create_reminder_tool` (native macOS control, from `tools/mac_control.py`)
-plus `find_web_element_tool`, `click_web_element_tool`,
-`type_in_web_field_tool` (browser control, from `tools/browser_tools.py`,
-see section 8). It receives one milestone goal per turn (driven by
+plus `navigate_to_url_tool`, `find_web_element_tool`,
+`click_web_element_tool`, `type_in_web_field_tool` (browser control, from
+`tools/browser_tools.py`, see section 8). It receives one milestone goal
+per turn (driven by
 `main.run_action()`, which loops over `plan.milestones` and sends each
 `milestone.goal` as a new message in the *same* session). Because milestones
 for one task share a session, the agent can infer context across calls -
@@ -116,11 +119,15 @@ The instruction maps milestone shape to tool choice: "app open/foreground"
 -> `open_app`; "something clicked" -> `click_ui` (requires
 `expected_app_name`); "text entered" -> `type_in_field` (same requirement);
 "reminder exists" -> `create_reminder` (extracts `task`/`due_date`/
-`due_time` as plain text, no manual date computation by the model); a
-milestone about a specific element on a *web page* -> `find_web_element`
-first (to get a `ref_id`), then `click_web_element`/`type_in_web_field`
-with that `ref_id`. If no tool fits, or a tool refuses to act, the agent
-is told to report that plainly rather than retry blindly.
+`due_time` as plain text, no manual date computation by the model);
+"browser is open at a website" (e.g. "Google Chrome is open with
+www.kayak.com loaded") -> `navigate_to_url`, with the agent turning a site
+name into a URL itself (Kayak -> `https://www.kayak.com`) - this is always
+the first web milestone; a milestone about a specific element on a *web
+page* -> `find_web_element` first (to get a `ref_id`), then
+`click_web_element`/`type_in_web_field` with that `ref_id`. If no tool
+fits, or a tool refuses to act, the agent is told to report that plainly
+rather than retry blindly.
 
 `agents/verifier_callbacks.py`'s `log_tool_result_callback` is registered as
 `action_agent`'s `after_tool_callback` - ADK calls it after every tool
@@ -353,8 +360,8 @@ deliberately-inherited known flaws, and what was trimmed from the
 original.
 
 **Demo target: Kayak, not Google Flights.** `backend/main.py`'s browser
-demo command is `"on the Kayak website that's already open, search for a
-flight to New York"`. Google Flights' destination field rejects
+demo command is `"open Kayak and search for a flight to New York"`. Google
+Flights' destination field rejects
 JS-dispatched input specifically - every event a content script dispatches
 carries `event.isTrusted === false` (an unspoofable browser property), and
 Google Flights' input handling appears to gate on it. Confirmed via a
@@ -379,6 +386,35 @@ description once it matches the site's actual copy, and correctly reports
 live on both Google Flights and Kayak, where an initial guess
 ("destination") both times matched an unrelated decorative element before
 the real field's own wording ("Where to?"/"To?") was tried.
+
+**Getting to the site is Jarvis's job, not a manual precondition.** The
+Kayak plan's first milestone is "Google Chrome is open with www.kayak.com
+loaded" (the Planner is instructed to make the browser-open step the first
+milestone of any website task, naming the address). The Action agent maps
+that to `navigate_to_url("https://www.kayak.com")` in
+`tools/browser_tools.py`, which:
+1. runs `open -a "Google Chrome" <url>` - launches Chrome if it isn't
+   running, loads the URL;
+2. re-sends AppleScript `activate` on a poll loop until
+   `_frontmost_app_name()` (imported from `mac_control.py` - a fresh
+   `osascript` query each call, never a cached value) confirms Chrome is
+   frontmost, the same way `open_app` does;
+3. waits (up to 30s, for a cold launch + heavy page + extension reconnect)
+   for the browser bridge to register a snapshot whose URL is on the
+   target host. This one signal proves the page loaded, the extension is
+   connected, and its content script is live on the right page - and that
+   snapshot is exactly what `find_web_element` reads next. A
+   newer-but-wrong-host snapshot only raises the generation floor;
+   `wait_for_snapshot`'s strict `>` means the tool can't pass on a stale
+   snapshot it already had.
+
+Verified for real (bridge + real extension + real Chrome, non-voice
+integration test): `navigate_to_url("https://www.kayak.com")` returned
+`success=True` with the confirming snapshot's real URL and generation;
+re-run with Chrome seeded on a different page first, it waited past the
+stale snapshot for a genuinely newer kayak.com one rather than passing on
+the page already open. See `planning.md`'s "hidden manual precondition"
+entry for the full finding and fix.
 
 `content_script.js`'s `executeType` now uses the native
 `HTMLInputElement`/`HTMLTextAreaElement` value setter (bypassing any
