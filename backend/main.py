@@ -46,7 +46,22 @@ USER_ID = "test_user"
 _browser_bridge_task = None
 
 
-async def run_command(runner: InMemoryRunner, session_id: str, text: str) -> MilestonePlan | None:
+async def _emit(on_event, payload: dict) -> None:
+    """Forwards a structured pipeline event to an optional async consumer.
+
+    `on_event` is None for every command-line run, which keeps the printed
+    output below the single source of truth for the CLI. The WebSocket
+    server (servers/agent_server.py) passes a real callback so the Electron
+    UI can render the same pipeline as state transitions rather than by
+    scraping stdout.
+    """
+    if on_event is not None:
+        await on_event(payload)
+
+
+async def run_command(
+    runner: InMemoryRunner, session_id: str, text: str, on_event=None
+) -> MilestonePlan | None:
     """Sends one text command through the Orchestrator agent and prints
     every event it and its sub-agents produce. Returns the parsed
     MilestonePlan if the Planner responded, else None (e.g. conversational
@@ -89,12 +104,29 @@ async def run_command(runner: InMemoryRunner, session_id: str, text: str) -> Mil
             print(f"     success_signal: {m.success_signal}")
             if m.requires_approval:
                 print("     requires_approval: TRUE")
+        await _emit(
+            on_event,
+            {
+                "type": "plan",
+                "milestones": [
+                    {
+                        "step_number": m.step_number,
+                        "goal": m.goal,
+                        "success_signal": m.success_signal,
+                        "requires_approval": m.requires_approval,
+                    }
+                    for m in plan.milestones
+                ],
+            },
+        )
         return plan
 
+    # Conversational reply handled by the Orchestrator itself - no plan.
+    await _emit(on_event, {"type": "reply", "text": (final_text or "").strip()})
     return None
 
 
-async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milestone) -> None:
+async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milestone, on_event=None) -> None:
     """Sends one milestone (goal + success_signal) to the Action agent and
     prints the tool call it makes plus the tool's own success/failure
     result.
@@ -115,6 +147,11 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
     message_text = f"Goal: {milestone.goal}\nSuccess signal: {milestone.success_signal}"
     message = types.Content(role="user", parts=[types.Part(text=message_text)])
 
+    await _emit(
+        on_event,
+        {"type": "milestone_start", "step_number": milestone.step_number, "goal": milestone.goal},
+    )
+
     async for event in runner.run_async(
         user_id=USER_ID,
         session_id=session_id,
@@ -127,10 +164,30 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
                         f"[{event.author}] -> calling tool: "
                         f"{part.function_call.name}({part.function_call.args})"
                     )
+                    await _emit(on_event, {"type": "tool_call", "tool": part.function_call.name})
                 if getattr(part, "function_response", None):
                     print(f"[{event.author}] tool result: {part.function_response.response}")
+                    response = part.function_response.response
+                    await _emit(
+                        on_event,
+                        {
+                            "type": "tool_result",
+                            "tool": part.function_response.name,
+                            # The tool's own success field - never the agent's
+                            # summary of it. Same "don't trust the self-report"
+                            # principle the rest of this project runs on.
+                            "success": bool(response.get("success")) if isinstance(response, dict) else None,
+                            "message": str(response.get("message", "")) if isinstance(response, dict) else str(response),
+                        },
+                    )
                 if part.text:
                     print(f"[{event.author}] {part.text.strip()}")
+                    await _emit(on_event, {"type": "agent_text", "text": part.text.strip()})
+
+    await _emit(
+        on_event,
+        {"type": "milestone_done", "step_number": milestone.step_number, "goal": milestone.goal},
+    )
 
 
 async def run_milestones_until_approval(
