@@ -21,9 +21,10 @@ from pathlib import Path
 
 import speech_recognition as sr
 
-# 16 kHz mono 16-bit PCM: the standard shape for speech recognition and what
-# both the capture layer and Google's endpoint expect. Kept here so the
-# capture code and this module can't drift apart on it.
+# Mono 16-bit PCM. SAMPLE_WIDTH (bytes per sample) is fixed - int16 is what
+# the capture layer records and what AudioData expects. SAMPLE_RATE is only
+# a fallback default: real capture uses the input device's native rate, and
+# Google's endpoint accepts anything >= 8 kHz, so the rate isn't pinned.
 SAMPLE_RATE = 16_000
 SAMPLE_WIDTH = 2
 
