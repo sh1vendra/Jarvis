@@ -6,47 +6,60 @@ lifecycle or a component's behavior changes.
 
 ## 1. Entry point
 
-`backend/main.py` is the only runnable entry point (no UI layer yet).
+**Jarvis is voice-first: real spoken audio is the only entry point the
+product has.** `backend/main.py` run with no arguments is the real
+lifecycle - `run_voice_session()` records each demo command from the
+microphone, one at a time, and runs it through the full chain. Typed
+commands still exist (`python main.py --typed`) but only as agent-logic
+regression scaffolding; a demo command is not considered working until
+it has been driven by real voice.
+
 `load_dotenv()` pulls `GOOGLE_API_KEY` from the repo-root `.env` before any
 ADK/Gemini call is made. `logging.basicConfig(level=logging.INFO, ...)` is
 set up here so that `agents/verifier_callbacks.py`'s logger and
 `tools/mac_control.py`'s zoom-search logger both actually print.
 
-There are now two ways a command enters the chain, and they converge
-immediately:
-- **Typed** - `run_command(runner, session_id, text)` sends the text
-  straight to the Orchestrator.
-- **Voice** - `run_voice_command(runner, session_id, audio)` first calls
-  `voice.stt.transcribe_audio(audio)` to get a transcript string, then
-  calls `run_command` with it. `audio` is either a real
-  `speech_recognition.AudioData` (from `voice/capture.py`'s push-to-talk
-  recorder) or a `voice.stt.SimulatedAudio` carrying a known transcript
-  that `transcribe_audio` returns verbatim - no network, no microphone.
-  Nothing downstream of `transcribe_audio` can tell which it was; the
-  Orchestrator receives an ordinary text string either way.
+**The voice lifecycle, per command:**
+1. `voice/capture.py`'s `record_push_to_talk(device=...)` records mic audio
+   between two Enter presses and returns a `speech_recognition.AudioData`
+   (section 9).
+2. `run_voice_command(runner, session_id, audio)` calls
+   `voice.stt.transcribe_audio(audio)` - one real HTTP call to Google's
+   free endpoint - to turn that audio into a transcript string, prints the
+   transcript prominently, then hands it to `run_command` exactly as if it
+   had been typed. Nothing downstream of `transcribe_audio` knows the
+   command came from voice; the Orchestrator receives an ordinary string.
+3. `run_command` -> Orchestrator -> (transfer) -> Planner -> `MilestonePlan`
+   (sections 2-3).
+4. `run_plan_with_approval_gate(action_runner, session_id, milestones)`
+   feeds each milestone to the Action agent in order, pausing at every
+   `requires_approval` milestone on a real Enter press that stands in for
+   the user approving it in the (not-yet-built) modal, then resuming
+   (sections 4, 8).
 
-See `voice/stt.py` (section 9) for how transcription and the simulated
-bypass work, and `planning.md` for why the trigger is a push-to-talk
-hotkey rather than wake-word detection.
+`run_voice_session(only=None, device=None)` is the loop over the three demo
+commands. It starts the in-process browser bridge task first (the Kayak
+command needs it; harmless for the others), then for each command prints
+its precondition, waits for Enter so that precondition can be set up
+(Spotify running / kayak.com the active tab), and calls
+`run_spoken_command`. `python main.py spotify|reminder|kayak` runs just one;
+`python main.py --list-devices` prints the input devices and exits;
+`--device N` forces an input-device index.
+
+`voice.stt.SimulatedAudio` (a known transcript `transcribe_audio` returns
+verbatim, no network) is still in the codebase for unit tests but is no
+longer wired into any `main.py` run - see `planning.md` for why it was
+removed from the default path.
 
 Two ADK runner types are used, each wrapping one agent:
-- `InMemoryRunner(agent=orchestrator_agent, ...)` - drives a text command
+- `InMemoryRunner(agent=orchestrator_agent, ...)` - drives a command
   through the Orchestrator (and, via transfer, the Planner).
 - `InMemoryRunner(agent=action_agent, ...)` - drives one milestone goal at a
   time through the Action agent.
 
-Each logical run gets its own session (`session_service.create_session`), so
-`main()`'s test cases in the file don't share conversation state with each
-other. One of those cases (`session6`) drives a `SimulatedAudio` transcript
-through `run_voice_command` and on through the full Orchestrator -> Planner
--> Action chain, shaped exactly like the typed Spotify/Reminders/Kayak
-cases.
-
-`python main.py --voice` skips all of that and runs `run_live_voice()`
-instead: `voice/capture.py`'s `record_push_to_talk()` -> `transcribe_audio`
--> the same Orchestrator -> Planner -> Action chain, approval gate
-(`run_milestones_until_approval`) included. This is the real-microphone
-end-to-end path; it needs the macOS mic permission granted (see section 9).
+Each command gets its own fresh orchestrator and action session
+(`session_service.create_session`), so commands in one voice session don't
+share conversation state.
 
 ## 2. Orchestrator's decision logic
 
@@ -402,11 +415,15 @@ through the Action agent in order, but the moment it reaches one with
 `run_action` on it* - deliberately placed in the orchestration loop
 rather than inside the Action agent or any tool, so the pause doesn't
 depend on the same self-reporting agent this project has repeatedly found
-unreliable elsewhere. There's no real approval-modal UI yet; `main.py`'s
-Kayak demo case simulates approval with an explicit follow-up
-`run_action(...)` call for the paused milestone, reusing the same ADK
-session throughout so the pause-and-resume mechanics (does context
-survive the pause) get tested for real, not assumed.
+unreliable elsewhere. There's no real approval-modal UI yet;
+`run_plan_with_approval_gate` (which wraps `run_milestones_until_approval`)
+simulates approval by waiting on a real Enter press, then calling
+`run_action` on the paused milestone and continuing with any milestones
+after it - all in the same ADK session, so the pause-and-resume mechanics
+(does context survive the pause) get tested for real, not assumed. Both
+the Kayak command (submit the search) and the Reminder command (save the
+reminder) hit this gate; in the voice session it holds and resumes the
+same way regardless of whether the command was typed or spoken.
 
 **Verified as one continuous, real, unbroken run** (see `planning.md` for
 the full walkthrough with real generation numbers): destination field
@@ -526,11 +543,6 @@ arrived.
 audio_data, *, language="en-US")` is the one function the rest of the
 system calls:
 
-- Given a `SimulatedAudio` (a small object wrapping a known transcript
-  string), it returns `.transcript.strip()` directly - no network, no
-  audio. This is the seam that let the whole voice -> agent chain be
-  built and tested before a microphone existed, and is also what a future
-  "type a command instead of speaking it" mode would reuse.
 - Given a real `speech_recognition.AudioData`, it constructs an
   `sr.Recognizer` and calls `recognizer.recognize_google(audio_data,
   language=...)` - the library's free Google endpoint (generic key baked
@@ -538,24 +550,40 @@ system calls:
   (unintelligible speech) and `RequestError` (network down, rate-limited,
   key revoked) are both re-raised as `voice.stt.TranscriptionError` so
   callers have one exception type to handle.
+- Given a `SimulatedAudio` (a small object wrapping a known transcript
+  string), it returns `.transcript.strip()` directly - no network, no
+  audio. Used only by unit tests now; not wired into any `main.py` run.
 
-`SAMPLE_RATE = 16_000` / `SAMPLE_WIDTH = 2` (16 kHz mono 16-bit PCM) are
-defined here and shared with the capture layer so the two can't drift.
+`SAMPLE_WIDTH = 2` (int16) is fixed - it's what the capture layer records
+and what `AudioData` expects. `SAMPLE_RATE = 16_000` is only a fallback
+default: real capture records at the input device's native rate and
+Google's endpoint accepts anything >= 8 kHz, so the rate isn't pinned.
 `audio_from_wav(path)` loads a saved clip into an `AudioData` for
 re-transcription without re-recording; `save_wav(audio_data, path)` writes
 one out via the stdlib `wave` module for inspection.
 
 `backend/voice/capture.py` is the real-audio push-to-talk recorder.
-`record_push_to_talk()` prints "Press Enter to start recording...", opens a
-`sounddevice.RawInputStream` (int16, mono, `SAMPLE_RATE`) whose callback
-stashes each buffer on a `queue.Queue` from PortAudio's thread, waits on a
-second Enter to stop, joins the buffers, and returns
-`sr.AudioData(raw, sample_rate, SAMPLE_WIDTH)` - the same object
-`transcribe_audio` takes. `sounddevice`'s wheel bundles PortAudio, so
-there's no Homebrew dependency. This keyboard trigger is a backend-only
-stand-in; the shipped trigger is an Electron global hotkey (frontend,
-later), but nothing downstream cares how recording was started. Running
-`python -m voice.capture` records one clip and prints what Google heard.
+`record_push_to_talk(sample_rate=None, device=None)`:
+- **Resolves the input device fresh every call.** `None` becomes a concrete
+  index via `sounddevice.query_devices(kind="input")`, falling back to the
+  first device with input channels. This is re-done per call because the
+  system default input changes at runtime (connecting AirPods makes them
+  the default, at a different sample rate). `--device N` overrides;
+  `list_input_devices()` (`python main.py --list-devices`) prints the
+  choices.
+- Records at the device's native sample rate (unless `sample_rate` is
+  passed), int16 mono, via a `sounddevice.RawInputStream` whose callback
+  stashes each buffer on a `queue.Queue` from PortAudio's thread. A second
+  Enter stops it; buffers are joined into `sr.AudioData(raw, sample_rate,
+  SAMPLE_WIDTH)`.
+- Prints captured byte count, duration, and **peak int16 amplitude**. A
+  peak of 0 means the capture was completely silent - permission denied or
+  wrong device - and is flagged loudly, so it doesn't later masquerade as
+  a bad transcription.
+
+`sounddevice`'s wheel bundles PortAudio, so there's no Homebrew dependency.
+Running `python -m voice.capture` records one clip and prints what Google
+heard, without the agent chain.
 
 **macOS microphone permission:** the first `RawInputStream` open blocks on
 the system TCC gate. The permission must be granted to the process hosting
@@ -563,5 +591,5 @@ Python - the terminal app (Terminal / iTerm) when run from a shell, or
 "Visual Studio Code" / "Code Helper" when run from the IDE - under System
 Settings > Privacy & Security > Microphone. If that process can't surface
 the prompt (a headless/helper parent), the stream open hangs silently
-rather than erroring; the fix is to run `python -m voice.capture` once
-directly from a normal terminal, approve the prompt, then re-run.
+rather than erroring; the fix is to run `python main.py` once directly from
+a normal terminal and approve the prompt on the first recording.
