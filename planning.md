@@ -1710,3 +1710,73 @@ restyling should not require touching any wiring above it.
 **What we didn't do:** No mouse-passthrough behavior on the transparent
 window (a polish detail, and easy to get subtly wrong in a way that makes
 the window uninteractable). No animations, no layout work, no design system.
+
+---
+
+## The Reminders command created the reminder twice - a Planner granularity bug
+
+**Bug:** "set a reminder to call mom tomorrow at 5pm" produced two identical
+entries in Reminders.app, every run. Confirmed against real state during
+the Electron approval-gate testing: one command, two "buy milk" reminders.
+
+**Root cause - in the Planner, not the tool.** The Planner was splitting a
+reminder task into separate milestones - typically "the reminder details
+are entered" (milestone 2) and "the reminder is saved and scheduled"
+(milestone 3, marked `requires_approval=true`). The Action agent's
+instruction maps any milestone about "a reminder existing/being created" to
+`create_reminder`, so *both* of those milestones triggered a
+`create_reminder` call, and `create_reminder` is not idempotent - it
+unconditionally `make new reminder`s. Two milestones, two AppleScript
+`make new reminder` statements, two entries.
+
+Two things in the old instruction fed this:
+1. The general rule "give a task's final consequential action its own
+   separate milestone" - written for the Kayak case, where "fill the search
+   form" and "submit the search" genuinely are different states of the
+   world - was being applied to reminders, where they are not.
+2. Nothing told the Planner that some actions are atomic. A web form has a
+   real inspectable state between "filled" and "submitted"; a reminder does
+   not. `create_reminder` builds and commits the reminder in one
+   `osascript` call - there is no draft.
+
+**Fix - address both at the source:**
+- Added a **milestone-granularity rule**: one milestone per distinct real
+  outcome; never split one atomic action into a "prepare" milestone plus a
+  "commit" milestone. Creating a reminder is called out by name as a single
+  milestone. Splitting is explicitly reserved for genuine intermediate
+  states someone could inspect or cancel (the filled-but-unsubmitted web
+  form).
+- Tightened the **`requires_approval`** definition: it now means an action
+  that spends money, contacts other people, submits to an external website,
+  or is genuinely hard to undo. Creating a routine local item (reminder,
+  note, calendar event) is called out as explicitly *never* approval-worthy
+  - local, private, trivially deleted. This removes the spurious approval
+  gate the reminder command had been picking up as a side effect of rule 1.
+
+**Why not a downstream fix.** The obvious patch - have the Action agent
+skip `create_reminder` if a reminder was already created this session, or
+have milestone 3's success check just confirm the milestone-2 reminder
+exists - would leave the Planner still emitting a redundant milestone and
+still mislabeling reminder creation as consequential. Every future
+reminder-like command (a note, a calendar event) would hit the same bug
+and need the same patch. Fixing the Planner's model of what a milestone is
+fixes the whole class.
+
+**Verified for real - 5 consecutive runs, each queried against
+Reminders.app directly (not the tool's own success report):**
+- Runs 1-3: plan = 1 milestone ("A reminder to call mom tomorrow at 5pm
+  exists in the Reminders app"), `requires_approval=false`, **exactly 1
+  entry created** each time.
+- Runs 4-5 (after a rate-limit cooldown): same, **1 entry** each.
+- Kayak regression check: still 3 milestones, step 3 ("the flight search is
+  submitted") still `requires_approval=true`. The tightened approval rule
+  did not weaken the gate on the command that actually needs it.
+
+The Planner also dropped the separate "open Reminders" milestone on its own
+- `create_reminder` drives AppleScript directly and doesn't need the app
+foregrounded, and "keep the plan minimal" plus the new granularity rule
+collapsed the whole command to one milestone. Fine, and arguably optimal.
+
+**Housekeeping done at the same time:** the ~19 accumulated test reminders
+("Call mom" x N and assorted) in the "Jarvis Test" list from prior sessions
+were deleted. List is empty going into demo recording.

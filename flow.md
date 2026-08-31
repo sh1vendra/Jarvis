@@ -114,6 +114,18 @@ model from collapsing into step-by-step output, and separately instructs
 the model to give a task's final consequential action its own milestone
 with `requires_approval=true` rather than folding it into an earlier step.
 
+The instruction also carries a **milestone-granularity** rule: one
+milestone per distinct real outcome, and never split one atomic action
+into a "prepare" milestone plus a "commit" milestone. Splitting is only for
+genuine intermediate states someone could inspect or cancel - a web form
+filled but not submitted. This exists because the reminder command was
+being split into "details entered" + "saved", and each reminder-shaped
+milestone triggered its own `create_reminder` call (section 7). The
+`requires_approval` guidance was tightened at the same time: creating a
+routine local item (reminder, note, calendar event) is explicitly *never*
+approval-worthy - only actions that spend money, contact other people, or
+submit to an external site are.
+
 ## 4. Action agent's tool selection and execution loop
 
 `agents/action.py` defines `action_agent`, given eight tools -
@@ -360,6 +372,18 @@ AppleScript program that creates the named list if it doesn't exist
 inside it via `osascript`. Permission denial (`-1743` / "not authorized") is
 detected from `stderr` and surfaced as a specific, actionable error message
 rather than a generic failure.
+
+**Milestone plan shape (as of the double-creation fix).** The Planner
+produces a *single* milestone for a reminder command - e.g. "A reminder to
+call mom tomorrow at 5pm exists in the Reminders app" - with
+`requires_approval=false`. It used to split this into "details entered" +
+"saved" (sometimes plus "open Reminders"), and the Action agent called
+`create_reminder` once per reminder-shaped milestone, so two milestones
+meant two identical entries. `create_reminder` is one atomic AppleScript
+action with no inspectable in-between state, so there is nothing for a
+second milestone to represent. See `planning.md`'s "reminder created twice"
+entry. Verified: 3 consecutive real runs, each producing exactly one entry
+(queried from Reminders.app, not read off the tool's own success report).
 
 ## 8. Browser control path
 
