@@ -222,8 +222,12 @@ DEMO_COMMANDS: dict[str, dict] = {
     },
     "kayak": {
         "label": "KAYAK - flight search, with an approval-gate pause",
-        "say": "on the Kayak website that is already open, search for a flight to New York",
-        "precondition": "kayak.com is the ACTIVE Chrome tab and the Jarvis extension is loaded.",
+        "say": "open Kayak and search for a flight to New York",
+        "precondition": (
+            "None - Jarvis opens Chrome and navigates to Kayak itself. "
+            "Only requirement: the Jarvis Chrome extension is installed/enabled "
+            "(same kind of assumption as Spotify being installed)."
+        ),
     },
 }
 
@@ -314,11 +318,13 @@ async def run_typed_regression() -> None:
         action_session2 = await action_runner2.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
         await run_plan_with_approval_gate(action_runner2, action_session2.id, reminder_plan.milestones)
 
-    # Kayak, full chain including the approval-gate pause. Assumes kayak.com
-    # is the active tab (see planning.md for why Kayak, not Google Flights).
+    # Kayak, full chain including the approval-gate pause. Jarvis opens
+    # Chrome and navigates to Kayak itself now (first milestone,
+    # navigate_to_url) - no manual browser setup. See planning.md for why
+    # Kayak, not Google Flights.
     session4 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
     kayak_plan = await run_command(
-        orchestrator_runner, session4.id, "on the Kayak website that's already open, search for a flight to New York"
+        orchestrator_runner, session4.id, "open Kayak and search for a flight to New York"
     )
     if kayak_plan is not None:
         action_runner3 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)

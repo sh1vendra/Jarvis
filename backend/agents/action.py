@@ -8,6 +8,7 @@ from google.adk.agents import LlmAgent
 from tools.browser_tools import (
     click_web_element_tool,
     find_web_element_tool,
+    navigate_to_url_tool,
     type_in_web_field_tool,
 )
 from tools.mac_control import (
@@ -64,6 +65,14 @@ action_agent = LlmAgent(
         "  - due_time: the time mentioned or implied (e.g. '5pm', '17:00')\n\n"
         "For milestones about a web page in the browser (not a native Mac "
         "app), use these instead of open_app/click_ui/type_in_field:\n"
+        "- navigate_to_url: use this when the milestone is about the browser "
+        "being open at a particular website (e.g. 'Google Chrome is open "
+        "with kayak.com loaded', 'the Kayak site is open'). Pass a full URL "
+        "- turn a site name into its address yourself (Kayak -> "
+        "'https://www.kayak.com'). This launches Chrome if it isn't running, "
+        "loads the page, and only reports success once the page has actually "
+        "loaded and the extension is live on it. Always the FIRST web "
+        "milestone - do not call find_web_element before it.\n"
         "- find_web_element: use this FIRST whenever a milestone refers to "
         "a specific element on the current web page (e.g. 'the destination "
         "field', 'the search button') - it returns a ref_id you then pass "
@@ -87,6 +96,7 @@ action_agent = LlmAgent(
         click_ui_tool,
         type_in_field_tool,
         create_reminder_tool,
+        navigate_to_url_tool,
         find_web_element_tool,
         click_web_element_tool,
         type_in_web_field_tool,

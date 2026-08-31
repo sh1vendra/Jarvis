@@ -19,14 +19,158 @@ type_in_web_field are real `async def` functions that await the bridge's
 asyncio.Event-based waiting rather than needing to fake synchronicity.
 """
 
+import re
+import subprocess
+import time
+from urllib.parse import urlparse
+
 from google.adk.tools import FunctionTool
 
 from browser.bridge import browser_bridge
 from browser.models import ActionRequest, ElementRef
 from browser.store import browser_store
+from tools.mac_control import _frontmost_app_name
 
 _RESULT_TIMEOUT = 10.0
 _SETTLE_TIMEOUT = 5.0
+
+_CHROME_APP = "Google Chrome"
+# kayak.com and sites like it are heavy - the tab has to load AND the
+# content script has to build and push its first snapshot before we can
+# confirm anything. This budget is for that whole sequence, including a
+# cold Chrome launch and the extension's service worker reconnecting.
+_NAV_SETTLE_TIMEOUT = 30.0
+
+
+def _normalize_url(url: str) -> tuple[str, str]:
+    """Returns (full_url_with_scheme, bare_host). Host has a leading
+    'www.' stripped so 'kayak.com' and 'www.kayak.com' compare equal."""
+    target = url.strip()
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", target):
+        target = "https://" + target
+    host = urlparse(target).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return target, host
+
+
+async def navigate_to_url(url: str) -> dict:
+    """Opens Google Chrome (launching it if it isn't running) and loads
+    `url`, then verifies for real that it worked - not just that the launch
+    command exited cleanly.
+
+    Verification has two independent signals, both required:
+      1. Chrome is confirmed the frontmost app (fresh System Events query,
+         same check open_app uses).
+      2. The browser bridge has received a page snapshot whose own URL is
+         on `url`'s host - which only happens if the page actually loaded
+         AND the Jarvis extension's content script is live on it. That
+         single snapshot is also what find_web_element needs next, so this
+         tool leaves the browser in exactly the state the following
+         milestones expect.
+
+    Use this as the first step of any task that acts on a website, so the
+    user never has to pre-open or pre-navigate the browser by hand.
+
+    Args:
+        url: The address to open, e.g. "https://www.kayak.com" or just
+            "kayak.com" (https:// is added if no scheme is given).
+
+    Returns:
+        A dict with:
+            success: bool, True only if both signals above checked out
+            message: human-readable summary
+            url: the confirming snapshot's actual URL, if verified
+            generation: that snapshot's generation, if verified
+            error: raw error string if something went wrong, else None
+    """
+    target, host = _normalize_url(url)
+    if not host:
+        return {
+            "success": False,
+            "message": f"Could not parse a host out of {url!r}.",
+            "url": None,
+            "generation": None,
+            "error": "bad_url",
+        }
+
+    pre_generation = browser_store.current_generation()
+
+    launch = subprocess.run(
+        ["open", "-a", _CHROME_APP, target],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if launch.returncode != 0:
+        return {
+            "success": False,
+            "message": f"Could not open Chrome with {target!r} - the 'open' command itself failed.",
+            "url": None,
+            "generation": None,
+            "error": launch.stderr.strip() or f"open exited with code {launch.returncode}",
+        }
+
+    # `open -a` starts/loads reliably but doesn't always steal focus - the
+    # same thing open_app works around. Re-send `activate` on each poll
+    # until Chrome is really frontmost or the budget runs out.
+    frontmost_deadline = time.monotonic() + 8.0
+    frontmost_ok = False
+    last_seen = None
+    while time.monotonic() < frontmost_deadline:
+        subprocess.run(
+            ["osascript", "-e", f'tell application "{_CHROME_APP}" to activate'],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        last_seen = _frontmost_app_name()
+        if last_seen and last_seen.lower() == _CHROME_APP.lower():
+            frontmost_ok = True
+            break
+        time.sleep(0.15)
+
+    # Real verification: wait for a bridge snapshot that's both newer than
+    # anything we had before AND on the target host. A newer-but-wrong-host
+    # snapshot (e.g. the tab that was already open) just raises the floor
+    # and we keep waiting.
+    confirming = None
+    settle_deadline = time.monotonic() + _NAV_SETTLE_TIMEOUT
+    while time.monotonic() < settle_deadline:
+        remaining = settle_deadline - time.monotonic()
+        snap = await browser_bridge.wait_for_snapshot(min_generation=pre_generation, timeout=max(0.5, remaining))
+        if snap is None:
+            break
+        _, snap_host = _normalize_url(snap.url)
+        if host == snap_host or host in snap_host or snap_host in host:
+            confirming = snap
+            break
+        pre_generation = max(pre_generation, snap.generation)
+
+    if confirming is None:
+        if not browser_bridge.is_connected():
+            detail = "the browser bridge is not connected - is the Jarvis Chrome extension loaded and enabled?"
+        else:
+            detail = f"no page snapshot from {host!r} arrived within {_NAV_SETTLE_TIMEOUT:.0f}s"
+        frontmost_note = "Chrome is frontmost" if frontmost_ok else f"frontmost app is {last_seen!r}, not Chrome"
+        return {
+            "success": False,
+            "message": f"Chrome was told to open {target!r} ({frontmost_note}), but {detail}, so navigation is unverified.",
+            "url": None,
+            "generation": None,
+            "error": "nav_not_verified",
+        }
+
+    return {
+        "success": True,
+        "message": (
+            f"Chrome is open at {confirming.url!r} (frontmost confirmed) and the Jarvis extension has a "
+            f"live snapshot of it (generation {confirming.generation})."
+        ),
+        "url": confirming.url,
+        "generation": confirming.generation,
+        "error": None,
+    }
 
 
 def _match_score(query: str, el: ElementRef) -> float:
@@ -270,6 +414,7 @@ async def type_in_web_field(ref_id: str, text: str) -> dict:
     }
 
 
+navigate_to_url_tool = FunctionTool(navigate_to_url)
 find_web_element_tool = FunctionTool(find_web_element)
 click_web_element_tool = FunctionTool(click_web_element)
 type_in_web_field_tool = FunctionTool(type_in_web_field)
