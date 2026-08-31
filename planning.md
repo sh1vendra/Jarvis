@@ -1527,3 +1527,186 @@ for a genuinely newer kayak.com one (generation `...167116` -> `...172685`)
 rather than passing on the page that was already there. The full
 voice-driven chain (navigate -> type -> approval gate -> approved ->
 submit) still needs the real voice run to be end-to-end confirmed.
+
+---
+
+## The backend gets a WebSocket server: the CLI harness was never a real entry point
+
+**Decision:** Wrap the existing Orchestrator -> Planner -> Action pipeline
+in `backend/servers/agent_server.py`, a loopback WebSocket server, and make
+that the interface the Electron UI talks to.
+
+**Why:** The pipeline only ever ran from `main.py`'s command-line harness,
+and two things in that harness were test scaffolding standing in for
+product behavior:
+
+1. **The approval gate was an `input()` call.** `run_plan_with_approval_gate`
+   paused on a keypress in the terminal. That proved the pause-and-resume
+   *mechanics*, but a terminal keypress is not a user approving an action in
+   a UI - there was no way for a real interface to answer the gate.
+2. **State was printed text.** The UI needs to know it is thinking vs doing
+   vs waiting for approval. Scraping stdout for that would be a parser
+   sitting on top of human-readable prose - brittle, and it would break the
+   moment a print statement was reworded.
+
+So the server changes exactly those two things and nothing else about the
+pipeline. `main.run_command`/`run_action` gained an optional `on_event`
+callback defaulting to `None`, so every existing CLI path behaves
+identically; the server passes a callback that forwards each pipeline event
+to the client as JSON. The approval gate becomes an `asyncio.Future` the
+pipeline awaits, resolved only when the client sends an
+`approval_response`.
+
+**Constraints:** It deliberately mirrors `browser_bridge_server.py`'s shape
+(loopback `websockets` server, JSON frames, one handler coroutine) so this
+codebase has one server pattern rather than two. Both servers run as
+asyncio tasks in one process on one event loop - a hard requirement, not a
+convenience: `browser/bridge.py`'s `asyncio.Event`s are only awaitable from
+the loop that created them, and the Action agent's browser tools await them
+from inside this server's request handling. `agent_server.py`'s `_main()`
+starts both.
+
+**One real bug this design had to avoid:** the pipeline must run as a
+separate `asyncio.Task`, not be awaited inline in the message loop. Awaited
+inline, the handler stops reading messages while the pipeline blocks on the
+approval Future - and the message it is waiting for is the very
+`approval_response` it can no longer receive. Guaranteed deadlock; the task
+split is what prevents it.
+
+**Verified for real, over a live socket:** ping/pong; unknown-message error
+handling; a conversational command answered by the Orchestrator with no
+plan; and the full reminder command running end to end with real tool
+results (`open_app success=true`, `create_reminder success=true`, real
+reminder created). The approval gate genuinely blocked, and on a **reject**
+the milestone was never executed - confirmed by recording every
+`tool_call`/`milestone_start` event after the gate and finding none.
+
+**What we didn't do:** No REST/HTTP layer, no session persistence across
+connections, no auth. The browser bridge has a shared-token handshake
+because a webpage could otherwise reach it; this server is bound to
+loopback and talks only to a local Electron process, so a token would be
+ceremony. Worth revisiting if the backend ever binds beyond 127.0.0.1.
+
+---
+
+## Audio capture moves to the Electron renderer, and MediaRecorder cannot be used
+
+**Decision:** Capture microphone audio in the Electron renderer via the Web
+Audio API's `AudioWorklet`, producing raw int16 PCM - not with
+`MediaRecorder`, and no longer in Python.
+
+**Why capture moved out of Python:** The trigger is now a global hotkey, and
+the hotkey lives in Electron's main process because that is the only place
+that can register a system-wide shortcut that fires while Spotify or Chrome
+is focused. Keeping capture in Python would mean the hotkey firing in
+Electron, crossing a process boundary to tell Python to start recording,
+then crossing back - two processes contending for the same microphone, with
+the recording start latency of an IPC round trip. Capturing where the
+trigger already is removes the entire problem.
+
+**Why not MediaRecorder - this is a hard constraint, not a preference:**
+`MediaRecorder` in Chromium emits WebM/Opus. The backend's
+`speech_recognition` library reads WAV, AIFF and FLAC PCM only; it cannot
+decode Opus at all, and handing it a WebM blob fails outright. The options
+were (a) add an ffmpeg binary to the backend purely to transcode, or (b)
+take raw PCM straight off the Web Audio graph, which is *already* the shape
+`sr.AudioData` wants. (b) needs no new dependency and makes the Electron
+path hand `transcribe_audio` the same kind of object the Python
+`sounddevice` path did.
+
+**Why AudioWorklet over ScriptProcessorNode:** `ScriptProcessorNode` has
+been deprecated for years and runs on the main thread, where it glitches
+under load. The worklet is loaded from an **inline Blob URL** rather than a
+file, because a file-backed `audioWorklet.addModule()` has to satisfy
+Electron's CSP and `file://` resolution; a Blob sidesteps both and behaves
+identically in dev and packaged builds.
+
+**No resampling anywhere - deliberately.** Capture happens at the device's
+native rate (48 kHz here) and that rate travels with the audio; Google's
+endpoint accepts anything at or above 8 kHz, so nothing resamples on either
+side and what reaches transcription is bit-identical to what the microphone
+produced. Downsampling to 16 kHz would have cut the payload 3x, but the
+payload is crossing loopback, so there was no reason to introduce a
+resampling step that could be blamed for a bad transcript later.
+
+**One measured consequence:** `websockets` defaults `max_size` to 1 MiB.
+Mono int16 at 48 kHz is ~94 KB/s raw and ~125 KB/s base64-encoded, so any
+clip past roughly 8 seconds would have been rejected outright as too large.
+Measured before it could bite, and `max_size` is raised to 64 MiB with the
+arithmetic recorded in the source.
+
+**Verified for real:** the format contract was proven *before* any Electron
+code was written - synthesized int16 PCM through `sr.AudioData` produced
+valid FLAC (`fLaC` magic, bundled `flac-mac` binary works on this arch), and
+Google accepted the request, returning `UnknownValueError` (well-formed, no
+speech) rather than a `RequestError` (rejected). Then proven again with real
+hardware: a live capture reported `48000 Hz, 185600 samples (~3.9s), peak
+15549/32767` in the renderer and arrived at the backend as `371200 bytes`
+(185600 x 2, byte-exact through base64 and the socket), where Google
+processed it and correctly found no speech in ambient room noise.
+
+**What we didn't do:** No voice-activity detection, no silence trimming, no
+streaming/partial transcription. Capture is whole-clip, push-to-talk,
+transcribe-once.
+
+---
+
+## The hotkey is a toggle because Electron cannot express hold-to-talk
+
+**Decision:** `Cmd+Shift+Space` toggles recording - press to start, press
+again to stop - rather than recording only while the key is held.
+
+**Why:** Not a preference. Electron's `globalShortcut` fires on key-*down*
+only and exposes no key-up event, so "record while held" is not expressible
+without a native input-monitoring module and the extra permissions that
+implies. A toggle is what the API can actually guarantee.
+
+The main process keeps an `isRecording` flag to decide which edge each press
+is, but the renderer is authoritative and reports its real state back over
+`jarvis:recording-state` - so if capture fails to start, the toggle resyncs
+and the next press is still the correct edge rather than being inverted for
+the rest of the session.
+
+**Two real environment findings, both caught by running it rather than
+assuming:**
+- **`ELECTRON_RUN_AS_NODE=1` is set in this development shell.** That
+  variable makes the Electron binary run as plain Node - no `app`, no
+  `BrowserWindow`, no window at all, and `require("electron")` returns the
+  binary's *path string* instead of the API. It presents as
+  `TypeError: Cannot read properties of undefined (reading 'whenReady')`,
+  which reads exactly like a broken import. The `dev:electron` script now
+  strips it with `env -u`. Named ESM imports from `"electron"` were verified
+  working once it was unset - the import style was never the problem.
+- **Renderer console output does not reach the terminal by default.** A
+  failed module import in the renderer silently leaves the *previous* build
+  running with no visible cause - observed directly, and it looked like the
+  hotkey handler had stopped working. `main.js` now mirrors
+  `webContents.on("console-message")` into the terminal.
+
+---
+
+## UI polish is deliberately deferred to a separate tool
+
+**Decision:** This pass builds functional structure only - a plain state
+machine, unstyled controls, no visual design. Styling is a later, separate
+pass.
+
+**Why:** The two jobs have different failure modes and different feedback
+loops. Wiring is verified by observing real behavior (did the hotkey fire,
+did the PCM arrive intact, did the gate actually withhold execution);
+styling is verified by looking at it. Interleaving them means every visual
+tweak risks disturbing wiring that was already proven, and every wiring fix
+invalidates a visual judgment. Doing structure first also means the styling
+pass has something real to style rather than mockups.
+
+**What the styling pass can rely on not changing:** the state set (`idle`,
+`listening`, `thinking`, `doing`, `approving`, `done`), the fields `App.jsx`
+holds (`transcript`, `plan`, `activity`, `pendingApproval`, `captureInfo`,
+`error`, `connection`), and the `decide(approved)` callback behind the
+approval buttons. All inline styles live in a single `S` object at the
+bottom of `App.jsx`, deliberately separate from the component body, so
+restyling should not require touching any wiring above it.
+
+**What we didn't do:** No mouse-passthrough behavior on the transparent
+window (a polish detail, and easy to get subtly wrong in a way that makes
+the window uninteractable). No animations, no layout work, no design system.

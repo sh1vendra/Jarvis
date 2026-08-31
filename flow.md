@@ -4,11 +4,26 @@ Technical walkthrough of how a command actually moves through Jarvis, end to
 end, referencing real files/functions. Updated whenever the request
 lifecycle or a component's behavior changes.
 
-## 1. Entry point
+## 0. The two entry points, and which one is the product
 
 **Jarvis is voice-first: real spoken audio is the only entry point the
-product has.** `backend/main.py` run with no arguments is the real
-lifecycle - `run_voice_session()` records each demo command from the
+product has.** There are now two ways to drive the pipeline by voice, and
+only the first is the product:
+
+- **The Electron app** (`frontend/`) - global hotkey, audio captured in the
+  renderer, WebSocket to `backend/servers/agent_server.py`, UI state
+  machine, real approval clicks. This is the real lifecycle; see section 10.
+- **`backend/main.py`** - the command-line harness. Same pipeline, but
+  capture is `sounddevice` in Python and the approval gate is an `input()`
+  keypress. Retained for testing the agent chain without the UI in the loop;
+  it is scaffolding, not the product.
+
+Section 1 below describes the CLI harness. Section 10 describes the real
+Electron lifecycle.
+
+## 1. Entry point (CLI harness)
+
+`backend/main.py` run with no arguments records each demo command from the
 microphone, one at a time, and runs it through the full chain. Typed
 commands still exist (`python main.py --typed`) but only as agent-logic
 regression scaffolding; a demo command is not considered working until
@@ -629,3 +644,128 @@ Settings > Privacy & Security > Microphone. If that process can't surface
 the prompt (a headless/helper parent), the stream open hangs silently
 rather than erroring; the fix is to run `python main.py` once directly from
 a normal terminal and approve the prompt on the first recording.
+
+## 10. The Electron lifecycle: hotkey to UI state, end to end
+
+The real request lifecycle. Everything in sections 2-9 still applies
+unchanged - this section is what wraps around it.
+
+**Processes.** Two, on one machine:
+- **Electron** (`frontend/`) - a main process owning the window and the
+  global hotkey, and a renderer owning audio capture, the WebSocket, and the
+  React UI.
+- **Python** (`backend/servers/agent_server.py` run directly) - starts *two*
+  asyncio tasks on one event loop: the agent server on `ws://127.0.0.1:8766`
+  and the browser bridge on `ws://127.0.0.1:8765`. Same loop is a hard
+  requirement, not tidiness: `browser/bridge.py`'s `asyncio.Event`s are only
+  awaitable from the loop that created them, and the Action agent's browser
+  tools await them from inside the agent server's request handling.
+
+**Step by step:**
+
+1. **Hotkey.** `electron/main.js` registers `Cmd+Shift+Space` via
+   `globalShortcut`. It fires while any app is focused. It is a **toggle**,
+   not hold-to-talk - `globalShortcut` exposes key-down only, with no
+   key-up event, so hold-to-talk is not expressible without a native module.
+   Main flips an `isRecording` flag and sends `jarvis:hotkey` with
+   `{action: "start"|"stop"}` to the renderer.
+
+2. **Bridge.** `electron/preload.cjs` exposes exactly three things on
+   `window.jarvis` - `onHotkey`, `reportRecordingState`, `log` - and nothing
+   else: no `ipcRenderer`, no node APIs. Audio does **not** travel over IPC;
+   the renderer holds its own WebSocket straight to Python, so captured
+   audio never detours through the main process.
+
+3. **Capture** (`src/audio/recorder.js`). `getUserMedia` -> `AudioContext` ->
+   an `AudioWorkletNode` running a `pcm-collector` processor loaded from an
+   **inline Blob URL** (a file-backed `addModule()` would have to satisfy
+   Electron's CSP and `file://` resolution; a Blob sidesteps both). The
+   worklet posts each render quantum's `Float32Array` (`.slice(0)` - the
+   input buffer is reused by the audio thread, so posting it directly sends
+   garbage) to the main thread, which accumulates them. The node is
+   connected through a zero-gain node to `destination`, because a worklet
+   node is only pulled if it reaches the destination - the zero gain stops
+   the mic being echoed out of the speakers.
+
+   On stop: Float32 `[-1,1]` -> little-endian int16 -> base64 (chunked, so a
+   several-hundred-KB buffer doesn't blow the call stack on
+   `String.fromCharCode`). It also computes **peak amplitude**, so a
+   permissions failure reads as an explicit "captured audio was completely
+   silent" rather than surfacing later as a mysterious mistranscription.
+
+   **No resampling anywhere.** Capture is at the device's native rate
+   (48 kHz here) and that rate travels with the audio; Google accepts
+   anything >= 8 kHz. What reaches transcription is bit-identical to what
+   the microphone produced.
+
+4. **Transport** (`src/ws/client.js` -> `agent_server.py`). One JSON frame:
+   `{type: "audio", sample_rate, sample_width, pcm_base64}`. The server
+   raises `websockets`' `max_size` from its 1 MiB default to 64 MiB -
+   mono int16 at 48 kHz is ~125 KB/s base64-encoded, so clips past roughly
+   8 seconds would otherwise be rejected outright as too large.
+
+5. **Transcription.** The server base64-decodes to raw PCM, wraps it in
+   `sr.AudioData(pcm, sample_rate, sample_width)` - the same object
+   section 9's Python capture path produces - and calls the same
+   `voice.stt.transcribe_audio`, via `asyncio.to_thread` so the blocking
+   HTTP call to Google does not stall the event loop the browser bridge
+   shares. Emits `{type: "transcript", text}`.
+
+   Note `MediaRecorder` is unusable for this: it emits WebM/Opus, and
+   `speech_recognition` reads WAV/AIFF/FLAC PCM only. Raw PCM is not an
+   optimization here, it is the only format that works without adding an
+   ffmpeg dependency.
+
+6. **Pipeline.** The transcript goes into `main.run_command` - the *same*
+   function the CLI calls - and on through Orchestrator -> Planner ->
+   Action exactly as sections 2-4 describe. The only addition is an optional
+   `on_event` callback (defaulting to `None`, so CLI behavior is unchanged),
+   which the server passes to forward each pipeline event to the UI:
+   `plan`, `milestone_start`, `tool_call`, `tool_result`,
+   `milestone_done`, `agent_text`, `reply`. `tool_result` carries the
+   **tool's own `success` field**, never the agent's summary of it - the
+   same "don't trust the self-report" rule the rest of the system runs on.
+
+   The pipeline runs as a separate `asyncio.Task`, not awaited inline in the
+   message loop. Inline, the handler would stop reading messages while the
+   pipeline blocks at an approval gate - and the message it is waiting for
+   is the very `approval_response` it could no longer receive. The task
+   split is what prevents that deadlock.
+
+7. **The approval gate, for real this time** (`agent_server._run_plan`).
+   Same placement as the CLI's `run_milestones_until_approval` - in the loop
+   that decides which milestone runs next, never inside the Action agent or
+   a tool, so the pause does not depend on the agent policing itself. What
+   changed is only what the pause waits on. The server sends
+   `{type: "approval_required", milestone: {...}}` and then awaits an
+   `asyncio.Future`. `App.jsx` renders Approve/Reject (clickable, or Enter /
+   Escape) and sends `{type: "approval_response", approved}`, which resolves
+   the Future. On **reject the milestone is never executed at all** and the
+   run ends with `{state: "done", reason: "rejected"}`. A client that
+   disconnects mid-gate resolves the Future as a rejection, so the pipeline
+   unwinds rather than hanging forever.
+
+8. **UI state** (`src/App.jsx`). A plain state machine - `idle`,
+   `listening`, `thinking`, `doing`, `approving`, `done` - driven entirely
+   by server messages after the audio is sent. Everything before that
+   (`idle` -> `listening`) is local to the renderer. Visual design is
+   explicitly out of scope for this pass; all inline styles live in a single
+   `S` object at the bottom of the file, kept separate from the component
+   body so a later styling pass can restyle without rewiring.
+
+**Running it:**
+```
+# terminal 1 - backend (agent server + browser bridge, one process)
+cd backend && python servers/agent_server.py
+
+# terminal 2 - Electron + Vite
+cd frontend && npm run dev
+```
+
+**Two environment gotchas, both found by running it:**
+- `ELECTRON_RUN_AS_NODE=1` in the shell makes the Electron binary run as
+  plain Node - no window, and `app` comes back `undefined`, which presents
+  as a broken import. `dev:electron` strips it with `env -u`.
+- Renderer console output does not reach the terminal by default; a failed
+  renderer import silently leaves the previous build running. `main.js`
+  mirrors `webContents.on("console-message")` into the terminal.
