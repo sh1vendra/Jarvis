@@ -3,6 +3,17 @@
   <head>
     <meta charset="UTF-8" />
     <title>Jarvis</title>
+    <!--
+      Structural reset, not a style pass: without it, the default 8px body
+      margin leaves a dead band around the window's edge that belongs to no
+      element - not covered by App.jsx's drag strip, so a drag started near
+      the actual window edge (the natural place to grab it) would silently
+      fail. html/body/#root all need height:100% so the shell can rely on
+      height:100% too, rather than shrinking to content.
+    -->
+    <style>
+      html, body, #root { margin: 0; padding: 0; height: 100%; }
+    </style>
   </head>
   <body>
     <div id="root"></div>

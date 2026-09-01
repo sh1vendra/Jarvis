@@ -174,6 +174,24 @@ export default function App() {
 
   return (
     <div style={S.shell}>
+      {/* Frameless windows draw no OS titlebar, so there is no built-in way
+          to move or minimize/close this window without this strip. The
+          strip itself is `-webkit-app-region: drag` (Electron reads that
+          CSS property to know a mousedown here should move the window
+          instead of hitting the page); the buttons inside are explicitly
+          marked `no-drag` so clicking them doesn't start a drag first. */}
+      <div style={S.titlebar}>
+        <span style={S.titlebarLabel}>Jarvis</span>
+        <div style={S.titlebarButtons}>
+          <button style={S.titlebarButton} onClick={() => window.jarvis.minimize()} title="Minimize">
+            &#8211;
+          </button>
+          <button style={S.titlebarButton} onClick={() => window.jarvis.closeWindow()} title="Close">
+            &#215;
+          </button>
+        </div>
+      </div>
+
       <div style={S.row}>
         <strong>{STATE_LABEL[state] || state}</strong>
         <span style={S.dim}>backend: {connection}</span>
@@ -239,6 +257,31 @@ const S = {
     height: "100%",
     boxSizing: "border-box",
     overflow: "auto",
+  },
+  titlebar: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8,
+    paddingBottom: 6,
+    borderBottom: "1px solid #ccc",
+    // The draggable surface - see the comment above this element in JSX.
+    WebkitAppRegion: "drag",
+    cursor: "default",
+  },
+  titlebarLabel: { fontWeight: "bold", color: "#555" },
+  titlebarButtons: { display: "flex", gap: 4, WebkitAppRegion: "no-drag" },
+  titlebarButton: {
+    width: 20,
+    height: 20,
+    lineHeight: "18px",
+    padding: 0,
+    textAlign: "center",
+    fontSize: 13,
+    cursor: "pointer",
+    background: "#eee",
+    border: "1px solid #999",
+    borderRadius: 3,
   },
   row: { display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between" },
   dim: { color: "#777" },

@@ -33,4 +33,15 @@ contextBridge.exposeInMainWorld("jarvis", {
   log(message) {
     ipcRenderer.send("jarvis:log", String(message));
   },
+
+  /** Minimize the window - the frameless window draws no OS minimize
+   * button, so this is what the titlebar strip's button calls. */
+  minimize() {
+    ipcRenderer.send("jarvis:minimize");
+  },
+
+  /** Close the window - same reasoning as minimize() above. */
+  closeWindow() {
+    ipcRenderer.send("jarvis:close");
+  },
 });

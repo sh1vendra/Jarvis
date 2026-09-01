@@ -17,7 +17,8 @@
 // almost certainly ELECTRON_RUN_AS_NODE being set in the environment, which
 // makes the Electron binary behave as plain Node - see the `dev:electron`
 // script in package.json.
-import { app, BrowserWindow, globalShortcut, ipcMain, systemPreferences } from "electron";
+import { app, BrowserWindow, globalShortcut, ipcMain, screen, systemPreferences } from "electron";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -26,6 +27,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOTKEY = "CommandOrControl+Shift+Space";
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || "http://localhost:5173";
 
+const WINDOW_WIDTH = 460;
+const WINDOW_HEIGHT = 340;
+const EDGE_MARGIN = 24; // px kept clear of the screen edge for the default spawn position
+
 let mainWindow = null;
 // Mirrors the renderer's recording state so the single hotkey can alternate
 // start/stop. The renderer is the source of truth and reports back via
@@ -33,14 +38,86 @@ let mainWindow = null;
 // which edge to send.
 let isRecording = false;
 
+// ── Window position persistence ──
+//
+// A frameless, always-on-top window with no config'd default position was
+// what let it end up somewhere the user lost track of - real failure mode
+// this session, forcing a full restart to get it back. Fix has two parts:
+// remember where the user last put it (so a deliberate move sticks across
+// launches), and if there's nothing remembered or the remembered spot is no
+// longer on any connected display (external monitor unplugged, etc.), fall
+// back to a fixed, sane default instead of whatever the OS/Electron would
+// otherwise pick.
+const windowStatePath = path.join(app.getPath("userData"), "window-state.json");
+
+function loadSavedPosition() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(windowStatePath, "utf8"));
+    if (Number.isFinite(raw.x) && Number.isFinite(raw.y)) return { x: raw.x, y: raw.y };
+  } catch {
+    // No file yet, or corrupt - fall through to the default.
+  }
+  return null;
+}
+
+function saveWindowPosition(win) {
+  try {
+    const [x, y] = win.getPosition();
+    fs.writeFileSync(windowStatePath, JSON.stringify({ x, y }));
+  } catch (err) {
+    console.error("[main] failed to save window position:", err);
+  }
+}
+
+/** True if a window at (x, y) would have at least its top titlebar strip
+ * visible on some currently-connected display - not just the primary one,
+ * so a position that made sense on a since-reconnected external monitor
+ * isn't wrongly rejected. */
+function isPositionUsable(x, y) {
+  const probe = { x: x + WINDOW_WIDTH / 2, y: y + 10 };
+  return screen.getAllDisplays().some((d) => {
+    const b = d.bounds;
+    return probe.x >= b.x && probe.x < b.x + b.width && probe.y >= b.y && probe.y < b.y + b.height;
+  });
+}
+
+/** Top-right of the primary display's work area - a fixed, predictable
+ * default, never "wherever the OS feels like." */
+function defaultPosition() {
+  const { workArea } = screen.getPrimaryDisplay();
+  return {
+    x: workArea.x + workArea.width - WINDOW_WIDTH - EDGE_MARGIN,
+    y: workArea.y + EDGE_MARGIN,
+  };
+}
+
+function resolveStartPosition() {
+  const saved = loadSavedPosition();
+  if (saved && isPositionUsable(saved.x, saved.y)) return saved;
+  return defaultPosition();
+}
+
 function createWindow() {
+  const { x, y } = resolveStartPosition();
+
   mainWindow = new BrowserWindow({
-    width: 460,
-    height: 340,
+    width: WINDOW_WIDTH,
+    height: WINDOW_HEIGHT,
+    x,
+    y,
     frame: false,
     transparent: true,
     hasShadow: false,
     resizable: false,
+    // Both explicit even though they're Electron's defaults: a frameless
+    // window draws no OS titlebar/traffic-lights, so there is no built-in
+    // affordance for either regardless of these flags - movement only
+    // happens via the renderer's `-webkit-app-region: drag` strip, and
+    // minimizing only happens via the explicit button wired below
+    // (jarvis:minimize). These flags just make sure neither is disabled.
+    movable: true,
+    minimizable: true,
+    closable: true,
     alwaysOnTop: true,
     // Visual design is explicitly out of scope this session - a later
     // styling pass owns look and feel. This is just a surface that shows
@@ -58,6 +135,19 @@ function createWindow() {
   // Spotify or Chrome is frontmost.
   mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   mainWindow.setAlwaysOnTop(true, "floating");
+
+  // Persist position on every real move, debounced so a drag doesn't write
+  // to disk on every intermediate pixel - and again on close, as a
+  // last-write safety net.
+  let saveTimer = null;
+  mainWindow.on("moved", () => {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => saveWindowPosition(mainWindow), 250);
+  });
+  mainWindow.on("close", () => {
+    clearTimeout(saveTimer);
+    if (mainWindow) saveWindowPosition(mainWindow);
+  });
 
   // The renderer asks for the mic via getUserMedia; without this handler
   // Electron denies the request silently.
@@ -130,8 +220,29 @@ app.whenReady().then(() => {
   }
 
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+      return;
+    }
+    // A minimized/hidden window doesn't count as "closed" - clicking the
+    // dock icon should bring it back rather than silently no-op.
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
   });
+});
+
+// Both driven by the renderer's titlebar strip (App.jsx) - a frameless
+// window has no OS-drawn minimize/close buttons, so these are the only way
+// either action can happen.
+ipcMain.on("jarvis:minimize", () => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.minimize();
+});
+
+ipcMain.on("jarvis:close", () => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.close();
 });
 
 // The renderer is authoritative about whether it is actually recording -

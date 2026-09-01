@@ -1780,3 +1780,86 @@ collapsed the whole command to one milestone. Fine, and arguably optimal.
 **Housekeeping done at the same time:** the ~19 accumulated test reminders
 ("Call mom" x N and assorted) in the "Jarvis Test" list from prior sessions
 were deleted. List is empty going into demo recording.
+
+---
+
+## Overlay window couldn't be moved or minimized - frameless windows need explicit drag regions
+
+**Bug:** the Electron overlay could not be dragged or minimized, and had no
+close button. It once ended up off-screen this session and had to be
+recovered by restarting the whole dev process.
+
+**Root cause.** `frame: false` draws no OS titlebar - no drag handle, no
+traffic-light buttons - and none of that comes back automatically. It isn't
+that `movable`/`minimizable` were set to `false` (they weren't; Electron
+defaults both to `true`); a frameless window still needs (a) a page region
+explicitly marked `-webkit-app-region: drag` before the OS will treat a
+mousedown there as "move the window" instead of "click the page," and (b) an
+actual affordance - a button or shortcut - to call `win.minimize()`/
+`win.close()`, since there's no OS-drawn control to click. Both were simply
+missing. Compounding it: the window had no explicit spawn position and
+nothing remembered where the user last put it, so a drag (once possible)
+wouldn't even stick across relaunches.
+
+**Fix, three parts, all in service of "the user can always get the window
+back":**
+1. **Drag region** - `App.jsx` gained a titlebar strip (`S.titlebar`,
+   `-webkit-app-region: drag`) with a label and two buttons. The buttons sit
+   in a child marked `-webkit-app-region: no-drag`, or clicking them would
+   start a window-drag before the click ever reached the button.
+   `index.html` also needed a small structural reset (`margin/padding: 0`,
+   `height: 100%` on `html`/`body`/`#root`) - without it the default 8px
+   body margin left a dead band at the window's actual edge that belonged
+   to no element, so a drag started right at the edge (the natural place to
+   grab a window) would silently miss the drag region entirely. This is a
+   layout correction, not a style choice.
+2. **Minimize/close** - `preload.cjs` exposes `minimize()`/`closeWindow()`,
+   sending `jarvis:minimize`/`jarvis:close` over IPC to two new
+   `ipcMain.on` handlers in `main.js` that call `win.minimize()`/
+   `win.close()`. A button, not a shortcut: the window is frameless by
+   design, so a visible, always-there control fit the existing pattern
+   better than one more shortcut to remember, and it's what the titlebar
+   strip needed anyway once it existed for dragging.
+3. **Position, chosen deliberately over "remember size too" or "snap to
+   grid"** - `main.js` writes `{x, y}` to a small JSON file under
+   `app.getPath("userData")` on every real `moved` event (debounced 250ms)
+   and again on `close`, as a last-write safety net. On launch: use the
+   saved position only if it's still on some *currently connected* display
+   (checked against `screen.getAllDisplays()`, not just the primary one -
+   an external-monitor position shouldn't be rejected just because the
+   external monitor happens to be the primary at save time and isn't at
+   load time); otherwise fall back to a fixed default (top-right of the
+   primary display's work area, 24px margin) rather than whatever the OS
+   would otherwise pick. This directly targets the failure that started
+   this entry - a bad or stale position degrades to a known-good spot
+   instead of off-screen.
+
+**Verified for real, all via the real code path (Quartz-synthesized HID
+mouse events through `kCGHIDEventTap` - the same event pipeline a physical
+mouse goes through, not DOM-level simulation, and OS-level `AXMinimized`/
+window-position queries via System Events, not application-reported
+state):**
+- **Drag**: a synthesized mousedown-drag-mouseup on the titlebar strip
+  moved the real window by exactly the drag delta (`(1306,85)->(1050,400)`,
+  window went `(1226,63)->(970,378)` - a `(-256,+315)` move both times).
+- **Minimize**: a real click at the minimize button's computed screen
+  position flipped `AXMinimized` `false -> true`; restoring (the same
+  mechanism a Dock-icon click uses) brought it back at the same position.
+- **Close**: a real click at the close button's position took the process
+  from 1 window to 0.
+- **Cross-launch persistence**: after the drag, a full process kill and
+  fresh `npm run dev` opened the window at exactly `(970, 378)` - the
+  dragged-to position, not the default.
+- **Off-screen recovery - the actual original bug, reproduced and
+  confirmed fixed**: the saved-position file was hand-poisoned to `(9999,
+  9999)` (an impossible position, and the general shape of what caused this
+  session's real loss); the next launch correctly rejected it and fell back
+  to the default top-right position rather than spawning off-screen.
+
+**What we didn't do:** No remembered window *size* (it's fixed and
+non-resizable already). No multi-window state. No dock-icon-click test via
+UI scripting - the dev-mode unbundled Electron binary doesn't keep a stable
+Dock presence once windowless, which is a macOS packaging detail unrelated
+to the actual fix; cross-launch persistence (the thing that matters) was
+verified by a full process restart instead, which is the more deterministic
+test anyway.
