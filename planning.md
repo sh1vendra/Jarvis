@@ -1863,3 +1863,62 @@ Dock presence once windowless, which is a macOS packaging detail unrelated
 to the actual fix; cross-launch persistence (the thing that matters) was
 verified by a full process restart instead, which is the more deterministic
 test anyway.
+
+---
+
+## The styling pass: a state-keyed stylesheet, verified by driving real states over the WS contract
+
+**Decision:** all visual design moved out of `App.jsx`'s inline `S` object
+into a dedicated `frontend/src/styles.css`, keyed off a single `data-state`
+attribute the component sets on its root element. The overlay is now a dark
+glass container that morphs per state - compact pill for
+idle/listening/thinking, full card for doing/approving/done - with the
+state orb, waveform, approval card, plan list, and activity log all styled
+there. `App.jsx` kept every hook, handler, and message case unchanged; only
+the render markup changed (classNames plus a few purely decorative
+elements: the orb, five waveform bars).
+
+**Why a stylesheet instead of growing the `S` object:** the design needs
+keyframe animations (orb pulse/ping/spinner, waveform, animated ellipsis),
+pseudo-elements, hover reveals, and transitions between states - none of
+which inline styles can express. The separation contract from the
+"UI polish is deliberately deferred" entry held exactly as intended: the
+state set, the fields, and `decide(approved)` were enough to design
+against, and no wiring changed.
+
+**Two things the transparent window bought for free:**
+1. The fixed 460x340 window never resizes; only the in-page glass container
+   morphs (width/radius/padding transitions). Because the window is fully
+   transparent with no OS shadow, the container reads as the window itself
+   changing shape - so the morphing needed zero `main.js` changes.
+2. `backdrop-filter` genuinely samples the windows *behind* the transparent
+   Electron window on this macOS/Electron combo (confirmed in screenshots:
+   the editor behind the overlay is visibly blurred through the glass), so
+   the glass effect is real, not simulated with opacity alone.
+
+**Per-state content visibility lives in CSS, not the component.** Rules
+like `.stage[data-state="approving"] .plan { display: none }` decide what
+each state shows (the approval card hides the plan and log to focus the
+decision; the pills hide everything but the header). This keeps every
+conditional the wiring already had intact while still letting each state
+present differently.
+
+**Verified by driving the real app, not by reading the code:** a throwaway
+stub WebSocket server on `ws://127.0.0.1:8766` replayed the actual protocol
+messages (`state`, `transcript`, `plan`, `milestone_start`, `tool_call`,
+`tool_result`, `approval_required`, `reply`) at the running overlay - the
+renderer's own reconnect loop picks the stub up within 2s - and each of the
+six states was screenshotted live and inspected. This caught one real gap:
+the stub jumps states without the hotkey-start reset ever firing, which
+rendered leftover reply/plan content inside the idle and listening pills,
+bloating them into misshapen capsules. In the real flow the hotkey handler
+clears that state first, but the CSS now hides reply/plan/transcript/log
+in the pill states anyway - cheap insurance against any future path that
+reaches a pill state without the reset.
+
+**What we didn't do:** the waveform bars are a decorative CSS animation,
+not real audio levels - real levels would mean piping analyser data out of
+`recorder.js`, which is wiring, not styling. No per-state window resizing
+(unnecessary, per the above). No light theme - the overlay commits to dark
+glass regardless of system appearance, which is the norm for this class of
+floating HUD.

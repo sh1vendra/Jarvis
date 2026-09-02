@@ -49,8 +49,8 @@ set up here so that `agents/verifier_callbacks.py`'s logger and
 4. `run_plan_with_approval_gate(action_runner, session_id, milestones)`
    feeds each milestone to the Action agent in order, pausing at every
    `requires_approval` milestone on a real Enter press that stands in for
-   the user approving it in the (not-yet-built) modal, then resuming
-   (sections 4, 8).
+   the user approving it in the Electron overlay's approval card, then
+   resuming (sections 4, 8).
 
 `run_voice_session(only=None, device=None)` is the loop over the three demo
 commands. It starts the in-process browser bridge task first (the Kayak
@@ -769,13 +769,20 @@ unchanged - this section is what wraps around it.
    disconnects mid-gate resolves the Future as a rejection, so the pipeline
    unwinds rather than hanging forever.
 
-8. **UI state** (`src/App.jsx`). A plain state machine - `idle`,
-   `listening`, `thinking`, `doing`, `approving`, `done` - driven entirely
-   by server messages after the audio is sent. Everything before that
-   (`idle` -> `listening`) is local to the renderer. Visual design is
-   explicitly out of scope for this pass; all inline styles live in a single
-   `S` object at the bottom of the file, kept separate from the component
-   body so a later styling pass can restyle without rewiring.
+8. **UI state** (`src/App.jsx` + `src/styles.css`). A state machine -
+   `idle`, `listening`, `thinking`, `doing`, `approving`, `done` - driven
+   entirely by server messages after the audio is sent. Everything before
+   that (`idle` -> `listening`) is local to the renderer. All visual design
+   lives in `src/styles.css`, keyed off a `data-state` attribute `App.jsx`
+   sets on its root element: the glass container morphs between a compact
+   pill (idle/listening/thinking) and a full card (doing/approving/done),
+   and per-state CSS rules decide which content blocks are visible, so the
+   component body carries no presentation logic. The whole glass surface is
+   the window's drag region; every interactive element (window controls,
+   approval buttons, the scrollable activity log) opts back out with
+   `-webkit-app-region: no-drag`. The transparent, fixed-size window
+   (`main.js`) is what makes the in-page morphing read as the window itself
+   changing shape - nothing outside the glass container ever paints.
 
 **Running it:**
 ```
