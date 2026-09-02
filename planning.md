@@ -1986,6 +1986,60 @@ variable at deploy time (`--set-env-vars`), never baked into the image. The
 `.dockerignore` excludes `.env` from the build context as defense in depth.
 
 **Cost.** `--min-instances=0` (scale to zero when idle), 512Mi / 1 CPU,
-`--max-instances` capped low. Idle cost is effectively zero; the only spend
-is per-request CPU-seconds when something actually hits it, which for a
-resume link is ~never.
+`--max-instances=3`. Idle cost is effectively zero; the only spend is
+per-request CPU-seconds when something actually hits it, which for a resume
+link is ~never.
+
+---
+
+## Cloud Run deployment: what actually happened, and the live result
+
+**Project.** `gen-lang-client-0853510522` ("Jarvis") - the same project the
+Gemini API key was created under. It had **billing disabled** (AI Studio
+auto-creates the project on the free tier, and the free Gemini tier needs no
+billing). Cloud Run / Cloud Build / Artifact Registry all require it, so an
+open billing account was linked. Then `run.googleapis.com`,
+`cloudbuild.googleapis.com`, `artifactregistry.googleapis.com` were enabled.
+
+**One real snag, fixed:** the first `gcloud run deploy --source .` failed
+with `PERMISSION_DENIED` - on a project this new, the Compute Engine default
+service account (which Cloud Build now runs builds as) had no build
+permissions. Fixed by granting it `roles/cloudbuild.builds.builder` and
+`roles/storage.objectViewer`; the retry went through.
+
+**Deploy command** (`gcloud run deploy jarvis-agent --source . --region
+us-central1 --allow-unauthenticated --min-instances 0 --max-instances 3
+--memory 512Mi --cpu 1 --port 8080 --env-vars-file <tmp>`). Cloud Build
+built the image from the repo-root `Dockerfile`, pushed it to Artifact
+Registry, and Cloud Run rolled out revision `jarvis-agent-00001`.
+`GOOGLE_API_KEY` was passed via a temp `--env-vars-file` (deleted right
+after) so it never appears in shell history or the command line, and it
+lives in the service's env config, not the image.
+
+**Live URL:** `https://jarvis-agent-xpaca6zida-uc.a.run.app`
+(also reachable as `https://jarvis-agent-31384021500.us-central1.run.app`).
+
+**Verified for real, against the live URL from outside GCP:**
+- `curl https://jarvis-agent-xpaca6zida-uc.a.run.app/health` ->
+  `HTTP/2 200`, body `{"status": "ok", "service": "jarvis-agent"}`, served
+  by Google Frontend. `GET /` returns the same.
+- A real `wss://` connection to the live service: `ping` -> `pong`, then a
+  spoken-style command (`"set a reminder to buy milk tomorrow at 4pm"`) ran
+  the **real pipeline in the cloud** - a real Gemini call, a real
+  `MilestonePlan` (one milestone, the granularity fix visible), handed to
+  the Action agent, which called `create_reminder` and got back the
+  `RuntimeError: macOS control APIs unavailable` guard. The pipeline caught
+  it and ended cleanly (`state: done, reason: error`).
+
+That last result is the whole point of the scope, made concrete: the
+Gemini-facing coordination genuinely runs on Cloud Run; the device-control
+half correctly refuses to run without a Mac, loudly and without crashing.
+"Deployed to production infrastructure" - yes. "The full product runs in
+the cloud" - no, by design.
+
+**Config confirmed** via `gcloud run services describe`: `minScale` unset
+(= 0, scales to zero), `maxScale: 3`, `cpu: 1`, `memory: 512Mi`, IAM
+binding `allUsers` (public), `GOOGLE_API_KEY` present as an env var (value
+not exposed). Teardown when it's no longer wanted:
+`gcloud run services delete jarvis-agent --region us-central1`, and
+optionally unlink billing from the project again.
