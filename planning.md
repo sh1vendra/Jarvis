@@ -1922,3 +1922,70 @@ not real audio levels - real levels would mean piping analyser data out of
 (unnecessary, per the above). No light theme - the overlay commits to dark
 glass regardless of system appearance, which is the norm for this class of
 floating HUD.
+
+---
+
+## Cloud Run deployment: the agent server only, and why that's the honest scope
+
+**Decision:** Deploy `backend/servers/agent_server.py` - and nothing else -
+to Cloud Run, as a one-time exercise. Not for daily use; Jarvis is driven
+from the local Electron app against a local backend, and that doesn't
+change.
+
+**Why only the agent server.** Jarvis's actual capability - controlling
+Spotify, creating Reminders, driving a browser - is built on macOS
+Accessibility APIs, AppleScript, and CGEvent mouse/keyboard synthesis
+against a real screen (`tools/mac_control.py`, `tools/perception.py`). None
+of that exists on a headless Linux container, and none of it *should* run
+there - a cloud box has no screen to act on. What's left, and what actually
+deploys, is the part with no host dependency: the Gemini-facing pipeline -
+Orchestrator classifies, Planner produces a `MilestonePlan`, and the
+WebSocket protocol (including the real approval gate) is served. That piece
+talks only to Gemini and the connected client.
+
+**The distinction this is meant to demonstrate.** "Deployed to production
+infrastructure" and "the full product runs in the cloud" are different
+claims. This is the first: a real container, built and run on Cloud Run,
+reachable at a real URL, scaling to zero, with secrets injected properly.
+It is explicitly *not* the second - the demo commands still only work
+locally, on a Mac, and the deployment can't run them. Conflating the two
+would be the dishonest version of this line on a resume.
+
+**Bare-minimum scope, on purpose.** Boots cleanly, answers `GET /health`
+with `{"status": "ok"}` from outside the container. That's the whole goal.
+No custom domain, no CI/CD, no min instances, no load testing.
+
+**What had to change in the code to make a clean Linux import possible:**
+- `tools/mac_control.py` and `tools/perception.py` import `Quartz`,
+  `AppKit`, and `ApplicationServices` (all pyobjc, all macOS-only). Those
+  imports are now wrapped in `try/except ImportError`; the module-level
+  `_APP_SEARCH_SHORTCUTS` dict (which referenced a `Quartz` constant at
+  import time) is gated behind an `_MACOS` flag; and the Mac-only public
+  functions (`open_app`, `create_reminder`, `_frontmost_app_name`,
+  `get_ui_tree`, ...) call a `_require_macos()` / `_require_accessibility_api()`
+  guard that raises a clear `RuntimeError` if they're ever reached off a
+  Mac. Verified both ways: the full `agents -> tools` chain still imports on
+  macOS unchanged, and imports cleanly with pyobjc forcibly blocked.
+- `agent_server.py` reads Cloud Run's `PORT` (binds `0.0.0.0:$PORT` when
+  `PORT` is set, stays on `127.0.0.1:8766` locally) and `K_SERVICE` (skips
+  the browser bridge entirely - nothing to bridge to in the cloud).
+- The health check is a `process_request` hook on the same `websockets`
+  server. It keys off the `Upgrade: websocket` header, not the path: a real
+  client connecting to the bare URL (path `/`, which the Electron app does)
+  must pass straight through to the handshake, so `/` can't be reserved for
+  health. Upgrade header present -> WebSocket; absent -> health body.
+
+**Dependencies.** A separate `backend/requirements-cloudrun.txt`, pinned,
+excluding the pyobjc frameworks (don't exist on Linux) and `sounddevice`
+(mic capture, CLI-only, not in the agent server's import path). `Pillow` and
+`dateparser` stay - they're imported at module load by `mac_control.py`
+even though the functions using them never run here.
+
+**Secrets.** `GOOGLE_API_KEY` is injected as a Cloud Run environment
+variable at deploy time (`--set-env-vars`), never baked into the image. The
+`.dockerignore` excludes `.env` from the build context as defense in depth.
+
+**Cost.** `--min-instances=0` (scale to zero when idle), 512Mi / 1 CPU,
+`--max-instances` capped low. Idle cost is effectively zero; the only spend
+is per-request CPU-seconds when something actually hits it, which for a
+resume link is ~never.
