@@ -21,8 +21,6 @@ import time
 from datetime import datetime
 
 import dateparser
-import Quartz
-from AppKit import NSScreen
 from google import genai
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
@@ -30,7 +28,30 @@ from PIL import Image, ImageChops
 
 from .perception import capture_region, capture_screenshot, get_field_values, get_frontmost_window_frame, get_ui_tree
 
+try:
+    import Quartz
+    from AppKit import NSScreen
+except ImportError:
+    # Not macOS. The Cloud Run deployment of the agent server pulls in the
+    # full agent -> tools import chain, and there is no pyobjc there and no
+    # screen to drive. Every function in this module that actually posts a
+    # CGEvent or reads NSScreen is Mac-only and raises a clear error via
+    # _require_macos() if reached off a Mac - but the import itself must
+    # stay clean so the agent pipeline can load.
+    Quartz = None
+    NSScreen = None
+
+_MACOS = Quartz is not None
+
 logger = logging.getLogger(__name__)
+
+
+def _require_macos() -> None:
+    if not _MACOS:
+        raise RuntimeError(
+            "macOS control APIs unavailable - open_app / click_ui / type_in_field only work on a "
+            "local Mac, not in the Cloud Run deployment (which runs the Gemini agent pipeline only)."
+        )
 
 
 def _build_applescript(task: str, due_date: datetime, list_name: str) -> str:
@@ -104,6 +125,7 @@ def create_reminder(task: str, due_date: str, due_time: str, list_name: str = "J
     # dateparser understands both natural language ("tomorrow", "5pm") and
     # ISO-style input, so we don't hand-roll fragile string matching for
     # every phrasing the Planner/Action agent might produce.
+    _require_macos()
     parsed = dateparser.parse(f"{due_date} {due_time}")
     if parsed is None:
         return {
@@ -180,6 +202,7 @@ def _frontmost_app_name() -> str | None:
     each time has no such cache to go stale - each call is a fresh,
     real answer.
     """
+    _require_macos()
     result = subprocess.run(
         [
             "osascript",
@@ -209,6 +232,7 @@ def open_app(app_name: str) -> dict:
             message: human-readable summary of what happened
             error: the raw error string if something went wrong, else None
     """
+    _require_macos()
     clean_name = app_name.removesuffix(".app")
 
     launch = subprocess.run(
@@ -326,6 +350,7 @@ def _screen_scale_factor() -> float:
     coordinate is in point-space. On a Retina display those differ by this
     factor (2.0 is typical), so vision-tier coordinates must be divided by
     it before we dispatch a click."""
+    _require_macos()
     return NSScreen.mainScreen().backingScaleFactor()
 
 
@@ -529,9 +554,7 @@ def _dispatch_keyboard_shortcut(keycode: int, flags) -> None:
 # Spotify's own Edit menu via the Accessibility API (AXMenuItemCmdChar /
 # AXMenuItemCmdModifiers on the "Search" menu item), not assumed. Keycode
 # 37 is 'L' on a standard US keyboard layout.
-_APP_SEARCH_SHORTCUTS = {
-    "Spotify": (37, Quartz.kCGEventFlagMaskCommand),
-}
+_APP_SEARCH_SHORTCUTS = {"Spotify": (37, Quartz.kCGEventFlagMaskCommand)} if _MACOS else {}
 
 # Where the opened field lands, as an offset from its window's own top-left
 # corner (x as a fraction of window width, y as an absolute point offset

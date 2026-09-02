@@ -14,7 +14,24 @@ import subprocess
 import tempfile
 import time
 
-import ApplicationServices as AS
+try:
+    import ApplicationServices as AS
+except ImportError:
+    # Not macOS. The whole agent -> tools import chain is pulled in by the
+    # Cloud Run deployment of the agent server (backend/servers/agent_server.py),
+    # which only runs the Gemini-facing pipeline - it never has a screen and
+    # never calls anything in this module. A clean import is all that's needed
+    # there; every function below that touches AS raises a clear error if it
+    # is somehow reached off a Mac.
+    AS = None
+
+
+def _require_accessibility_api() -> None:
+    if AS is None:
+        raise RuntimeError(
+            "macOS Accessibility API unavailable - perception only works on a local Mac, "
+            "not in the Cloud Run deployment."
+        )
 
 # Roles worth surfacing to the caller - purely structural containers
 # (AXGroup, AXScrollArea, AXUnknown, ...) are skipped since they're never
@@ -134,6 +151,7 @@ def get_ui_tree(app_name: str, use_cache: bool = True) -> dict:
     (common for Electron/Chromium apps) will simply come back with very few
     or zero elements - that's a real signal, not a bug in this function.
     """
+    _require_accessibility_api()
     if use_cache:
         cached = _ui_tree_cache.get(app_name)
         if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
@@ -167,6 +185,7 @@ def get_field_values(app_name: str) -> list[str]:
     "Add Reminder", etc.), so it's the wrong thing to read here: after
     typing, we need the field's actual current *contents*, not its label.
     """
+    _require_accessibility_api()
     pid = _pid_for_app(app_name)
     if pid is None:
         return []
@@ -207,6 +226,7 @@ def get_frontmost_window_frame(app_name: str) -> tuple[float, float, float, floa
     shortcut), since asking vision to re-locate that kind of target was
     measured to guess wildly inconsistent, sometimes off-window locations.
     """
+    _require_accessibility_api()
     pid = _pid_for_app(app_name)
     if pid is None:
         return None
