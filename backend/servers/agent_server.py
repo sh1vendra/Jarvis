@@ -56,6 +56,7 @@ import json
 import logging
 import os
 import sys
+from http import HTTPStatus
 from typing import Any, Dict, Optional
 
 import websockets
@@ -73,8 +74,18 @@ from voice.stt import TranscriptionError, transcribe_audio  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-AGENT_HOST = os.environ.get("JARVIS_AGENT_HOST", "127.0.0.1")
-AGENT_PORT = int(os.environ.get("JARVIS_AGENT_PORT", "8766"))
+# Cloud Run injects PORT (and K_SERVICE). When PORT is set we're in a
+# container that must accept connections from outside it, so bind 0.0.0.0;
+# locally we stay on loopback so nothing off the machine can reach the
+# pipeline. JARVIS_AGENT_HOST/PORT still override either way.
+_IN_CONTAINER = bool(os.environ.get("PORT"))
+AGENT_HOST = os.environ.get("JARVIS_AGENT_HOST", "0.0.0.0" if _IN_CONTAINER else "127.0.0.1")
+AGENT_PORT = int(os.environ.get("PORT") or os.environ.get("JARVIS_AGENT_PORT") or "8766")
+
+# On Cloud Run there is no browser and no Electron client - only the
+# Gemini-facing agent pipeline is exercised, reachable for a health check.
+# K_SERVICE is always set by Cloud Run.
+_CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
 
 # websockets defaults max_size to 1 MiB, which real captures exceed: mono
 # int16 at the mic's native 48 kHz is ~94 KB/s raw, ~125 KB/s base64-encoded,
@@ -296,12 +307,30 @@ async def agent_handler(websocket):
         session.cancel_pending()
 
 
+_HEALTH_BODY = '{"status": "ok", "service": "jarvis-agent"}\n'
+
+
+def _health_check(connection, request):
+    """Answers plain HTTP GETs before the WebSocket upgrade, so Cloud Run
+    (and anyone opening the URL in a browser) gets a real liveness signal.
+    Returning None lets the request fall through to the WebSocket handshake.
+    """
+    if request.path in ("/health", "/healthz", "/"):
+        return connection.respond(HTTPStatus.OK, _HEALTH_BODY)
+    return None
+
+
 async def serve_forever() -> None:
     """Runs the agent server until cancelled."""
     async with websockets.serve(
-        agent_handler, AGENT_HOST, AGENT_PORT, origins=None, max_size=MAX_MESSAGE_BYTES
+        agent_handler,
+        AGENT_HOST,
+        AGENT_PORT,
+        origins=None,
+        max_size=MAX_MESSAGE_BYTES,
+        process_request=_health_check,
     ):
-        logger.info("agent server: listening on ws://%s:%s", AGENT_HOST, AGENT_PORT)
+        logger.info("agent server: listening on %s:%s (ws + GET /health)", AGENT_HOST, AGENT_PORT)
         await asyncio.Future()  # run until cancelled
 
 
@@ -323,4 +352,12 @@ if __name__ == "__main__":
 
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    asyncio.run(_main())
+
+    if _CLOUD_RUN:
+        # No browser bridge in the cloud - nothing to bridge to. Just the
+        # agent server, so the pipeline is reachable and the health check
+        # answers.
+        logger.info("agent server: Cloud Run mode (K_SERVICE=%s) - agent server only", os.environ.get("K_SERVICE"))
+        asyncio.run(serve_forever())
+    else:
+        asyncio.run(_main())
