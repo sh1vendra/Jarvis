@@ -1,0 +1,13 @@
+# Keep the build context small and keep secrets out of it.
+.env
+.git/
+.venv/
+.claude/
+frontend/
+chrome_extension/
+planning.md
+flow.md
+**/__pycache__/
+**/*.pyc
+**/.DS_Store
+backend/requirements.txt

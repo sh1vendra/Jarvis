@@ -313,11 +313,17 @@ _HEALTH_BODY = '{"status": "ok", "service": "jarvis-agent"}\n'
 def _health_check(connection, request):
     """Answers plain HTTP GETs before the WebSocket upgrade, so Cloud Run
     (and anyone opening the URL in a browser) gets a real liveness signal.
-    Returning None lets the request fall through to the WebSocket handshake.
+
+    A real WebSocket client is let straight through on any path - the
+    Electron app connects to the bare URL (path "/"), so "/" cannot be
+    reserved for health. The tell is the `Upgrade: websocket` header:
+    present -> it's the app, return None and proceed to the handshake;
+    absent -> it's a browser or a probe, answer with the health body.
     """
-    if request.path in ("/health", "/healthz", "/"):
-        return connection.respond(HTTPStatus.OK, _HEALTH_BODY)
-    return None
+    upgrade = (request.headers.get("Upgrade") or "").lower()
+    if upgrade == "websocket":
+        return None
+    return connection.respond(HTTPStatus.OK, _HEALTH_BODY)
 
 
 async def serve_forever() -> None:

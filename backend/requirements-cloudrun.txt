@@ -1,0 +1,21 @@
+# Dependencies for the Cloud Run deployment of the agent server ONLY.
+#
+# This is the subset of backend/requirements.txt that the Gemini-facing
+# agent pipeline actually needs at import + run time on Linux. Deliberately
+# excludes:
+#   - pyobjc-framework-* : macOS Accessibility/Quartz bindings. Don't exist
+#     on Linux; tools/mac_control.py and tools/perception.py guard their
+#     imports and raise a clear error if the Mac-only functions are called.
+#   - sounddevice        : microphone capture (voice/capture.py), CLI-only,
+#     not in the agent server's import chain.
+#
+# Pinned to the versions running locally so the container is reproducible.
+
+google-adk==2.6.3
+google-genai==2.17.0
+python-dotenv==1.2.2
+pydantic==2.13.4
+dateparser==1.4.2
+Pillow==12.3.0
+websockets==15.0.1
+SpeechRecognition==3.17.0
