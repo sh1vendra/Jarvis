@@ -76,6 +76,13 @@ planner_agent = LlmAgent(
         "milestone - don't fold it into an earlier one - and mark only that "
         "milestone requires_approval=true, so execution can pause there for approval "
         "before it actually runs.\n\n"
+        "If the task description is followed by a '[Known user preferences ...]' "
+        "block, treat those as facts the user has told Jarvis before. Use a "
+        "preference only to fill in a detail the command itself left unspecified - "
+        "e.g. the command says 'search for a flight' with no destination and a "
+        "preference gives a default flight city, so the plan uses that city. Never "
+        "let a preference override something the command stated explicitly, and "
+        "ignore any preference not relevant to this command.\n\n"
         "Keep the plan minimal — only the milestones actually needed to "
         "accomplish the task, in the order they must happen."
     ),

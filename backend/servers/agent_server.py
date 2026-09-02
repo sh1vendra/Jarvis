@@ -69,7 +69,8 @@ if _backend_dir not in sys.path:
 from agents.action import action_agent  # noqa: E402
 from agents.orchestrator import orchestrator_agent  # noqa: E402
 from agents.planner import MilestonePlan  # noqa: E402
-from main import APP_NAME, USER_ID, run_action, run_command  # noqa: E402
+from main import APP_NAME, USER_ID, run_action, run_command, summarize_plan  # noqa: E402
+from memory import store as memory_store  # noqa: E402
 from voice.stt import TranscriptionError, transcribe_audio  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -135,7 +136,7 @@ class ClientSession:
             self._task.cancel()
 
 
-async def _run_plan(session: ClientSession, plan: MilestonePlan) -> None:
+async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
     """Executes a plan's milestones in order, pausing at every
     `requires_approval` one until a real client decision arrives.
 
@@ -144,6 +145,9 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> None:
     `main.run_milestones_until_approval`: the agent should not be trusted to
     police its own execution. The only change from the CLI version is what
     the pause waits on: a client message instead of a keypress.
+
+    Returns "completed" or "rejected" so the caller can record the outcome
+    in command_history.
     """
     action_runner = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
     action_session = await action_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
@@ -170,15 +174,24 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> None:
                 await session.send(
                     {"type": "state", "state": "done", "reason": "rejected", "goal": milestone.goal}
                 )
-                return
+                return "rejected"
 
         await run_action(action_runner, action_session.id, milestone, on_event=session.send)
 
     await session.send({"type": "state", "state": "done", "reason": "completed"})
+    return "completed"
 
 
 async def _handle_command(session: ClientSession, text: str) -> None:
-    """One full command: Orchestrator -> Planner -> (approval gate) -> Action."""
+    """One full command: Orchestrator -> Planner -> (approval gate) -> Action.
+
+    A real task command (one that produced a plan) is written to
+    command_history on the way out, pass or fail. Conversational input that
+    never produced a plan isn't a command Jarvis "executed", so it isn't
+    logged.
+    """
+    plan_summary: Optional[str] = None
+    success = False
     try:
         await session.send({"type": "state", "state": "thinking"})
 
@@ -194,7 +207,9 @@ async def _handle_command(session: ClientSession, text: str) -> None:
             await session.send({"type": "state", "state": "done", "reason": "conversational"})
             return
 
-        await _run_plan(session, plan)
+        plan_summary = summarize_plan(plan)
+        outcome = await _run_plan(session, plan)
+        success = outcome == "completed"
 
     except asyncio.CancelledError:
         raise
@@ -202,6 +217,10 @@ async def _handle_command(session: ClientSession, text: str) -> None:
         logger.exception("agent server: command failed")
         await session.send({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
         await session.send({"type": "state", "state": "done", "reason": "error"})
+    finally:
+        if plan_summary is not None:
+            memory_store.log_command(text, plan_summary, success)
+            logger.info("agent server: command logged to memory (success=%s)", success)
 
 
 async def _transcribe(session: ClientSession, data: Dict[str, Any]) -> Optional[str]:

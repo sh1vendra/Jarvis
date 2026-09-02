@@ -31,6 +31,7 @@ from google.genai import types
 from agents.action import action_agent
 from agents.orchestrator import orchestrator_agent
 from agents.planner import Milestone, MilestonePlan
+from memory import store as memory_store
 from servers.browser_bridge_server import serve_forever as serve_browser_bridge_forever
 from voice.stt import transcribe_audio
 
@@ -59,6 +60,36 @@ async def _emit(on_event, payload: dict) -> None:
         await on_event(payload)
 
 
+def summarize_plan(plan: MilestonePlan) -> str:
+    """A one-line, human-readable digest of a plan, for the command_history
+    log. Just the milestone goals, numbered, pipe-separated."""
+    return " | ".join(f"{m.step_number}. {m.goal}" for m in plan.milestones)
+
+
+def _with_preferences(text: str) -> tuple[str, dict[str, str]]:
+    """Tier 1 memory read (see memory/store.py): if any stored preference is
+    relevant to this command, append it as context so the Planner can fill
+    in details the user didn't say - a default flight city, who "mom" is.
+
+    Returns `(effective_text, applied_prefs)`. When nothing is relevant,
+    `effective_text` is `text` unchanged and `applied_prefs` is empty, so a
+    plain command reaches the Planner exactly as before.
+    """
+    prefs = memory_store.relevant_preferences(text)
+    if not prefs:
+        return text, {}
+    lines = "\n".join(f"- {k}: {v}" for k, v in prefs.items())
+    print(f"\n[MEMORY] applying {len(prefs)} stored preference(s):\n{lines}")
+    effective = (
+        f"{text}\n\n"
+        "[Known user preferences - use these to fill in any detail the user did not "
+        "state explicitly in the command above (e.g. a destination, a city, a "
+        "contact). Do not act on a preference that isn't relevant to this command.]\n"
+        f"{lines}"
+    )
+    return effective, prefs
+
+
 async def run_command(
     runner: InMemoryRunner, session_id: str, text: str, on_event=None
 ) -> MilestonePlan | None:
@@ -71,7 +102,11 @@ async def run_command(
     print(f"USER COMMAND: {text!r}")
     print("=" * 60)
 
-    message = types.Content(role="user", parts=[types.Part(text=text)])
+    effective_text, applied_prefs = _with_preferences(text)
+    if applied_prefs:
+        await _emit(on_event, {"type": "preferences_applied", "preferences": applied_prefs})
+
+    message = types.Content(role="user", parts=[types.Part(text=effective_text)])
 
     final_text = None
     responding_agent = None
@@ -244,7 +279,9 @@ async def run_plan_with_approval_gate(
         remaining = remaining[remaining.index(pending) + 1:]
 
 
-async def run_voice_command(runner: InMemoryRunner, session_id: str, audio) -> MilestonePlan | None:
+async def run_voice_command(
+    runner: InMemoryRunner, session_id: str, audio
+) -> tuple[str, MilestonePlan | None]:
     """The voice entry point: transcribe captured audio to text, then send
     that text through exactly the same Orchestrator path a typed command
     would take (`run_command`).
@@ -253,12 +290,16 @@ async def run_voice_command(runner: InMemoryRunner, session_id: str, audio) -> M
     `speech_recognition.AudioData`, or a `voice.stt.SimulatedAudio` in a
     unit test. `transcribe_audio` handles both; nothing below this line
     knows or cares which it was.
+
+    Returns `(transcript, plan)` - the transcript is handed back so the
+    caller can log the command to memory verbatim.
     """
     transcript = transcribe_audio(audio)
     print(f"\n{'*' * 60}")
     print(f"GOOGLE STT TRANSCRIPT: {transcript!r}")
     print("*" * 60)
-    return await run_command(runner, session_id, transcript)
+    plan = await run_command(runner, session_id, transcript)
+    return transcript, plan
 
 
 # The three demo commands, in test order. `say` is a suggested STT-friendly
@@ -305,7 +346,7 @@ async def run_spoken_command(name: str, *, device: int | None) -> None:
 
     orchestrator_runner = InMemoryRunner(agent=orchestrator_agent, app_name=APP_NAME)
     session = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-    plan = await run_voice_command(orchestrator_runner, session.id, audio)
+    transcript, plan = await run_voice_command(orchestrator_runner, session.id, audio)
     if plan is None:
         print(
             "\n[VOICE] No plan produced - the orchestrator treated this as conversational. "
@@ -315,7 +356,15 @@ async def run_spoken_command(name: str, *, device: int | None) -> None:
 
     action_runner = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
     action_session = await action_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-    await run_plan_with_approval_gate(action_runner, action_session.id, plan.milestones)
+    success = False
+    try:
+        await run_plan_with_approval_gate(action_runner, action_session.id, plan.milestones)
+        success = True
+    finally:
+        # Tier 1 memory write: every real task command that runs gets a
+        # command_history row, pass or fail (see memory/store.py).
+        memory_store.log_command(transcript, summarize_plan(plan), success)
+        print(f"\n[MEMORY] logged command (transcript={transcript!r}, success={success})")
 
 
 async def run_voice_session(only: str | None = None, *, device: int | None = None) -> None:
@@ -364,6 +413,7 @@ async def run_typed_regression() -> None:
         action_runner = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
         action_session = await action_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
         await run_plan_with_approval_gate(action_runner, action_session.id, spotify_plan.milestones)
+        memory_store.log_command("open Spotify and play Billie Jean by Michael Jackson", summarize_plan(spotify_plan), True)
 
     # Reminder, full chain.
     session3 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
@@ -374,6 +424,7 @@ async def run_typed_regression() -> None:
         action_runner2 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
         action_session2 = await action_runner2.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
         await run_plan_with_approval_gate(action_runner2, action_session2.id, reminder_plan.milestones)
+        memory_store.log_command("set a reminder to call mom tomorrow at 5pm", summarize_plan(reminder_plan), True)
 
     # Kayak, full chain including the approval-gate pause. Jarvis opens
     # Chrome and navigates to Kayak itself now (first milestone,
@@ -387,6 +438,7 @@ async def run_typed_regression() -> None:
         action_runner3 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
         action_session3 = await action_runner3.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
         await run_plan_with_approval_gate(action_runner3, action_session3.id, kayak_plan.milestones)
+        memory_store.log_command("open Kayak and search for a flight to New York", summarize_plan(kayak_plan), True)
 
 
 def _parse_args(argv: list[str]) -> dict:
