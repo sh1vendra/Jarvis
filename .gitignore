@@ -5,3 +5,8 @@ __pycache__/
 
 node_modules/
 frontend/dist/
+
+# Tier 1 memory: local SQLite, never committed
+backend/memory/*.db
+backend/memory/*.db-wal
+backend/memory/*.db-shm
