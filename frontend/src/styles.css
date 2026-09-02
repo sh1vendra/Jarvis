@@ -1,0 +1,624 @@
+/*
+ * All visual design for the overlay lives in this file - App.jsx owns state
+ * and wiring only. The root element carries data-state (idle | listening |
+ * thinking | doing | approving | done), and everything here keys off that:
+ * the glass container morphs between a compact pill and a full card, and
+ * per-state rules decide which content blocks are visible so the logic never
+ * has to.
+ *
+ * The BrowserWindow is frameless and fully transparent (main.js), so the
+ * glass container is the only thing on screen - its own shadow paints into
+ * the transparent margin the .stage padding reserves around it.
+ */
+
+:root {
+  --glass-bg-top: rgba(40, 42, 55, 0.9);
+  --glass-bg-bottom: rgba(24, 25, 34, 0.94);
+  --glass-border: rgba(255, 255, 255, 0.14);
+  --glass-highlight: rgba(255, 255, 255, 0.08);
+  --text-primary: rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(255, 255, 255, 0.55);
+  --text-faint: rgba(255, 255, 255, 0.35);
+  --inset-bg: rgba(255, 255, 255, 0.06);
+  --inset-border: rgba(255, 255, 255, 0.09);
+  --accent-blue: #0a84ff;
+  --accent-red: #ff453a;
+  --accent-purple: #bf5af2;
+  --accent-amber: #ff9f0a;
+  --accent-green: #30d158;
+  --ease-morph: cubic-bezier(0.32, 0.72, 0.28, 1);
+}
+
+html,
+body {
+  background: transparent;
+  overflow: hidden;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  color: var(--text-primary);
+  user-select: none;
+  cursor: default;
+}
+
+/* ── Stage: fills the transparent window, centers the glass ── */
+
+.stage {
+  height: 100%;
+  box-sizing: border-box;
+  padding: 14px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* ── The glass container ── */
+
+.glass {
+  position: relative;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--glass-bg-top), var(--glass-bg-bottom));
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    0 16px 48px rgba(0, 0, 0, 0.5),
+    0 2px 10px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 var(--glass-highlight);
+  backdrop-filter: blur(24px) saturate(1.5);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  /* The whole glass surface is the drag region; interactive children opt
+     out below with -webkit-app-region: no-drag. */
+  -webkit-app-region: drag;
+  transition:
+    width 0.45s var(--ease-morph),
+    border-radius 0.45s var(--ease-morph),
+    padding 0.45s var(--ease-morph);
+}
+
+/* Morph targets per state: pill when idle/listening/thinking, card once
+   there is real content to show. */
+.stage[data-state="idle"] .glass {
+  width: 236px;
+  border-radius: 999px;
+  padding: 10px 20px;
+}
+
+.stage[data-state="listening"] .glass {
+  width: 324px;
+  border-radius: 999px;
+  padding: 12px 22px;
+}
+
+.stage[data-state="thinking"] .glass {
+  width: 360px;
+  border-radius: 26px;
+  padding: 13px 20px;
+}
+
+.stage[data-state="doing"] .glass,
+.stage[data-state="approving"] .glass,
+.stage[data-state="done"] .glass {
+  width: 436px;
+  border-radius: 22px;
+  padding: 15px 18px 13px;
+}
+
+/* ── Per-state content visibility: keep the pills clean, focus the
+      approval card, let the working card carry the detail ── */
+
+.stage[data-state="idle"] .activity,
+.stage[data-state="listening"] .activity,
+.stage[data-state="thinking"] .activity,
+.stage[data-state="approving"] .activity {
+  display: none;
+}
+
+.stage[data-state="idle"] .transcript,
+.stage[data-state="listening"] .transcript,
+.stage[data-state="idle"] .reply,
+.stage[data-state="listening"] .reply,
+.stage[data-state="idle"] .plan,
+.stage[data-state="listening"] .plan {
+  display: none;
+}
+
+.stage[data-state="approving"] .plan {
+  display: none;
+}
+
+.stage[data-state="idle"] .capture,
+.stage[data-state="listening"] .capture,
+.stage[data-state="approving"] .capture {
+  display: none;
+}
+
+/* ── Header row: orb, state label, hotkey hint, connection dot ── */
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 20px;
+  flex: none;
+}
+
+.stateLabel {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.08px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Animated ellipsis while the backend is busy - content animation keeps the
+   label element itself static so nothing reflows. */
+.stage[data-state="thinking"] .stateLabel::after,
+.stage[data-state="doing"] .stateLabel::after {
+  content: "";
+  animation: ellipsis 1.4s steps(4, end) infinite;
+}
+
+@keyframes ellipsis {
+  0% { content: ""; }
+  25% { content: "."; }
+  50% { content: ".."; }
+  75% { content: "..."; }
+}
+
+.hint {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-faint);
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+}
+
+/* ── Status orb: one dot, recolored and re-animated per state ── */
+
+.orb {
+  position: relative;
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: background 0.3s ease, box-shadow 0.3s ease;
+}
+
+.stage[data-state="idle"] .orb {
+  animation: breathe 3.2s ease-in-out infinite;
+}
+
+.stage[data-state="listening"] .orb {
+  background: var(--accent-red);
+  box-shadow: 0 0 10px rgba(255, 69, 58, 0.6);
+}
+
+.stage[data-state="listening"] .orb::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 2px solid rgba(255, 69, 58, 0.55);
+  animation: ping 1.3s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+.stage[data-state="thinking"] .orb {
+  background: var(--accent-purple);
+  box-shadow: 0 0 10px rgba(191, 90, 242, 0.55);
+  animation: breathe 1.4s ease-in-out infinite;
+}
+
+.stage[data-state="doing"] .orb {
+  background: var(--accent-blue);
+  box-shadow: 0 0 10px rgba(10, 132, 255, 0.55);
+}
+
+.stage[data-state="doing"] .orb::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--accent-blue);
+  animation: spin 0.9s linear infinite;
+}
+
+.stage[data-state="approving"] .orb {
+  background: var(--accent-amber);
+  box-shadow: 0 0 10px rgba(255, 159, 10, 0.55);
+  animation: breathe 1s ease-in-out infinite;
+}
+
+.stage[data-state="done"] .orb {
+  background: var(--accent-green);
+  box-shadow: 0 0 10px rgba(48, 209, 88, 0.55);
+}
+
+@keyframes breathe {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+@keyframes ping {
+  0% { transform: scale(0.6); opacity: 1; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Connection dot: tiny, truthful, out of the way ── */
+
+.conn {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  /* Sits at the right edge of the header; the hotkey hint, when present,
+     takes over the auto margin and the dot just trails it. */
+  margin-left: auto;
+}
+
+.hint + .conn {
+  margin-left: 8px;
+}
+
+.conn[data-conn="connected"] {
+  background: var(--accent-green);
+}
+
+.conn[data-conn="connecting"] {
+  background: var(--accent-amber);
+  animation: breathe 1.2s ease-in-out infinite;
+}
+
+.conn[data-conn="disconnected"],
+.conn[data-conn="error"] {
+  background: var(--accent-red);
+}
+
+/* ── Waveform: decorative bars while the mic is open ── */
+
+.wave {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 26px;
+  margin-top: 8px;
+  flex: none;
+}
+
+.wave span {
+  width: 4px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, #7cb8ff, var(--accent-blue));
+  animation: wavebar 1.1s ease-in-out infinite;
+}
+
+.wave span:nth-child(1) { animation-delay: -0.9s; }
+.wave span:nth-child(2) { animation-delay: -0.7s; }
+.wave span:nth-child(3) { animation-delay: -0.5s; }
+.wave span:nth-child(4) { animation-delay: -0.3s; }
+.wave span:nth-child(5) { animation-delay: -0.1s; }
+
+@keyframes wavebar {
+  0%, 100% { height: 6px; opacity: 0.6; }
+  50% { height: 24px; opacity: 1; }
+}
+
+/* ── Scrollable content column below the header ── */
+
+.body {
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+
+.body > * {
+  animation: rise 0.35s var(--ease-morph);
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Content blocks ── */
+
+.caption {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 3px;
+}
+
+.transcript {
+  margin-top: 10px;
+  flex: none;
+}
+
+.quote {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  font-style: italic;
+}
+
+.capture {
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.reply {
+  margin-top: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  flex: none;
+}
+
+/* Plan: custom-numbered milestones with an approval chip where needed */
+
+.plan {
+  list-style: none;
+  counter-reset: milestone;
+  margin: 10px 0 0;
+  padding: 0;
+  flex: none;
+}
+
+.plan li {
+  counter-increment: milestone;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+.plan li::before {
+  content: counter(milestone);
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--inset-bg);
+  border: 1px solid var(--inset-border);
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  transform: translateY(2px);
+}
+
+.planGoal {
+  flex: 1;
+}
+
+.badge {
+  flex: none;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--accent-amber);
+  background: rgba(255, 159, 10, 0.14);
+  border: 1px solid rgba(255, 159, 10, 0.25);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+/* ── Approval card: the one real decision point ── */
+
+.approval {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--inset-bg);
+  border: 1px solid var(--inset-border);
+  border-radius: 14px;
+  flex: none;
+}
+
+.approvalTitle {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--accent-amber);
+  margin-bottom: 6px;
+}
+
+.approvalGoal {
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
+.approvalSignal {
+  margin-top: 4px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+
+.approvalActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+  -webkit-app-region: no-drag;
+}
+
+.btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 7px 12px;
+  border-radius: 10px;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.12s ease, filter 0.12s ease, background 0.12s ease;
+}
+
+.btn:active {
+  transform: scale(0.97);
+}
+
+.btn kbd {
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.btnApprove {
+  border: none;
+  color: #fff;
+  background: linear-gradient(180deg, #3d97ff, var(--accent-blue));
+  box-shadow: 0 2px 8px rgba(10, 132, 255, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+}
+
+.btnApprove:hover {
+  filter: brightness(1.1);
+}
+
+.btnReject {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.btnReject:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.btnReject kbd {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* ── Error banner ── */
+
+.error {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(255, 69, 58, 0.14);
+  border: 1px solid rgba(255, 69, 58, 0.3);
+  color: #ff8a80;
+  font-size: 12px;
+  line-height: 1.4;
+  flex: none;
+}
+
+/* ── Activity log ── */
+
+.activity {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  max-height: 110px;
+  overflow-y: auto;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  -webkit-app-region: no-drag;
+  flex: none;
+}
+
+.activity::-webkit-scrollbar {
+  width: 6px;
+}
+
+.activity::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+
+/* ── Window controls: hover-revealed minimize/close in the top corner ── */
+
+.controls {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 2;
+  display: flex;
+  gap: 4px;
+  padding: 2px;
+  border-radius: 999px;
+  background: rgba(18, 19, 26, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  opacity: 0;
+  transition: opacity 0.18s ease;
+  -webkit-app-region: no-drag;
+}
+
+.glass:hover .controls {
+  opacity: 1;
+}
+
+/* Center the controls vertically on the compact pills. */
+.stage[data-state="idle"] .controls,
+.stage[data-state="listening"] .controls {
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.winBtn {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.winBtn:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--text-primary);
+}

@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { PCMRecorder } from "./audio/recorder.js";
 import { AgentClient } from "./ws/client.js";
+// All visual design lives in styles.css, keyed off data-state on the root
+// element - this file owns state and wiring only.
+import "./styles.css";
 
-// Plain, deliberately unstyled state machine. Visual design is out of scope
-// for this pass and is owned by a later styling tool - the contract that pass
-// depends on is this state set and the props below it, so restyling should
-// not require rewiring anything here.
+// The state machine contract the stylesheet designs around:
 //
 //   idle       nothing happening, waiting for the hotkey
 //   listening  microphone is open, user is speaking
@@ -14,11 +14,11 @@ import { AgentClient } from "./ws/client.js";
 //   approving  paused at an approval gate, waiting for a real human decision
 //   done       run finished (completed / rejected / conversational / error)
 const STATE_LABEL = {
-  idle: "Idle - press Cmd+Shift+Space to speak",
-  listening: "Listening...",
-  thinking: "Thinking...",
-  doing: "Doing it...",
-  approving: "Waiting for your approval",
+  idle: "Jarvis",
+  listening: "Listening",
+  thinking: "Thinking",
+  doing: "Working",
+  approving: "Approval needed",
   done: "Done",
 };
 
@@ -173,121 +173,90 @@ export default function App() {
   }, [pendingApproval, decide]);
 
   return (
-    <div style={S.shell}>
-      {/* Frameless windows draw no OS titlebar, so there is no built-in way
-          to move or minimize/close this window without this strip. The
-          strip itself is `-webkit-app-region: drag` (Electron reads that
-          CSS property to know a mousedown here should move the window
-          instead of hitting the page); the buttons inside are explicitly
-          marked `no-drag` so clicking them doesn't start a drag first. */}
-      <div style={S.titlebar}>
-        <span style={S.titlebarLabel}>Jarvis</span>
-        <div style={S.titlebarButtons}>
-          <button style={S.titlebarButton} onClick={() => window.jarvis.minimize()} title="Minimize">
+    <div className="stage" data-state={state}>
+      <div className="glass">
+        {/* Frameless windows draw no OS titlebar, so there is no built-in
+            way to move or minimize/close this window. The whole glass
+            surface is `-webkit-app-region: drag` (Electron reads that CSS
+            property to know a mousedown should move the window instead of
+            hitting the page); these buttons and every interactive element
+            are marked `no-drag` in the stylesheet so clicking them doesn't
+            start a drag first. */}
+        <div className="controls">
+          <button className="winBtn" onClick={() => window.jarvis.minimize()} title="Minimize">
             &#8211;
           </button>
-          <button style={S.titlebarButton} onClick={() => window.jarvis.closeWindow()} title="Close">
+          <button className="winBtn" onClick={() => window.jarvis.closeWindow()} title="Close">
             &#215;
           </button>
         </div>
-      </div>
 
-      <div style={S.row}>
-        <strong>{STATE_LABEL[state] || state}</strong>
-        <span style={S.dim}>backend: {connection}</span>
-      </div>
-
-      {transcript && (
-        <div style={S.block}>
-          <div style={S.dim}>heard</div>
-          <div>"{transcript}"</div>
+        <div className="header">
+          <span className="orb" />
+          <span className="stateLabel">{STATE_LABEL[state] || state}</span>
+          {state === "idle" && <span className="hint">&#8984;&#8679;Space</span>}
+          <span className="conn" data-conn={connection} title={`backend: ${connection}`} />
         </div>
-      )}
 
-      {captureInfo && (
-        <div style={S.dim}>
-          {captureInfo.seconds.toFixed(1)}s @ {captureInfo.sampleRate} Hz, peak {captureInfo.peak}
-        </div>
-      )}
-
-      {reply && <div style={S.block}>{reply}</div>}
-
-      {plan.length > 0 && (
-        <ol style={S.list}>
-          {plan.map((m) => (
-            <li key={m.step_number}>
-              {m.goal} {m.requires_approval ? <em>(needs approval)</em> : null}
-            </li>
-          ))}
-        </ol>
-      )}
-
-      {pendingApproval && (
-        <div style={S.approval}>
-          <div>
-            <strong>Approve this step?</strong>
+        {state === "listening" && (
+          <div className="wave" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
           </div>
-          <div>{pendingApproval.goal}</div>
-          <div style={S.dim}>{pendingApproval.success_signal}</div>
-          <div style={S.row}>
-            <button onClick={() => decide(true)}>Approve (Enter)</button>
-            <button onClick={() => decide(false)}>Reject (Esc)</button>
-          </div>
+        )}
+
+        <div className="body">
+          {transcript && (
+            <div className="transcript">
+              <div className="caption">Heard</div>
+              <div className="quote">"{transcript}"</div>
+            </div>
+          )}
+
+          {captureInfo && (
+            <div className="capture">
+              {captureInfo.seconds.toFixed(1)}s &middot; {captureInfo.sampleRate} Hz &middot; peak{" "}
+              {captureInfo.peak}
+            </div>
+          )}
+
+          {reply && <div className="reply">{reply}</div>}
+
+          {plan.length > 0 && (
+            <ol className="plan">
+              {plan.map((m) => (
+                <li key={m.step_number}>
+                  <span className="planGoal">{m.goal}</span>
+                  {m.requires_approval ? <span className="badge">approval</span> : null}
+                </li>
+              ))}
+            </ol>
+          )}
+
+          {pendingApproval && (
+            <div className="approval">
+              <div className="approvalTitle">Approve this step?</div>
+              <div className="approvalGoal">{pendingApproval.goal}</div>
+              <div className="approvalSignal">{pendingApproval.success_signal}</div>
+              <div className="approvalActions">
+                <button className="btn btnApprove" onClick={() => decide(true)}>
+                  Approve <kbd>&#9166;</kbd>
+                </button>
+                <button className="btn btnReject" onClick={() => decide(false)}>
+                  Reject <kbd>esc</kbd>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {error && <div className="error">{error}</div>}
+
+          {activity.length > 0 && <pre className="activity">{activity.join("\n")}</pre>}
         </div>
-      )}
-
-      {error && <div style={S.error}>{error}</div>}
-
-      {activity.length > 0 && (
-        <pre style={S.activity}>{activity.join("\n")}</pre>
-      )}
+      </div>
     </div>
   );
 }
-
-// Minimum needed to see and interact with each state. Not a design.
-const S = {
-  shell: {
-    fontFamily: "ui-monospace, monospace",
-    fontSize: 12,
-    padding: 12,
-    background: "#fff",
-    border: "1px solid #888",
-    borderRadius: 6,
-    height: "100%",
-    boxSizing: "border-box",
-    overflow: "auto",
-  },
-  titlebar: {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 8,
-    paddingBottom: 6,
-    borderBottom: "1px solid #ccc",
-    // The draggable surface - see the comment above this element in JSX.
-    WebkitAppRegion: "drag",
-    cursor: "default",
-  },
-  titlebarLabel: { fontWeight: "bold", color: "#555" },
-  titlebarButtons: { display: "flex", gap: 4, WebkitAppRegion: "no-drag" },
-  titlebarButton: {
-    width: 20,
-    height: 20,
-    lineHeight: "18px",
-    padding: 0,
-    textAlign: "center",
-    fontSize: 13,
-    cursor: "pointer",
-    background: "#eee",
-    border: "1px solid #999",
-    borderRadius: 3,
-  },
-  row: { display: "flex", gap: 8, alignItems: "center", justifyContent: "space-between" },
-  dim: { color: "#777" },
-  block: { marginTop: 6 },
-  list: { margin: "6px 0", paddingLeft: 18 },
-  approval: { marginTop: 8, padding: 8, border: "2px solid #333", borderRadius: 4 },
-  error: { marginTop: 6, color: "#a00" },
-  activity: { marginTop: 8, maxHeight: 120, overflow: "auto", background: "#f4f4f4", padding: 6 },
-};
