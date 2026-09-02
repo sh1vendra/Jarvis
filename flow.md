@@ -126,6 +126,17 @@ routine local item (reminder, note, calendar event) is explicitly *never*
 approval-worthy - only actions that spend money, contact other people, or
 submit to an external site are.
 
+**Memory read (Tier 1, see section 11).** Before the Planner ever runs,
+`run_command` calls `memory.store.relevant_preferences(text)`. If a stored
+preference matches the command by keyword, it's appended to the user
+message as a `[Known user preferences ...]` block, and a `preferences_applied`
+event is emitted. The instruction has one paragraph telling the Planner to
+use such a block only to fill in a detail the command left unspecified
+(a default flight city, who "mom" is) and never to override something
+stated explicitly. Verified: with `default_flight_destination` stored,
+"search Kayak for a flight" (no destination) produces a plan whose
+milestone reads "the destination Austin, Texas is entered".
+
 ## 4. Action agent's tool selection and execution loop
 
 `agents/action.py` defines `action_agent`, given eight tools -
@@ -800,3 +811,38 @@ cd frontend && npm run dev
 - Renderer console output does not reach the terminal by default; a failed
   renderer import silently leaves the previous build running. `main.js`
   mirrors `webContents.on("console-message")` into the terminal.
+
+## 11. Memory (Tier 1): SQLite command history + preferences
+
+`backend/memory/store.py` - plain SQLite at `backend/memory/jarvis_memory.db`
+(path resolved absolutely; `JARVIS_MEMORY_DB` overrides it for tests). Two
+tables, no embeddings - the ChromaDB "Memory Agent" from the plan doc is a
+deliberately separate Tier 2 step (see `planning.md`).
+
+**`command_history(id, timestamp, transcript, plan_summary, success)`** - one
+row per real task command that runs to a finish, written by the caller that
+owns the whole command, not by `run_command`:
+- CLI voice path: `main.run_spoken_command`, in a `try/finally` around
+  `run_plan_with_approval_gate`.
+- Electron path: `agent_server._handle_command`, in a `finally`, using the
+  `"completed"` / `"rejected"` return from `_run_plan`.
+- Typed regression: one `log_command` call after each demo command.
+
+`success` = ran end to end with no exception and no rejection. A conversational
+input that never produced a plan is not logged (nothing was executed). A soft
+tool failure (a tool returning `success: false` without raising) is currently
+still logged as success - a documented Tier 1 limitation.
+
+**`preferences(key, value, updated_at)`** - explicit user-stated facts, set by
+hand for now: `python -m memory.set_preference "default_flight_destination"
+"Austin, Texas"`. There is no "remember this" voice command yet (Tier 2).
+`relevant_preferences(text)` is the gate wired into the Planner (section 3): a
+preference matches if any 3+char, non-stopword token of its key appears as a
+whole word in the command. Keyword match, not NL understanding.
+
+**Where it sits in the lifecycle:** the read happens in `run_command` just
+before the Orchestrator call (so both the CLI and Electron paths get it for
+free); the write happens once per command, at the very end, after execution
+settles. Neither touches how a plan is generated or executed - it's a layer
+on top. Persistence is just the file: kill the process, restart, the rows
+and preferences are still there (verified with a real process restart).

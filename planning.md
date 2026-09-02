@@ -2043,3 +2043,97 @@ binding `allUsers` (public), `GOOGLE_API_KEY` present as an env var (value
 not exposed). Teardown when it's no longer wanted:
 `gcloud run services delete jarvis-agent --region us-central1`, and
 optionally unlink billing from the project again.
+
+---
+
+## Tier 1 memory: SQLite for command history + explicit preferences, ChromaDB deferred
+
+**Context.** The original plan doc and the resume framing named a "Memory
+Agent" with vector memory (ChromaDB). It was never built - Jarvis had zero
+memory between commands or sessions. This step builds a real, minimal
+version; the full semantic system stays out of scope, as its own future
+session.
+
+**Decision: plain SQLite (`backend/memory/store.py`), two tables, no
+embeddings.**
+- `command_history(timestamp, transcript, plan_summary, success)` - an
+  append-only log, one row per real task command that runs.
+- `preferences(key, value, updated_at)` - a handful of explicit
+  user-stated facts the Planner can consult before it plans.
+
+**Why SQLite and not ChromaDB here.** The two are not interchangeable and
+this tier genuinely wants the relational one:
+- The data is small, structured, and looked up by **exact match** - a
+  preference by key, history newest-first. There is no "find the 5 most
+  semantically similar past commands" question being asked yet. Vector
+  search would be answering a question nobody has.
+- It must **survive a process restart with zero infrastructure**. SQLite is
+  a file. ChromaDB is a service (or an embedded store with a heavier
+  dependency and an embedding model to load). For "prove persistent memory
+  exists," a file is the honest minimum.
+- Adding ChromaDB now would mean picking an embedding model, a similarity
+  threshold, and a collection schema - real design decisions that deserve
+  their own step, not a rushed corner of this one.
+
+**Why command history and preferences are the right minimal scope.** They
+are the two things that make "memory" a real claim rather than a word:
+- History is **observability** - a real record that Jarvis did something,
+  what plan it produced, and whether it worked. It needs no intelligence to
+  be useful; it just needs to be written every time, automatically.
+- Preferences are the **read path** - proof that stored state can flow back
+  into a decision (the Planner's) and change the output. The mechanism
+  (store -> relevance check -> Planner context -> different plan) is the
+  thing worth proving. What's deliberately *not* here: automatic extraction
+  of preferences from natural speech ("remember that my mom is..."). That's
+  a harder NL problem and it's Tier 2. For now preferences are set by hand
+  (`python -m memory.set_preference "key" "value"`).
+
+**The relevance check is a keyword gate, on purpose.**
+`relevant_preferences(text)` matches a preference if any 3+char, non-stopword
+token of its key appears as a whole word in the command. So
+`default_flight_destination` fires on "search Kayak for a flight",
+`who_is_mom` on "call mom". It is not language understanding - it is the
+smallest thing that reliably gets the right preference in front of the
+Planner and keeps unrelated ones out. A real relevance model is Tier 2.
+
+**ChromaDB / semantic memory is a deliberate Tier 2 deferral, not an
+oversight.** The future step: embed each `command_history` transcript,
+store vectors in ChromaDB, and let the Orchestrator/Planner retrieve
+semantically similar past commands as context ("last time you asked for
+something like this, here's the plan that worked"). That needs an embedding
+model choice, a similarity threshold tuned against real history, and a
+retrieval-injection design - a whole session's worth of decisions. This
+tier is the foundation it will build on: the SQLite `command_history` rows
+are exactly the corpus Tier 2 will embed.
+
+**Wiring - a clean layer on top, no demo-command logic touched.**
+- Write: `run_command` is unchanged in how it plans; the *callers* that run
+  a plan to completion (`run_spoken_command`, the agent server's
+  `_handle_command`, and the typed regression) call
+  `memory_store.log_command(...)` on the way out, pass or fail.
+- Read: `run_command` calls `_with_preferences(text)` before building the
+  message - if a preference is relevant it's appended as a
+  `[Known user preferences ...]` block, and the Planner instruction gained
+  one paragraph telling it to use such a block only to fill in unstated
+  details, never to override an explicit one.
+- `success` in the log means "ran end to end without an exception or a
+  rejection." It does not currently distinguish a soft tool failure (a tool
+  that returned `success: false` without raising) - a documented Tier 1
+  limitation, easy to tighten later.
+
+**Verified for real** (dedicated test DB, rows inspected directly with
+`sqlite3`, not via the code that wrote them):
+- Ran "set a reminder to water the plants tomorrow at 9am" through the
+  agent server -> `command_history` row 1: exact transcript, `plan_summary`
+  = the milestone goal, `success = 1`.
+- Set `default_flight_destination = "Austin, Texas"`, then ran "search
+  Kayak for a flight" (no destination spoken) -> a `preferences_applied`
+  event fired, and the Planner's milestone 2 came back as *"the destination
+  Austin, Texas is entered"*. The plan itself changed because of stored
+  state - not just that the state was stored.
+- Killed the agent server process, restarted it against the same DB file ->
+  a fresh Python process read back both `command_history` rows and the
+  preference. Persistence across a full restart, confirmed.
+- Control: "play Billie Jean on Spotify" produced no `preferences_applied`
+  event and an unchanged plan - stored preferences don't leak into
+  unrelated commands.
