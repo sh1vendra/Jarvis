@@ -2196,3 +2196,71 @@ on `no-drag` children to poke holes in it, especially not
 absolutely-positioned ones. Make the drag handle a specific, normal-flow
 element (the title/header strip) and keep every interactive control a
 normal-flow sibling or child of it.
+
+---
+
+## Wake word ("Jarvis") reintroduced - reversing the earlier "skip it" decision, deliberately
+
+**This overturns the "Push-to-talk hotkey instead of Porcupine" entry
+above.** That decision was made for demo reliability - a hotkey has no
+false positives and looks identical to a wake word on camera. It still
+stands *as a fallback*: the global hotkey is unchanged and is now the
+secondary trigger. Wake word is added on top because "say 'Jarvis' and it
+responds" is the actual product experience, and a real portfolio piece
+should have it, with the continuous-mic and false-positive costs accepted
+rather than avoided.
+
+**Engine: Porcupine**, as originally scoped in the first plan doc. Free
+tier, fully on-device, no cloud. Built-in "Jarvis" keyword (no custom
+model training).
+
+**Where it runs: the Electron MAIN process** (`@picovoice/porcupine-node`
++ `@picovoice/pvrecorder-node`), not the renderer (`porcupine-web` +
+`web-voice-processor`). Both were installed and evaluated:
+
+| | main (porcupine-node) | renderer (porcupine-web) |
+|---|---|---|
+| native addon | yes - but ships prebuilt N-API `.node` for mac/arm64; **verified loading in Electron 44 main with no electron-rebuild** | none (WASM) |
+| acoustic model | **bundled in the package** | ~2 MB `.pv` file to vendor into `public/` or fetch |
+| built-in "Jarvis" keyword | bundled | bundled (base64) |
+| mic | one native stream, released to the renderer during a command capture | continuous `getUserMedia`; needs a handoff dance with the push-to-talk recorder, or a WebVoiceProcessor refactor of code that already works |
+| trigger wiring | **reuses the exact hotkey path** (`main -> jarvis:hotkey -> renderer`) - renderer and recorder unchanged | new renderer module, touches the verified capture path |
+| CSP / WASM | n/a | Electron CSP + WASM compilation to reason about |
+
+The main-process path won on every axis that matters here: no vendored
+model, no changes to the working renderer/recorder, one place owning the
+listen/pause lifecycle. The native-addon risk - the usual reason to prefer
+WASM - was checked first and doesn't apply (N-API, prebuilt, loads clean).
+
+**Both triggers funnel through one `startListening(source)` in `main.js`.**
+The hotkey is a toggle; wake word only ever starts, and the renderer ends
+that capture itself on ~1.2 s of trailing silence after speech (RMS gate,
+with a 9 s hard cap). Full VAD/endpointing is a later refinement - this is
+enough to be usable.
+
+**Mic contention** between Porcupine (native, main) and the command
+recorder (`getUserMedia`, renderer) is sidestepped, not risked: on any
+capture start, main calls `wakeWord.pauseCapture()` which fully
+`stop()`s the `PvRecorder`; it `start()`s again when the renderer reports
+`recording-state -> false`. Only one mic client at a time.
+
+**Costs now on the table, honestly:**
+- A microphone stream is open whenever the app is idle. macOS shows the
+  orange mic dot. Porcupine inference is ~1 % of one core.
+- False positives are possible (default sensitivity 0.5, env-tunable via
+  `PICOVOICE_SENSITIVITY`). "Jarvis" is a distinctive keyword so this is
+  low, but it's not zero.
+- Needs a `PICOVOICE_ACCESS_KEY` in the repo-root `.env` (free from the
+  Picovoice console). Missing key or a broken addon -> wake word is simply
+  off, logged clearly, hotkey unaffected.
+
+**Verified for real (everything short of speaking the word, which needs a
+key + a voice):** the native addons load in Electron 44's main process;
+`PvRecorder.getAvailableDevices()` returns the real mics; Porcupine's
+constructor reaches a real `PorcupineInvalidArgumentError` on a fake key
+(engine wired, not an ABI failure); with no key, the app logs
+"wake word: unavailable ... (hotkey still works)" and the **hotkey path
+still captures audio end to end** (`recording at 24000 Hz [triggered by
+hotkey]` -> `captured 65280 samples, peak 3845 [stopped by hotkey]` ->
+sent to backend). The "say 'Jarvis', watch it start listening" test is the
+user's, once the key is in place.
