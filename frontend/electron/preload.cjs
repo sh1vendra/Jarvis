@@ -24,6 +24,17 @@ contextBridge.exposeInMainWorld("jarvis", {
     return () => ipcRenderer.removeListener("jarvis:hotkey", listener);
   },
 
+  /**
+   * Subscribe to wake-word ("Jarvis") availability/listening status.
+   * @param {(payload: {available: boolean, listening: boolean, reason?: string}) => void} handler
+   * @returns {() => void} unsubscribe
+   */
+  onWakeWordStatus(handler) {
+    const listener = (_event, payload) => handler(payload);
+    ipcRenderer.on("jarvis:wakeword-status", listener);
+    return () => ipcRenderer.removeListener("jarvis:wakeword-status", listener);
+  },
+
   /** Report real recording state so the main process's toggle stays in sync. */
   reportRecordingState(isRecording) {
     ipcRenderer.send("jarvis:recording-state", Boolean(isRecording));
