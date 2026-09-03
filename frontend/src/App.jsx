@@ -32,9 +32,19 @@ export default function App() {
   const [reply, setReply] = useState("");
   const [error, setError] = useState("");
   const [captureInfo, setCaptureInfo] = useState(null);
+  const [wakeWord, setWakeWord] = useState({ available: false, listening: false });
 
   const recorderRef = useRef(null);
   const clientRef = useRef(null);
+  const autoStopRef = useRef(null); // { timers, done } for a wake-word capture
+
+  // Trailing-silence auto-stop for the wake-word path (the hotkey stays a
+  // manual toggle). RMS threshold and windows tuned for a quiet room; a
+  // hard cap ensures a stuck capture always ends.
+  const VAD_RMS_THRESHOLD = 0.02;
+  const VAD_SILENCE_MS = 1200;
+  const VAD_MIN_MS = 700;
+  const VAD_HARD_CAP_MS = 9000;
 
   const log = useCallback((line) => {
     window.jarvis.log(line);
@@ -97,43 +107,28 @@ export default function App() {
     return () => client.close();
   }, [log]);
 
-  // ── Hotkey: start/stop capture, then hand the PCM to the backend ──
-  useEffect(() => {
-    const off = window.jarvis.onHotkey(async ({ action }) => {
-      if (action === "start") {
-        setError("");
-        setTranscript("");
-        setPlan([]);
-        setReply("");
-        setActivity([]);
-        setCaptureInfo(null);
-        setPendingApproval(null);
-        try {
-          const recorder = new PCMRecorder();
-          recorderRef.current = recorder;
-          const { sampleRate } = await recorder.start();
-          setState("listening");
-          window.jarvis.reportRecordingState(true);
-          log(`recording at ${sampleRate} Hz`);
-        } catch (err) {
-          setError(`microphone failed: ${err.message}`);
-          setState("idle");
-          // Resync main's toggle, or the next press would send "stop".
-          window.jarvis.reportRecordingState(false);
-        }
-        return;
+  // Stop the recorder and hand the PCM to the backend. Idempotent - the
+  // wake-word auto-stop timer and a manual hotkey stop can race, and
+  // whichever loses is a no-op.
+  const stopAndSend = useCallback(
+    async (source) => {
+      const timers = autoStopRef.current;
+      if (timers) {
+        clearTimeout(timers.hardCap);
+        autoStopRef.current = null;
       }
-
       const recorder = recorderRef.current;
       if (!recorder) return;
-      const captured = await recorder.stop();
       recorderRef.current = null;
+
+      const captured = await recorder.stop();
       window.jarvis.reportRecordingState(false);
       if (!captured) return;
 
       setCaptureInfo(captured);
       log(
-        `captured ${captured.samples} samples (~${captured.seconds.toFixed(1)}s), peak ${captured.peak}/32767`
+        `captured ${captured.samples} samples (~${captured.seconds.toFixed(1)}s), ` +
+          `peak ${captured.peak}/32767 [stopped by ${source}]`
       );
       if (captured.peak === 0) {
         setError("Captured audio was completely silent - check microphone permission.");
@@ -152,6 +147,88 @@ export default function App() {
         setError("Backend not connected - is agent_server.py running?");
         setState("idle");
       }
+    },
+    [log]
+  );
+
+  const beginCapture = useCallback(
+    async (source) => {
+      if (recorderRef.current) return; // already capturing
+      setError("");
+      setTranscript("");
+      setPlan([]);
+      setReply("");
+      setActivity([]);
+      setCaptureInfo(null);
+      setPendingApproval(null);
+
+      const recorder = new PCMRecorder();
+      recorderRef.current = recorder;
+
+      // The wake-word path has no "press again to stop", so the renderer
+      // ends it: on ~1.2s of trailing silence after speech, or a hard cap.
+      let onLevel;
+      if (source === "wakeword") {
+        const startedAt = performance.now();
+        let lastLoud = startedAt;
+        let heardSpeech = false;
+        onLevel = (rms) => {
+          const now = performance.now();
+          if (rms >= VAD_RMS_THRESHOLD) {
+            lastLoud = now;
+            heardSpeech = true;
+          }
+          if (
+            autoStopRef.current &&
+            heardSpeech &&
+            now - startedAt >= VAD_MIN_MS &&
+            now - lastLoud >= VAD_SILENCE_MS
+          ) {
+            stopAndSend("silence");
+          }
+        };
+        autoStopRef.current = {
+          hardCap: setTimeout(() => stopAndSend("hard-cap"), VAD_HARD_CAP_MS),
+        };
+      }
+
+      try {
+        const { sampleRate } = await recorder.start({ onLevel });
+        setState("listening");
+        window.jarvis.reportRecordingState(true);
+        log(`recording at ${sampleRate} Hz [triggered by ${source}]`);
+      } catch (err) {
+        recorderRef.current = null;
+        if (autoStopRef.current) {
+          clearTimeout(autoStopRef.current.hardCap);
+          autoStopRef.current = null;
+        }
+        setError(`microphone failed: ${err.message}`);
+        setState("idle");
+        window.jarvis.reportRecordingState(false);
+      }
+    },
+    [log, stopAndSend]
+  );
+
+  // ── Trigger: hotkey (toggle) or wake word (start + auto-stop) ──
+  useEffect(() => {
+    const off = window.jarvis.onHotkey(({ action, source }) => {
+      if (action === "start") beginCapture(source || "hotkey");
+      else stopAndSend(source || "hotkey");
+    });
+    return off;
+  }, [beginCapture, stopAndSend]);
+
+  // ── Wake-word availability (a second trigger; the hotkey always works) ──
+  useEffect(() => {
+    const off = window.jarvis.onWakeWordStatus((status) => {
+      setWakeWord(status);
+      log(
+        status.available
+          ? 'wake word: listening for "Jarvis"'
+          : `wake word: off (${status.reason || "unavailable"})`
+      );
     });
     return off;
   }, [log]);
@@ -173,7 +250,7 @@ export default function App() {
   }, [pendingApproval, decide]);
 
   return (
-    <div className="stage" data-state={state}>
+    <div className="stage" data-state={state} data-wakeword={wakeWord.available ? "on" : "off"}>
       <div className="glass">
         {/* Frameless windows draw no OS titlebar. The drag region is the
             `.header` row only (see styles.css), NOT the whole glass: a
@@ -187,7 +264,9 @@ export default function App() {
         <div className="header">
           <span className="orb" />
           <span className="stateLabel">{STATE_LABEL[state] || state}</span>
-          {state === "idle" && <span className="hint">&#8984;&#8679;Space</span>}
+          {state === "idle" && (
+            <span className="hint">{wakeWord.available ? '⌘⇧Space · “Jarvis”' : "⌘⇧Space"}</span>
+          )}
           <span className="conn" data-conn={connection} title={`backend: ${connection}`} />
           <div className="controls">
             <button className="winBtn" onClick={() => window.jarvis.minimize()} title="Minimize">

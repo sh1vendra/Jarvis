@@ -82,8 +82,16 @@ export class PCMRecorder {
     this.recording = false;
   }
 
-  async start() {
+  /**
+   * @param {{onLevel?: (rms: number) => void}} [opts] - onLevel is called
+   *   once per audio render quantum with the frame's RMS amplitude (0..1),
+   *   used by the wake-word path for trailing-silence auto-stop and by the
+   *   voice-activity indicator. Optional; omitting it keeps the original
+   *   behaviour exactly.
+   */
+  async start(opts = {}) {
     if (this.recording) return;
+    const onLevel = opts.onLevel;
 
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -110,8 +118,14 @@ export class PCMRecorder {
     this.source = this.context.createMediaStreamSource(this.stream);
     this.node = new AudioWorkletNode(this.context, "pcm-collector");
     this.node.port.onmessage = (event) => {
-      this.chunks.push(event.data);
-      this.totalLength += event.data.length;
+      const frame = event.data;
+      this.chunks.push(frame);
+      this.totalLength += frame.length;
+      if (onLevel) {
+        let sum = 0;
+        for (let i = 0; i < frame.length; i += 1) sum += frame[i] * frame[i];
+        onLevel(Math.sqrt(sum / frame.length));
+      }
     };
 
     this.source.connect(this.node);
