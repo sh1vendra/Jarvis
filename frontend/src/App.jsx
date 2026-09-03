@@ -175,27 +175,28 @@ export default function App() {
   return (
     <div className="stage" data-state={state}>
       <div className="glass">
-        {/* Frameless windows draw no OS titlebar, so there is no built-in
-            way to move or minimize/close this window. The whole glass
-            surface is `-webkit-app-region: drag` (Electron reads that CSS
-            property to know a mousedown should move the window instead of
-            hitting the page); these buttons and every interactive element
-            are marked `no-drag` in the stylesheet so clicking them doesn't
-            start a drag first. */}
-        <div className="controls">
-          <button className="winBtn" onClick={() => window.jarvis.minimize()} title="Minimize">
-            &#8211;
-          </button>
-          <button className="winBtn" onClick={() => window.jarvis.closeWindow()} title="Close">
-            &#215;
-          </button>
-        </div>
-
+        {/* Frameless windows draw no OS titlebar. The drag region is the
+            `.header` row only (see styles.css), NOT the whole glass: a
+            `-webkit-app-region: no-drag` element that is `position: absolute`
+            over a drag region does NOT actually carve itself out on macOS
+            (the region is registered at its in-flow position, not where
+            top/right put it), so an absolutely-positioned control chip over
+            a full-surface drag region swallows its own clicks. Keeping the
+            controls as a normal-flow child of the drag `.header`, marked
+            `no-drag`, is what makes them clickable. See planning.md. */}
         <div className="header">
           <span className="orb" />
           <span className="stateLabel">{STATE_LABEL[state] || state}</span>
           {state === "idle" && <span className="hint">&#8984;&#8679;Space</span>}
           <span className="conn" data-conn={connection} title={`backend: ${connection}`} />
+          <div className="controls">
+            <button className="winBtn" onClick={() => window.jarvis.minimize()} title="Minimize">
+              &#8211;
+            </button>
+            <button className="winBtn" onClick={() => window.jarvis.closeWindow()} title="Close">
+              &#215;
+            </button>
+          </div>
         </div>
 
         {state === "listening" && (

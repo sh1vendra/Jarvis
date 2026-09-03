@@ -71,9 +71,6 @@ body {
     inset 0 1px 0 var(--glass-highlight);
   backdrop-filter: blur(24px) saturate(1.5);
   -webkit-backdrop-filter: blur(24px) saturate(1.5);
-  /* The whole glass surface is the drag region; interactive children opt
-     out below with -webkit-app-region: no-drag. */
-  -webkit-app-region: drag;
   transition:
     width 0.45s var(--ease-morph),
     border-radius 0.45s var(--ease-morph),
@@ -145,6 +142,11 @@ body {
   gap: 10px;
   min-height: 20px;
   flex: none;
+  /* The drag handle. Deliberately NOT the whole .glass - see the note in
+     App.jsx: a position:absolute no-drag child does not reliably carve
+     itself out of a drag region on macOS, so the control buttons must live
+     in a normal-flow child of this element, marked no-drag below. */
+  -webkit-app-region: drag;
 }
 
 .stateLabel {
@@ -574,13 +576,15 @@ body {
   border-radius: 3px;
 }
 
-/* ── Window controls: hover-revealed minimize/close in the top corner ── */
+/* ── Window controls: hover-revealed minimize/close, trailing the header row ── */
 
 .controls {
-  position: absolute;
-  top: 12px;
-  right: 12px;
-  z-index: 2;
+  /* Normal flow, trailing the connection dot at the right end of the header
+     row (`.conn` / `.hint` already carry the auto margin that pushes this
+     group right). NOT position:absolute - that breaks the no-drag
+     carve-out on macOS, see App.jsx. */
+  flex: none;
+  align-self: center;
   display: flex;
   gap: 4px;
   padding: 2px;
@@ -596,13 +600,6 @@ body {
   opacity: 1;
 }
 
-/* Center the controls vertically on the compact pills. */
-.stage[data-state="idle"] .controls,
-.stage[data-state="listening"] .controls {
-  top: 50%;
-  transform: translateY(-50%);
-}
-
 .winBtn {
   width: 18px;
   height: 18px;
@@ -616,6 +613,9 @@ body {
   text-align: center;
   cursor: pointer;
   transition: background 0.12s ease, color 0.12s ease;
+  /* Explicit, belt-and-suspenders: the parent .controls is already no-drag,
+     but declaring it on the button itself too costs nothing. */
+  -webkit-app-region: no-drag;
 }
 
 .winBtn:hover {

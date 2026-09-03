@@ -2137,3 +2137,62 @@ are exactly the corpus Tier 2 will embed.
 - Control: "play Billie Jean on Spotify" produced no `preferences_applied`
   event and an unchanged plan - stored preferences don't leak into
   unrelated commands.
+
+---
+
+## Minimize/close buttons stopped working after the restyle - a real -webkit-app-region gotcha
+
+**Regression.** The overlay's minimize and close buttons (verified working
+before the Fable styling pass, via real `AXMinimized` and window-count
+checks) did nothing when clicked in the styled build. The drag-to-move and
+the approval buttons still worked.
+
+**What was NOT wrong** (checked all of it first, by running the app under
+CDP, not by guessing):
+- The onClick handlers were intact - `window.jarvis.minimize()` /
+  `window.jarvis.closeWindow()`, same names, still calling through
+  `preload.cjs` -> `ipcMain` -> `mainWindow.minimize()/.close()`.
+- The whole IPC chain worked: firing `document.querySelector('.winBtn').click()`
+  from the console **did** minimize the window. So handler, preload, main
+  process - all fine.
+- The buttons computed `-webkit-app-region: no-drag`, `pointer-events: auto`,
+  and `document.elementFromPoint()` at the button's centre returned the
+  button. Nothing was covering them.
+
+**What was actually wrong.** A **real synthetic mouse click** at the
+button's exact screen position did nothing (`AXMinimized` stayed `false`,
+and the window didn't move either). The restyle made the entire `.glass`
+surface `-webkit-app-region: drag` and put the controls in a
+`position: absolute` hover-chip on top of it. On macOS, **a
+`-webkit-app-region: no-drag` element that is `position: absolute` does not
+reliably carve itself out of an ancestor drag region** - the draggable-region
+rectangles Chromium hands the OS are computed from the element's in-flow
+box, not from where `top`/`right` actually paint it. So the real
+on-screen button area stayed inside the drag region, and the OS consumed
+the mousedown as a (zero-distance, so invisible) window drag instead of
+delivering a DOM click.
+
+Confirmed by bisecting live: forcing `.controls` to `position: static`
+(normal flow) made real clicks work again immediately; a negative
+`margin-bottom` that made it visually overlap the header brought the bug
+back (now the overlap was real, in-flow). The rule is blunt: **drag and
+no-drag regions must not overlap, and no-drag only lands where the browser
+thinks the element is - which for `position: absolute` is the wrong place.**
+
+**Fix.** The drag region is now the `.header` row only, not the whole
+glass. `.controls` moved from a `position: absolute` child of `.glass` to a
+normal-flow child of `.header`, trailing the connection dot, marked
+`no-drag` (and `.winBtn` too, belt-and-suspenders). It still hover-reveals
+via `opacity`. Net cost: the idle pill is ~6px taller; text in the body is
+now selectable (it was inside the drag region before, so it wasn't).
+
+**Verified for real, with synthetic HID mouse events, both under CDP and
+in a plain run with no debugger attached:** minimize -> `AXMinimized`
+`false`->`true`; restore -> `false`; drag from the header -> window moved by
+exactly the drag delta; close -> window count `1`->`0`.
+
+**Lesson for frameless windows:** don't make a big element `drag` and rely
+on `no-drag` children to poke holes in it, especially not
+absolutely-positioned ones. Make the drag handle a specific, normal-flow
+element (the title/header strip) and keep every interactive control a
+normal-flow sibling or child of it.
