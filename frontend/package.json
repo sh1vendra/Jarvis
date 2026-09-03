@@ -18,6 +18,8 @@
     "wait-on": "^9.1.0"
   },
   "dependencies": {
+    "@picovoice/porcupine-node": "^4.0.2",
+    "@picovoice/pvrecorder-node": "^1.2.9",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   }
