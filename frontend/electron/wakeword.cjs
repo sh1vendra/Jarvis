@@ -1,5 +1,13 @@
 // Wake-word detection ("Jarvis") via Porcupine, in the Electron MAIN process.
 //
+// SUPERSEDED, kept but no longer wired into main.js - see planning.md.
+// Picovoice's signup turned out to be broken/restricted for this account,
+// so wake word moved to openWakeWord (backend/voice/wakeword.py), which
+// has no Node binding and so cannot run in this process at all - not a
+// small tweak, a different process entirely, hence the file staying here
+// unused rather than adapted in place. Kept in case Picovoice access is
+// ever unblocked; nothing in main.js requires or starts this anymore.
+//
 // This reverses the earlier "no wake word" decision (see planning.md),
 // deliberately and with the costs accepted: a continuously-open microphone,
 // false-positive risk, and Porcupine's access-key setup.

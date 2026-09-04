@@ -19,12 +19,8 @@
 // script in package.json.
 import { app, BrowserWindow, globalShortcut, ipcMain, screen, systemPreferences } from "electron";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-
-const require = createRequire(import.meta.url);
-const { WakeWord } = require("./wakeword.cjs");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -35,30 +31,15 @@ const WINDOW_WIDTH = 460;
 const WINDOW_HEIGHT = 340;
 const EDGE_MARGIN = 24; // px kept clear of the screen edge for the default spawn position
 
-// Minimal repo-root .env reader (main process, no dotenv dependency). The
-// backend already uses python-dotenv for the same file; this just needs one
-// key: PICOVOICE_ACCESS_KEY for wake-word detection.
-function readRepoEnv(key) {
-  for (const rel of ["../.env", "../../.env"]) {
-    try {
-      const text = fs.readFileSync(path.join(__dirname, rel), "utf8");
-      for (const line of text.split("\n")) {
-        const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/i);
-        if (m && m[1] === key) return m[2].replace(/^["']|["']$/g, "");
-      }
-    } catch {
-      // try the next candidate path
-    }
-  }
-  return "";
-}
-
-// Wake word ("Jarvis") - a SECOND trigger alongside the hotkey, never a
-// replacement. See electron/wakeword.cjs and planning.md.
-const wakeWord = new WakeWord({
-  accessKey: process.env.PICOVOICE_ACCESS_KEY || readRepoEnv("PICOVOICE_ACCESS_KEY"),
-  sensitivity: Number(process.env.PICOVOICE_SENSITIVITY) || 0.5,
-});
+// Wake word ("Hey Jarvis") no longer lives here - electron/wakeword.cjs
+// (Porcupine) is kept in the repo but deliberately not wired in below;
+// openWakeWord replaced it and runs on the Python backend instead, since
+// openWakeWord is a Python/onnxruntime library with no Node binding at all
+// (Porcupine's prebuilt N-API addon was the whole reason it *could* run in
+// this process - openWakeWord has nothing analogous). Its trigger now
+// arrives over the WebSocket connection (`wakeword_detected`, handled in
+// App.jsx) instead of the `jarvis:hotkey` IPC channel this file still owns
+// for the hotkey. See backend/voice/wakeword.py and planning.md.
 
 let mainWindow = null;
 // Mirrors the renderer's recording state so the single hotkey can alternate
@@ -204,15 +185,17 @@ function sendToRenderer(channel, payload) {
   }
 }
 
-// The two triggers - hotkey and wake word - both funnel through here so the
-// mic-handoff and recording-state bookkeeping happens in exactly one place.
+// The hotkey's own start/stop bookkeeping. Wake word ("Hey Jarvis") is a
+// second, independent trigger, but it no longer funnels through here - it
+// lives on the Python backend now (voice/wakeword.py) and reaches the
+// renderer directly over the WebSocket connection as `wakeword_detected`,
+// not through this IPC path. The two triggers share nothing at this layer
+// except both eventually calling the renderer's beginCapture(source) - see
+// App.jsx. Mic handoff for wake word is the renderer's own `mic_state`
+// message to the backend, not anything main.js does.
 function startListening(source) {
   if (isRecording) return;
   isRecording = true;
-  // Release the mic from Porcupine so the renderer's getUserMedia has it
-  // uncontended; detection resumes when the renderer reports it's done
-  // (jarvis:recording-state -> false).
-  wakeWord.pauseCapture();
   console.log(`[main] START recording (via ${source})`);
   sendToRenderer("jarvis:hotkey", { action: "start", source });
 }
@@ -243,30 +226,9 @@ function registerHotkey() {
   return ok;
 }
 
-function startWakeWord() {
-  wakeWord.on("listening", ({ device, sensitivity }) => {
-    console.log(`[main] wake word: listening for "Jarvis" (device=${device}, sensitivity=${sensitivity})`);
-    sendToRenderer("jarvis:wakeword-status", { available: true, listening: true });
-  });
-  wakeWord.on("detected", () => {
-    console.log('[main] wake word: "Jarvis" detected');
-    if (!isRecording) startListening("wakeword");
-  });
-  wakeWord.on("unavailable", (reason) => {
-    console.log(`[main] wake word: unavailable - ${reason} (hotkey still works)`);
-    sendToRenderer("jarvis:wakeword-status", { available: false, listening: false, reason });
-  });
-  wakeWord.on("error", (err) => {
-    console.error("[main] wake word error:", err.message);
-    sendToRenderer("jarvis:wakeword-status", { available: false, listening: false, reason: err.message });
-  });
-  wakeWord.start();
-}
-
 app.whenReady().then(() => {
   createWindow();
   registerHotkey();
-  startWakeWord();
 
   // Triggers the macOS microphone permission prompt for the Electron
   // binary itself, so the renderer's first getUserMedia doesn't silently
@@ -320,14 +282,6 @@ ipcMain.on("jarvis:close", () => {
 ipcMain.on("jarvis:recording-state", (_event, recording) => {
   isRecording = Boolean(recording);
   console.log(`[main] renderer reports recording=${isRecording}`);
-  if (!isRecording) {
-    // Command capture is done - hand the mic back to Porcupine.
-    wakeWord.resumeCapture();
-  }
-});
-
-app.on("will-quit", () => {
-  wakeWord.stop();
 });
 
 ipcMain.on("jarvis:log", (_event, message) => {

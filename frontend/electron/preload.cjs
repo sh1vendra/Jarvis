@@ -24,16 +24,11 @@ contextBridge.exposeInMainWorld("jarvis", {
     return () => ipcRenderer.removeListener("jarvis:hotkey", listener);
   },
 
-  /**
-   * Subscribe to wake-word ("Jarvis") availability/listening status.
-   * @param {(payload: {available: boolean, listening: boolean, reason?: string}) => void} handler
-   * @returns {() => void} unsubscribe
-   */
-  onWakeWordStatus(handler) {
-    const listener = (_event, payload) => handler(payload);
-    ipcRenderer.on("jarvis:wakeword-status", listener);
-    return () => ipcRenderer.removeListener("jarvis:wakeword-status", listener);
-  },
+  // Wake-word ("Hey Jarvis") status/detection is NOT an IPC channel - it
+  // travels over the renderer's own WebSocket connection to the backend
+  // (`wakeword_status`/`wakeword_detected` in App.jsx), since detection
+  // runs in Python (voice/wakeword.py), not this main process. See
+  // planning.md for why.
 
   /** Report real recording state so the main process's toggle stays in sync. */
   reportRecordingState(isRecording) {

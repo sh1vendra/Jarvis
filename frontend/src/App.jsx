@@ -37,7 +37,7 @@ export default function App() {
   const [reply, setReply] = useState("");
   const [error, setError] = useState("");
   const [captureInfo, setCaptureInfo] = useState(null);
-  const [wakeWord, setWakeWord] = useState({ available: false, listening: false });
+  const [wakeWord, setWakeWord] = useState({ available: false, reason: "" });
   const [failedGoals, setFailedGoals] = useState([]); // goals whose tools didn't verify
   const [cancelledGoal, setCancelledGoal] = useState(""); // the step the user rejected
 
@@ -124,6 +124,25 @@ export default function App() {
             setError(msg.message);
             log(`ERROR: ${msg.message}`);
             break;
+          case "wakeword_status":
+            // Backend-driven, not Electron IPC - openWakeWord runs in
+            // Python (no Node binding), so this travels over the same
+            // WebSocket connection everything else does. Sent once per
+            // connection; see agent_server.py.
+            setWakeWord({ available: Boolean(msg.available), reason: msg.reason || "" });
+            log(
+              msg.available
+                ? 'wake word: listening for "Hey Jarvis"'
+                : `wake word: off (${msg.reason || "unavailable"})`
+            );
+            break;
+          case "wakeword_detected":
+            // Reuses the exact same convergence point the hotkey uses -
+            // from here on, a wake-word-triggered capture is
+            // indistinguishable from a hotkey-triggered one.
+            log('wake word: "Hey Jarvis" detected');
+            beginCapture("wakeword");
+            break;
           default:
             break;
         }
@@ -132,6 +151,12 @@ export default function App() {
     clientRef.current = client;
     client.connect();
     return () => client.close();
+    // beginCapture is intentionally not in this array: it, stopAndSend, and
+    // log are all stable for the component's lifetime (log has no deps;
+    // stopAndSend and beginCapture only ever depend on stable values), so
+    // this effect still only runs once, and wakeword_detected always calls
+    // the current (only) implementation via closure.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [log]);
 
   // Stop the recorder and hand the PCM to the backend. Idempotent - the
@@ -150,6 +175,11 @@ export default function App() {
 
       const captured = await recorder.stop();
       window.jarvis.reportRecordingState(false);
+      // Tells the backend's wake-word listener it can re-acquire the mic -
+      // unconditionally, regardless of what triggered this capture, since
+      // the backend needs to know "is ANY renderer capture using the mic
+      // right now", not just wake-word-triggered ones. See agent_server.py.
+      clientRef.current.send({ type: "mic_state", active: false });
       if (!captured) return;
 
       setCaptureInfo(captured);
@@ -225,6 +255,10 @@ export default function App() {
         const { sampleRate } = await recorder.start({ onLevel });
         setState("listening");
         window.jarvis.reportRecordingState(true);
+        // Same mic-handoff signal as stopAndSend's release, the other
+        // direction - pauses the backend's wake-word listener so it never
+        // contends with this capture for the microphone.
+        clientRef.current.send({ type: "mic_state", active: true });
         log(`recording at ${sampleRate} Hz [triggered by ${source}]`);
       } catch (err) {
         recorderRef.current = null;
@@ -249,19 +283,6 @@ export default function App() {
     return off;
   }, [beginCapture, stopAndSend]);
 
-  // ── Wake-word availability (a second trigger; the hotkey always works) ──
-  useEffect(() => {
-    const off = window.jarvis.onWakeWordStatus((status) => {
-      setWakeWord(status);
-      log(
-        status.available
-          ? 'wake word: listening for "Jarvis"'
-          : `wake word: off (${status.reason || "unavailable"})`
-      );
-    });
-    return off;
-  }, [log]);
-
   const decide = useCallback((approved) => {
     clientRef.current.send({ type: "approval_response", approved });
     setPendingApproval(null);
@@ -278,8 +299,18 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [pendingApproval, decide]);
 
+  // Three real states, not just on/off: "unavailable" (openwakeword/mic
+  // dependencies missing on the backend - hotkey still works, nothing
+  // wrong), "paused" (available, but this exact renderer capture has its
+  // mic right now - state "listening" is precisely when that's true, see
+  // the mic_state sends above), "listening" (backend is actively listening
+  // for "Hey Jarvis"). Derived locally rather than round-tripped from the
+  // backend on every pause/resume - mic_state's own send is what drives the
+  // backend's pause/resume, so this side already knows the same thing.
+  const wakewordStatus = !wakeWord.available ? "unavailable" : state === "listening" ? "paused" : "listening";
+
   return (
-    <div className="stage" data-state={state} data-wakeword={wakeWord.available ? "on" : "off"}>
+    <div className="stage" data-state={state} data-wakeword={wakewordStatus}>
       <div className="glass">
         {/* Frameless windows draw no OS titlebar. The drag region is the
             `.header` row only (see styles.css), NOT the whole glass: a
@@ -294,8 +325,19 @@ export default function App() {
           <span className="orb" />
           <span className="stateLabel">{STATE_LABEL[state] || state}</span>
           {state === "idle" && (
-            <span className="hint">{wakeWord.available ? '⌘⇧Space · “Jarvis”' : "⌘⇧Space"}</span>
+            <span className="hint">{wakeWord.available ? '⌘⇧Space · “Hey Jarvis”' : "⌘⇧Space"}</span>
           )}
+          <span
+            className="wakeword"
+            data-wakeword={wakewordStatus}
+            title={
+              wakeWord.available
+                ? state === "listening"
+                  ? 'wake word paused - this capture has the microphone'
+                  : 'wake word listening for "Hey Jarvis"'
+                : `wake word unavailable${wakeWord.reason ? `: ${wakeWord.reason}` : ""}`
+            }
+          />
           <span className="conn" data-conn={connection} title={`backend: ${connection}`} />
           <div className="controls">
             <button className="winBtn" onClick={() => window.jarvis.minimize()} title="Minimize">

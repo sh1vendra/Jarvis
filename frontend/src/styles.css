@@ -274,20 +274,45 @@ body {
   to { transform: rotate(360deg); }
 }
 
-/* ── Connection dot: tiny, truthful, out of the way ── */
+/* ── Wake-word dot: same shape as .conn, sits just before it ──
+   Three real states, not just on/off: dim/muted = unavailable (openwakeword
+   deps missing on the backend - hotkey still works, nothing wrong), amber =
+   paused (available, but this exact capture currently holds the mic - see
+   App.jsx's wakewordStatus), green = actively listening for "Hey Jarvis".
+   Always rendered (never display:none) so it can carry the row's one
+   margin-left:auto - see the .hint + .wakeword override below for why. */
+
+.wakeword {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-left: auto;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.hint + .wakeword {
+  margin-left: 8px;
+}
+
+.wakeword[data-wakeword="listening"] {
+  background: var(--accent-green);
+}
+
+.wakeword[data-wakeword="paused"] {
+  background: var(--accent-amber);
+}
+
+/* ── Connection dot: tiny, truthful, out of the way ──
+   No margin-left:auto of its own anymore - .wakeword (always rendered)
+   handles pushing this pair to the right edge; .conn just trails it via
+   the header's normal gap. */
 
 .conn {
   flex: none;
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  /* Sits at the right edge of the header; the hotkey hint, when present,
-     takes over the auto margin and the dot just trails it. */
-  margin-left: auto;
-}
-
-.hint + .conn {
-  margin-left: 8px;
 }
 
 .conn[data-conn="connected"] {
