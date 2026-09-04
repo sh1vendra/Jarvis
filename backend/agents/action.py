@@ -18,7 +18,7 @@ from tools.mac_control import (
     search_spotify_candidates_tool,
     type_in_field_tool,
 )
-from tools.native_apps import create_calendar_event_tool, create_note_tool
+from tools.native_apps import create_calendar_event_tool, create_note_tool, send_message_tool
 from .verifier_callbacks import log_tool_result_callback
 
 action_agent = LlmAgent(
@@ -137,7 +137,17 @@ action_agent = LlmAgent(
         "exists'). Extract:\n"
         "  - content: the note's actual body text\n"
         "  - title: only if the user actually said one - otherwise leave "
-        "it unset and one is derived automatically\n\n"
+        "it unset and one is derived automatically\n"
+        "- send_message: use this ONLY when the milestone is about texting/"
+        "messaging a real person (e.g. 'a text is sent to +1... saying "
+        "...'). This is consequential - it will only ever appear as an "
+        "already-approved milestone (requires_approval=true), never call "
+        "it speculatively. Extract:\n"
+        "  - recipient: an EXACT phone number or email only - never a "
+        "name. If the milestone/task only gives a name ('text mom'), do "
+        "NOT guess a number - do not call this tool, instead respond "
+        "asking for the exact phone number or email to send to.\n"
+        "  - text: the message content\n\n"
         "For milestones about a web page in the browser (not a native Mac "
         "app), use these instead of open_app/click_ui/type_in_field:\n"
         "- navigate_to_url: use this when the milestone is about the browser "
@@ -174,6 +184,7 @@ action_agent = LlmAgent(
         create_reminder_tool,
         create_calendar_event_tool,
         create_note_tool,
+        send_message_tool,
         navigate_to_url_tool,
         find_web_element_tool,
         click_web_element_tool,

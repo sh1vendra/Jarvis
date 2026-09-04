@@ -15,6 +15,7 @@ planning.md for the full investigation behind that scope decision.
 """
 
 import html
+import re
 import subprocess
 from datetime import timedelta
 
@@ -308,3 +309,148 @@ def create_note(content: str, title: str | None = None, account: str = _DEFAULT_
 
 
 create_note_tool = FunctionTool(create_note)
+
+
+# --- send_message ------------------------------------------------------------
+#
+# Genuinely different from create_calendar_event/create_note above: this
+# reaches a real person, not a local, private, trivially-reversible item -
+# which is exactly why the Planner marks a milestone that resolves to this
+# tool requires_approval=True (see agents/planner.py), the same way it
+# already does for Kayak's final search-submit step. This is deliberately
+# the second real demonstration of that same approval gate, not a special
+# case invented for it.
+#
+# Two real investigation findings shaped this function's scope, both
+# confirmed directly (not assumed) before writing it - see planning.md:
+#
+# 1. Recipient resolution is deliberately narrow: an exact phone number or
+#    exact email only, never a name. Real existing chats on this machine
+#    use exactly that shape (e.g. "+15126659036"). There is no reliable
+#    public API this project found for resolving an ambiguous name to one
+#    specific real contact with confidence - guessing wrong here sends a
+#    real message to the wrong real person, so this scopes narrower rather
+#    than guessing, exactly per the standing "tell me honestly, don't ship
+#    something unreliable for a feature that contacts real people" rule.
+# 2. Verification is honestly weaker than the other three tools in this
+#    module. Messages' AppleScript dictionary exposes no way to read a
+#    chat's message content back (a `chat`'s own `properties` are only
+#    id/account/name/class - confirmed directly), and `exists buddy "..."`
+#    was confirmed to return true even for an obviously-invalid string, so
+#    there is no proactive validity check either. The only stronger check
+#    available - reading ~/Library/Messages/chat.db directly - needs Full
+#    Disk Access, a far broader permission than anything else this project
+#    asks for; confirmed directly this process is blocked from opening
+#    that file at all without it. Deliberately not taken on here (a real
+#    decision, not an oversight - see planning.md). So `success: True`
+#    below means "the recipient passed strict format validation and the
+#    AppleScript send command completed with no error" - it does NOT mean
+#    confirmed delivery, which nothing available to this process can
+#    honestly confirm.
+
+# Matches a phone number after stripping common formatting punctuation
+# (spaces, dashes, parens, dots) - "+17373359167", "737-335-9167", and
+# "7373359167" all normalize to a run of 8-15 digits, optionally preceded
+# by "+". Deliberately strict: this is the ONLY thing standing between a
+# real send and Messages' own confirmed-silent no-op for a garbage
+# recipient (see the module docstring above), since neither `exists buddy`
+# nor `send`'s own exit code catches that.
+_PHONE_PATTERN = re.compile(r"^\+?[1-9]\d{7,14}$")
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _looks_like_valid_recipient(recipient: str) -> bool:
+    cleaned = recipient.strip()
+    digits_only = re.sub(r"[\s\-().]", "", cleaned)
+    return bool(_PHONE_PATTERN.match(digits_only) or _EMAIL_PATTERN.match(cleaned))
+
+
+def _build_message_applescript(recipient: str, text: str) -> str:
+    safe_recipient = recipient.replace('"', '""')
+    safe_text = text.replace('"', '""')
+    return f'tell application "Messages" to send "{safe_text}" to buddy "{safe_recipient}"'
+
+
+def send_message(recipient: str, text: str) -> dict:
+    """Sends a real iMessage/SMS via the macOS Messages app.
+
+    This is a CONSEQUENTIAL action - it reaches a real person - and every
+    milestone that resolves to it must be marked requires_approval=True by
+    the Planner, so a real plan pauses for real user approval before this
+    ever runs (see agents/planner.py). Never call this as anything but the
+    already-approved step of a plan.
+
+    Recipient resolution is deliberately narrow: `recipient` must be an
+    exact phone number (any common formatting - "+17373359167",
+    "737-335-9167", "7373359167" are all accepted; digits are what's
+    matched) or an exact email address. There is NO fuzzy contact-name
+    lookup - "text mom" or "message John" will not resolve to a real
+    contact here. If the caller only has a name, ask the user for the
+    exact number/email instead of guessing - see this module's own
+    docstring for why guessing was ruled out rather than attempted.
+
+    Verification is honestly limited - see this module's docstring for the
+    full investigation. `success: True` means the recipient passed strict
+    format validation and the AppleScript send command completed with no
+    error. It does NOT confirm the message actually reached a real device;
+    nothing available to this process can honestly confirm that.
+
+    Args:
+        recipient: An exact phone number or email address - never a name.
+        text: The message text to send.
+
+    Returns:
+        A dict with:
+            success: bool - see the honest verification limits above
+            message: human-readable summary
+            error: raw error string if something went wrong, else None
+    """
+    _require_macos()
+    if not _looks_like_valid_recipient(recipient):
+        return {
+            "success": False,
+            "message": (
+                f"{recipient!r} doesn't look like a real phone number or email address. "
+                "send_message only accepts an exact phone number or email, never a name - "
+                "ask the user for the exact contact info instead of guessing."
+            ),
+            "error": "invalid_recipient_format",
+        }
+
+    script = _build_message_applescript(recipient, text)
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "success": False,
+            "message": "osascript timed out - Messages may be waiting on a permission dialog.",
+            "error": str(exc),
+        }
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "-1743" in stderr or "not authorized" in stderr.lower():
+            return {
+                "success": False,
+                "message": (
+                    "macOS denied automation access to Messages. Grant it under "
+                    "System Settings -> Privacy & Security -> Automation, then "
+                    "allow this process to control Messages, and try again."
+                ),
+                "error": stderr,
+            }
+        return {"success": False, "message": f"osascript failed while sending the message: {stderr}", "error": stderr}
+
+    return {
+        "success": True,
+        "message": (
+            f"Sent to {recipient} via Messages (recipient format validated, AppleScript reported "
+            "no error). This does not confirm real delivery - Messages' scripting API exposes no "
+            "way to read that back without Full Disk Access, which this project deliberately does "
+            "not use (see planning.md)."
+        ),
+        "error": None,
+    }
+
+
+send_message_tool = FunctionTool(send_message)
