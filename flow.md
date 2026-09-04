@@ -1008,6 +1008,48 @@ unchanged - this section is what wraps around it.
    that disconnects mid-gate resolves the Future as a rejection, so the
    pipeline unwinds rather than hanging forever.
 
+7b. **A real cancel, mid-run, not just at an approval gate**
+   (`ClientSession.cancel_pending`, `App.jsx`'s Cancel button). The
+   `{"type": "cancel"}` message and its handling
+   (`session.cancel_pending()`: resolve any pending approval Future as a
+   rejection, then `self._task.cancel()`) already existed before this UI
+   was added - what was missing was a real affordance that actually sent
+   it; the WS wiring needed no changes. Shown only during `state="doing"`
+   (`approving` already has its own real stop - Reject), and calls the
+   exact same `clientRef.current.send({type: "cancel"})` every other
+   button in this file already uses successfully.
+
+   `Task.cancel()` is real Python task cancellation (a genuine
+   `asyncio.CancelledError` thrown into the running coroutine, re-raised
+   rather than swallowed in `_handle_command`'s `except` - confirmed
+   directly, not assumed, via a live run: the server's own log printed
+   `WARNING ... Root node action_agent was cancelled` at the exact moment
+   the pending cancellation was delivered) - not merely "the UI stops
+   listening" while the backend keeps working unseen. Confirmed via ground
+   truth twice: a cancel sent mid-`search_spotify_candidates` let that one
+   call finish (see the honest caveat below) but the milestone's remaining
+   planned action (`click_ui`, to actually start playback) never ran, no
+   second milestone (`create_reminder`) ever started, and the real
+   Reminders.app list had no new entry afterward - not just the UI going
+   quiet while the backend finished in the background.
+
+   **The honest limit, worth stating precisely rather than overclaiming:**
+   ADK's `FunctionTool` invokes a synchronous tool function directly on
+   the event loop (confirmed by reading `google.adk.tools.function_tool`'s
+   source: `return target(**args_to_call)`, no thread offload) - so a
+   cancellation that arrives *while* a blocking sync call (any
+   `mac_control.py`/`native_apps.py` tool: `subprocess.run`, `time.sleep`,
+   etc.) is already in flight cannot interrupt that one call mid-execution;
+   Python/asyncio has no way to deliver `CancelledError` until control
+   returns to an `await` point. What cancel genuinely guarantees is:
+   nothing *further* happens once that point is reached - no next tool
+   call in the same milestone, no next milestone, no plan continuing
+   unseen. The (async) browser-control tools (`navigate_to_url`,
+   `click_web_element`, `type_in_web_field` - section 8) have real
+   `await`s inside them and so are architecturally interruptible mid-call
+   the normal asyncio way, though this specific case wasn't separately
+   re-confirmed live this session.
+
 8. **Terminal states - four, not two** (`agent_server._run_plan` /
    `_handle_command`). `done` (`reason: completed`) means *every* milestone's
    tools verified. `failed` (`{state: "failed", failed_goals: [{goal,

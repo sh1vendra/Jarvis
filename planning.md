@@ -3768,3 +3768,104 @@ running" rule the existing checks use (confirmed directly that
 "Calendar"/"Notes"/"Messages" are exactly the `localizedName` values
 NSWorkspace reports for each) - never force-launching an app just to check
 a setting.
+
+## Capability list and real cancel: two small, real closes on the queue
+
+**"What can you do" - why the answer has to stay accurate, not
+aspirational.** A generic conversational fallback here is worse than no
+answer at all: it either invents capabilities Jarvis doesn't have (eroding
+trust the moment the user tries one) or vaguely deflects (leaving a real,
+answerable question unanswered). The fix lives entirely in
+`orchestrator.py`'s existing instruction as a third branch alongside
+"simple conversational input" and "real task" - no new agent, no new
+WebSocket message, since this is exactly the same fast, no-Planner path
+"hello" already uses. `_CAPABILITIES_ANSWER` is a single Python string
+constant the instruction embeds verbatim (not retyped into the prompt
+text separately, so there is exactly one place it lives), covering only
+what's actually wired into `action_agent.tools` today: Spotify playback
+(naming its real ambiguity-handling behavior), Reminders, Calendar
+events, Notes, Messages (naming its real approval requirement), and Kayak
+flight search (naming its real approval requirement) - deliberately
+excluding the deferred conversational-clarification/autonomous-booking
+subsystem (not built) and excluding tool-level implementation details
+(`open_app`, `click_ui`, `type_in_field`, `find_web_element` - these are
+how a capability gets done, not a capability a user would recognize
+asking for). The constant carries an explicit comment that this must be
+updated by hand whenever `action.py`'s real tool set changes - nothing
+enforces that automatically, and an unmaintained capability list would
+silently become exactly the aspirational-not-real problem this exists to
+fix.
+
+Tested for real against the live `orchestrator_agent` (not assumed from
+reading the prompt): five phrasings ("what can you do", "what are you
+capable of", "help", "what can I ask you to do", plus a plain "hello"
+control) all resolved via `run_command` returning `plan is None` - i.e.
+answered directly by the orchestrator, zero Planner transfer, zero extra
+Gemini call beyond the one the orchestrator itself always makes. A real
+task command run in the same session ("open spotify and play some lofi
+music") still correctly transferred to the Planner, confirming the new
+branch didn't make the orchestrator over-eager to answer things directly
+that actually need a plan.
+
+**Real cancel - the button was the only missing piece, and testing had to
+prove that, not assume it.** `agent_server.py` already had
+`{"type": "cancel"}` fully wired (`ClientSession.cancel_pending`) with
+nothing in the UI ever sending it - so this task's real content wasn't
+backend work, it was verifying the existing backend mechanism actually
+does what a cancel button would promise, before trusting it enough to
+expose it. Investigated directly rather than assumed:
+
+- `google.adk.tools.function_tool.FunctionTool._invoke_callable` calls a
+  synchronous tool function directly on the event loop
+  (`return target(**args_to_call)`, confirmed by reading ADK's own
+  source) - no thread offload. This means a cancellation that arrives
+  while a blocking sync call (any `mac_control.py`/`native_apps.py` tool -
+  `subprocess.run`, `time.sleep`, etc.) is already executing cannot
+  interrupt that one call mid-flight; Python/asyncio can only deliver
+  `CancelledError` at the coroutine's next `await`. This is a real,
+  architectural fact about how ADK invokes tools, not a bug introduced
+  here or something a bigger rewrite should silently paper over in this
+  pass - stated plainly rather than either hidden or used as an excuse not
+  to ship the button.
+- What cancellation DOES genuinely guarantee, confirmed via a real,
+  ground-truth-checked run (not the UI's own say-so): a two-milestone
+  voice command ("play some lofi music on Spotify, then create a reminder
+  called marker") was cancelled mid-`search_spotify_candidates` (a slow,
+  blocking call). The real server log recorded
+  `WARNING ... Root node action_agent was cancelled` the instant that call
+  returned control to the event loop - `click_ui` (the milestone's
+  remaining planned action, to actually start playback) never ran, no
+  `tool_call` for milestone 2's `create_reminder` ever appeared, and,
+  checked independently in real Reminders.app afterward, no "marker"
+  reminder existed. `_handle_command`'s `except asyncio.CancelledError:
+  raise` was confirmed to matter, not just be defensive boilerplate: the
+  cancellation genuinely propagates instead of being caught by the
+  broader `except Exception` beneath it.
+- The button itself was verified rendering correctly in the real running
+  app: driven end to end through the actual global hotkey and real `say`-
+  synthesized speech captured by the real microphone (not a mocked
+  event), producing a real transcript, a real plan, and a real
+  `state="doing"` screen with the Cancel button in place, screenshotted.
+  Repeating the exact same live-voice path to also catch a precisely-timed
+  click mid-flight ran into real STT flakiness on synthesized speech
+  (`transcription failed: speech was unintelligible` on two separate
+  attempts) - a previously-documented real limitation of this specific
+  testing method (see the pytest suite's own `_require_unmuted_output`
+  finding), not a defect in the feature. Rather than force a fragile
+  repeat, the mid-flight interruption itself was confirmed via a direct,
+  scripted WebSocket client (the same transport the UI uses, same
+  message, same server-side handling) - real backend behavior, checked
+  against real app state, is what actually matters here; the button's own
+  wiring is a single `clientRef.current.send({type: "cancel"})` call,
+  identical to the already-proven Approve/Reject pattern.
+
+**Honest summary of what "cancel" means in this app today:** it reliably
+stops a run from progressing any further - no more tool calls in the
+current milestone beyond whichever one was already in flight, no further
+milestones, no silent continuation in the background - but it cannot abort
+a single already-executing blocking AppleScript/subprocess call
+mid-execution. For every tool currently wired in, that call is at most a
+few seconds long, so the practical effect is "stops within a few seconds,
+never invisibly keeps going" - a real, meaningfully bounded guarantee, just
+not an instantaneous kill switch, and described here as exactly that
+rather than oversold.
