@@ -84,13 +84,16 @@ class RecordingSession:
     async def send(self, payload: dict) -> None:
         self.sent.append(payload)
 
-    async def await_approval(self) -> bool:
-        # Real ClientSession.await_approval() returns an awaitable Future
-        # resolved later by a client message; here the test already knows
-        # the answer up front, so this just returns it directly - `await`
-        # on a plain bool works fine since this method is itself async.
+    async def await_reply(self) -> bool:
+        # Real ClientSession.await_reply() returns an awaitable Future
+        # resolved later by a client message (approval_response or
+        # clarification_response - this fake only ever stands in for the
+        # approval-gate usage, hence the bool return type); here the test
+        # already knows the answer up front, so this just returns it
+        # directly - `await` on a plain bool works fine since this method
+        # is itself async.
         if not self._approval_answers:
-            raise AssertionError("await_approval() called more times than the test scripted answers for")
+            raise AssertionError("await_reply() called more times than the test scripted answers for")
         return self._approval_answers.pop(0)
 
     def sent_types(self) -> list[str]:

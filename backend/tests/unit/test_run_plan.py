@@ -121,7 +121,7 @@ async def test_one_failed_milestone_among_several_still_reports_failed(monkeypat
 @pytest.mark.asyncio
 async def test_approval_required_milestone_never_runs_before_a_decision_arrives(monkeypatch):
     """The approval gate's core guarantee: run_action must not be called
-    for a requires_approval milestone until await_approval() actually
+    for a requires_approval milestone until await_reply() actually
     resolves - approving must be a real precondition, not a formality."""
     plan = MilestonePlan(
         milestones=[

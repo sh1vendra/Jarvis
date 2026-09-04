@@ -341,12 +341,27 @@ def _speak_text_for_error() -> str:
 
 
 class ClientSession:
-    """Per-connection state: the socket, and the one pending approval the
-    pipeline may currently be blocked on."""
+    """Per-connection state: the socket, and the one pending reply the
+    pipeline may currently be blocked on.
+
+    `await_reply`/`resolve_reply` are a single, generalized Future-based
+    pause primitive - originally built just for the approval gate
+    (approve/reject a milestone), now shared by the clarification loop too
+    (ask a real question before planning, resume with the real answer).
+    Both are structurally identical: send the client something that needs
+    a real response, block on a Future, resume when a later WS message
+    resolves it. Only the payload shape and the message type names differ
+    (`approval_required`/`approval_response` vs `clarification_needed`/
+    `clarification_response`) - the waiting/resolving mechanism underneath
+    is the exact same code either way, not two copies of it. Exactly one
+    pending reply per session at a time - the dispatch guard on "audio"/
+    "text" (a command already running is refused) means there's never a
+    real second caller to conflict with.
+    """
 
     def __init__(self, websocket):
         self.websocket = websocket
-        self._pending_approval: Optional[asyncio.Future] = None
+        self._pending_reply: Optional[asyncio.Future] = None
         self._task: Optional[asyncio.Task] = None
 
     async def send(self, payload: Dict[str, Any]) -> None:
@@ -355,27 +370,40 @@ class ClientSession:
         except websockets.exceptions.ConnectionClosed:
             logger.info("agent server: client gone, dropping event %s", payload.get("type"))
 
-    def await_approval(self) -> asyncio.Future:
+    def await_reply(self) -> asyncio.Future:
         """Creates the Future the pipeline blocks on. Resolved by
-        `resolve_approval` when the client's decision arrives."""
+        `resolve_reply` when the client's real response arrives - an
+        approval decision (bool) or a clarification answer (str), the
+        caller knows which shape to expect since it's the one awaiting it."""
         loop = asyncio.get_running_loop()
-        self._pending_approval = loop.create_future()
-        return self._pending_approval
+        self._pending_reply = loop.create_future()
+        return self._pending_reply
 
-    def resolve_approval(self, approved: bool) -> bool:
-        future = self._pending_approval
+    def resolve_reply(self, value: Any) -> bool:
+        """Resolves whatever's currently pending with `value`. Returns
+        False (resolving nothing) if nothing was actually pending - e.g. an
+        approval_response/clarification_response arriving with no real
+        question/approval outstanding to answer."""
+        future = self._pending_reply
         if future is None or future.done():
             return False
-        future.set_result(approved)
-        self._pending_approval = None
+        future.set_result(value)
+        self._pending_reply = None
         return True
 
     def cancel_pending(self) -> None:
-        """A disconnect mid-approval must not leave the pipeline blocked
-        forever - resolve it as a rejection so the run unwinds cleanly."""
-        if self._pending_approval is not None and not self._pending_approval.done():
-            self._pending_approval.set_result(False)
-            self._pending_approval = None
+        """A disconnect mid-pause must not leave the pipeline blocked
+        forever - resolve it (as a rejection, in the bool/approval shape -
+        unchanged from before this was generalized) so the run unwinds
+        cleanly, then cancel the task outright. For a pending
+        clarification, this resolved value is never actually read as real
+        data: the task cancellation immediately below always wins the
+        race in practice, since nothing awaits between the two calls -
+        this exists to unblock the Future, not to hand back meaningful
+        data."""
+        if self._pending_reply is not None and not self._pending_reply.done():
+            self._pending_reply.set_result(False)
+            self._pending_reply = None
         if self._task is not None and not self._task.done():
             self._task.cancel()
 
@@ -418,7 +446,7 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
                     },
                 }
             )
-            approved = await session.await_approval()
+            approved = await session.await_reply()
             await session.send({"type": "approval_result", "approved": approved})
             if not approved:
                 logger.info("agent server: user REJECTED %r - not executing it", milestone.goal)
@@ -598,9 +626,22 @@ async def agent_handler(websocket):
 
             if msg_type == "approval_response":
                 approved = bool(data.get("approved"))
-                if not session.resolve_approval(approved):
+                if not session.resolve_reply(approved):
                     await session.send(
                         {"type": "error", "message": "No approval is currently pending."}
+                    )
+                continue
+
+            if msg_type == "clarification_response":
+                # Structurally identical to approval_response above - same
+                # shared resolve_reply, just a str answer instead of a bool
+                # decision. No production caller sends clarification_needed
+                # yet (that's Stage 2's flight-slot-clarification agent) -
+                # this is the receiving half of the pair, ready for it.
+                text = str(data.get("text", "")).strip()
+                if not session.resolve_reply(text):
+                    await session.send(
+                        {"type": "error", "message": "No clarification is currently pending."}
                     )
                 continue
 
