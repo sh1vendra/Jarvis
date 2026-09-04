@@ -1014,6 +1014,24 @@ unchanged - this section is what wraps around it.
    `.quote`'s italic style, Jarvis turns reuse the same inset-card look
    `.approval`/`.outcome` already use - no new colors or spacing introduced.
 
+12. **Voice-activity indicator** - a small dot next to `.orb` showing which
+   direction audio is flowing, right now: `voiceActivity` in `App.jsx` is
+   `state === "listening" ? "user" : speaking ? "jarvis" : "neutral"` - both
+   inputs are signals that already exist for other reasons (`state ===
+   "listening"` already drives the `mic_state` send in step 1; `speaking`
+   already drives `tts_state` in step 9), nothing new is tracked. Checking
+   `"user"` first makes the two mutually exclusive in the display by
+   construction. Red (`"user"`) and blue (`"jarvis"`) reuse the exact
+   colors `.orb` already uses for `data-state="listening"`/`"doing"`, not
+   new ones. This step also widened the idle pill (236px -> 400px) as a
+   prerequisite fix, not part of the indicator itself - real measurement
+   (via CDP against the running app) found the old idle pill's header
+   content already overflowed its available width by 94px, clipping the
+   `.controls` chip entirely outside `.glass` and crushing the `.stateLabel`
+   text to 0px width via flex-shrink math - a real, pre-existing bug this
+   investigation surfaced, not something the new dot introduced. See
+   planning.md for the full measurements and reasoning.
+
 **Running it:**
 ```
 # terminal 1 - backend (agent server + browser bridge, one process)

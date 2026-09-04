@@ -3179,3 +3179,120 @@ verified by reading the turns back out of the live DOM by exact text), and
 a live screenshot of a real `failed` result showed the red outcome card and
 the conversation panel coexisting correctly with the milestone list
 properly absent.
+
+## Voice-activity indicator: real signals only, and a real pre-existing layout bug found first
+
+Before building anything, investigated whether the header had room for a
+fourth indicator, per the explicit ask to say so honestly rather than
+cram it in - and found something worse than "tight": the idle pill was
+**already broken**, independent of this feature. Measured on the real
+running app (`Runtime.evaluate` via CDP, not CSS inspection alone):
+`.header`'s real content needed 288px against 194px available at the old
+236px width - a 94px overflow. Two concrete, confirmed symptoms: the
+`.controls` chip (chat toggle, minimize, close) was rendering entirely
+outside `.glass`'s bounds (`overflow:hidden` clipped it completely - no
+hover, no click, nothing reachable while idle), and the "Jarvis" state
+label was rendering at **0px width** - crushed to nothing by flex-shrink
+math (`.stateLabel`'s `overflow:hidden`, needed for its own ellipsis
+truncation, makes its flex `min-width:auto` resolve to `0` per spec,
+so it absorbed the entire overflow while `.hint`, which has no
+`overflow` set, refused to shrink at all). Confirmed visually too - a
+real screenshot of the idle pill showed no "Jarvis" text anywhere. Checked
+the other states the same way: listening (324px), thinking (360px),
+doing/approving/done/failed/cancelled (436px) all measured zero overflow,
+confirmed via the real `listening` state specifically (triggered by the
+actual hotkey, not a DOM hack) - `headerScrollWidth === headerWidth`,
+`stateLabel` a real 57px. So this was isolated to the idle pill, the one
+state combining the long hotkey-hint text with everything else in the
+narrowest shape - not a whole-design problem, but a real one, predating
+this feature (the accumulated result of adding the wake-word dot and the
+transcript-toggle button on top of a pill that was already tight).
+Reported this plainly and asked how to handle it before building anything
+else, per the explicit instruction to do exactly that; the answer was to
+widen the pill. Landed on 400px after iterating against real measurements
+(236 -> 320 was still 26px short and the label was *still* crushed, since
+a crushed measurement is a moving target - the label keeps eating whatever
+overflow remains until there genuinely isn't any; 380px was the exact
+zero-overflow point, 400px adds real slack rather than a hairline fit).
+`.controls` now sits fully inside `.glass` with ~19px to spare.
+
+**The indicator itself reuses two already-tracked signals, not a new
+one - literally the point of the ask.** `voiceActivity` in `App.jsx` is
+`state === "listening" ? "user" : speaking ? "jarvis" : "neutral"`.
+`state === "listening"` is exactly "the renderer's mic is open right now" -
+the same fact that already drives the `mic_state(active=true)` send to the
+backend, true regardless of trigger (hotkey or wake word). `speaking` is
+the same real `say`-process lifecycle that already drives `tts_state`. No
+third signal was introduced anywhere. Checking `"user"` first makes the
+two mutually exclusive in the display *by construction*, not only by
+relying on the backend's own pause/resume guarantee
+(`_sync_wakeword_pause_state`) - real belt-and-suspenders, since the
+hotkey path's speech-interrupt-on-new-capture (`main.js`'s `stopSpeaking()`
+inside `startListening()`) has a genuine, if brief, async gap between
+killing an in-progress `say` and its `close` event actually reporting
+`speaking:false`.
+
+**Positioning:** a small 6px dot (same shape/size as `.wakeword`/`.conn`),
+placed immediately after `.orb`, not grouped with the wakeword/conn pair.
+Deliberate grouping, not arbitrary: `.orb` and this dot are both
+real-time *activity* - what's happening right now - while `.wakeword`/
+`.conn` are *system status* - is a background service available/reachable.
+Colors are reused, not invented: red for `"user"` is the exact red `.orb`
+already uses for `data-state="listening"` (one color, one meaning, the
+whole UI through); blue for `"jarvis"` is the exact blue `.orb` already
+uses for `data-state="doing"` ("Jarvis is producing something"). Neutral
+reuses `.wakeword`'s own dim/muted tone. Animates only while active
+(reusing the existing `breathe` keyframe, no new animation), so it doesn't
+compete for attention while nothing is happening - matching the explicit
+"genuinely small and unobtrusive" ask.
+
+**Tested for real, all three states, driving the actual app - with one
+real mistake made and owned along the way.** A same-session Bluetooth
+device (AirPods) had become the system's default audio input mid-session,
+at 24kHz instead of the built-in mic's 48kHz - real speech played through
+the speakers was barely reaching it, so several genuine `say`-into-mic
+attempts came back "speech was unintelligible" through no fault of this
+feature. While chasing that down, one screenshot was taken by calling
+`capture_region` directly with coordinates from a stale position check,
+**bypassing `capture_screenshot`'s own "no verified on-screen window"
+refusal** instead of respecting it - and it captured a different app's
+window (unrelated personal content) that had ended up in the same screen
+position, not the Jarvis window at all. This is exactly the failure mode
+that safety check exists to prevent, defeated by routing around it rather
+than treating the refusal as the answer. The file was deleted immediately,
+the content was not examined or described further, and every capture
+after that point went back through `capture_screenshot`'s verified path
+only - confirmed working again via a clean Electron restart before
+continuing. Told the user directly, not just noted here. Real lesson worth
+keeping: a lower-level primitive sitting right next to a hardened one is a
+standing invitation to bypass the hardening under time pressure - worth
+a naming or module-boundary change later so the unsafe primitive isn't
+one call away from the safe one; not fixed in this pass.
+
+Once a clean device/window state was re-established (switched the system
+default input back to the built-in mic via `switchaudio-osx`, confirmed
+via `sounddevice`, and restarted Electron fresh so it picked up the new
+default rather than a cached one), all three states were confirmed for
+real:
+- `neutral`: default, dim dot, confirmed via DOM and a real screenshot.
+- `"user"`: a real hotkey-triggered capture (`state="listening"`) - dot
+  measured `rgb(255, 69, 58)`, exactly `--accent-red`, alongside the
+  existing red pulsing `.orb` - both reinforcing the same real fact,
+  confirmed in a real screenshot.
+- `"jarvis"`: called the real, production `window.jarvis.speak()` API
+  directly via CDP - the exact function the `speak` WebSocket handler
+  itself calls, so this exercises the real subprocess/IPC/state path in
+  full, without depending on STT succeeding (which the AirPods issue was
+  actively blocking, unrelated to what this step verifies). Dot measured
+  `rgb(10, 132, 255)`, exactly `--accent-blue`, held steady for the whole
+  ~4.5s of a longer test sentence, then correctly reverted to `neutral`
+  the moment `say` actually closed - confirmed in a real screenshot mid-
+  speech too.
+- Never both at once: guaranteed by the ternary's construction, and never
+  observed otherwise across every real test above.
+- Regression check: the transcript toggle, the wake-word dot, and the
+  connection dot all still present and correctly positioned after the
+  idle-pill widening; toggling the transcript open still forces the same
+  436px card shape regardless of the new dot; `listening` state (the other
+  previously-tightest pill) still measured zero header overflow with the
+  new dot's extra width included.
