@@ -99,7 +99,9 @@ body {
 
 .stage[data-state="doing"] .glass,
 .stage[data-state="approving"] .glass,
-.stage[data-state="done"] .glass {
+.stage[data-state="done"] .glass,
+.stage[data-state="failed"] .glass,
+.stage[data-state="cancelled"] .glass {
   width: 436px;
   border-radius: 22px;
   padding: 15px 18px 13px;
@@ -242,6 +244,20 @@ body {
 .stage[data-state="done"] .orb {
   background: var(--accent-green);
   box-shadow: 0 0 10px rgba(48, 209, 88, 0.55);
+}
+
+.stage[data-state="failed"] .orb {
+  background: var(--accent-red);
+  box-shadow: 0 0 10px rgba(255, 69, 58, 0.55);
+}
+
+.stage[data-state="cancelled"] .orb {
+  background: var(--text-faint);
+  box-shadow: none;
+}
+
+.stage[data-state="failed"] .stateLabel {
+  color: #ff8a80;
 }
 
 @keyframes breathe {
@@ -544,6 +560,55 @@ body {
   font-size: 12px;
   line-height: 1.4;
   flex: none;
+}
+
+/* ── Honest terminal states: a failed run and a cancelled step never look
+      like a success (see planning.md). Same inset-card language as the
+      approval card; colour is the only tell. ── */
+
+.outcome {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  flex: none;
+}
+
+.outcomeFailed {
+  background: rgba(255, 69, 58, 0.12);
+  border: 1px solid rgba(255, 69, 58, 0.28);
+}
+
+.outcomeCancelled {
+  background: var(--inset-bg);
+  border: 1px solid var(--inset-border);
+}
+
+.outcomeTitle {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.outcomeFailed .outcomeTitle {
+  color: #ff8a80;
+}
+
+.outcomeCancelled .outcomeTitle {
+  color: var(--text-secondary);
+}
+
+.outcomeList {
+  margin: 0;
+  padding-left: 16px;
+}
+
+.outcomeList li,
+.outcomeDetail {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
 }
 
 /* ── Activity log ── */

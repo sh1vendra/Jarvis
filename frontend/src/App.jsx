@@ -12,7 +12,10 @@ import "./styles.css";
 //   thinking   audio sent; transcribing, then planning
 //   doing      Action agent is executing milestones
 //   approving  paused at an approval gate, waiting for a real human decision
-//   done       run finished (completed / rejected / conversational / error)
+//   done       run finished, every milestone verified
+//   failed     run finished but a milestone's tools reported failure - honest,
+//              never silently shown as "done" (see planning.md)
+//   cancelled  the user rejected an approval gate - the step never ran
 const STATE_LABEL = {
   idle: "Jarvis",
   listening: "Listening",
@@ -20,6 +23,8 @@ const STATE_LABEL = {
   doing: "Working",
   approving: "Approval needed",
   done: "Done",
+  failed: "Couldn’t complete that",
+  cancelled: "Cancelled",
 };
 
 export default function App() {
@@ -33,6 +38,8 @@ export default function App() {
   const [error, setError] = useState("");
   const [captureInfo, setCaptureInfo] = useState(null);
   const [wakeWord, setWakeWord] = useState({ available: false, listening: false });
+  const [failedGoals, setFailedGoals] = useState([]); // goals whose tools didn't verify
+  const [cancelledGoal, setCancelledGoal] = useState(""); // the step the user rejected
 
   const recorderRef = useRef(null);
   const clientRef = useRef(null);
@@ -69,8 +76,16 @@ export default function App() {
             log(`plan: ${msg.milestones.length} milestones`);
             break;
           case "state":
-            setState(msg.state === "done" ? "done" : msg.state);
-            if (msg.reason) log(`state=${msg.state} (${msg.reason})`);
+            setState(msg.state);
+            if (msg.state === "failed") {
+              setFailedGoals(msg.failed_goals || []);
+              log(`FAILED: ${(msg.failed_goals || [msg.reason]).join("; ")}`);
+            } else if (msg.state === "cancelled") {
+              setCancelledGoal(msg.goal || "");
+              log(`CANCELLED: ${msg.goal || "step rejected"}`);
+            } else if (msg.reason) {
+              log(`state=${msg.state} (${msg.reason})`);
+            }
             break;
           case "milestone_start":
             log(`-> milestone ${msg.step_number}: ${msg.goal}`);
@@ -161,6 +176,8 @@ export default function App() {
       setActivity([]);
       setCaptureInfo(null);
       setPendingApproval(null);
+      setFailedGoals([]);
+      setCancelledGoal("");
 
       const recorder = new PCMRecorder();
       recorderRef.current = recorder;
@@ -333,6 +350,26 @@ export default function App() {
           )}
 
           {error && <div className="error">{error}</div>}
+
+          {state === "failed" && (
+            <div className="outcome outcomeFailed">
+              <div className="outcomeTitle">Jarvis couldn’t complete this</div>
+              {failedGoals.length > 0 && (
+                <ul className="outcomeList">
+                  {failedGoals.map((g, i) => (
+                    <li key={i}>{g}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {state === "cancelled" && (
+            <div className="outcome outcomeCancelled">
+              <div className="outcomeTitle">Cancelled — nothing was done</div>
+              {cancelledGoal && <div className="outcomeDetail">{cancelledGoal}</div>}
+            </div>
+          )}
 
           {activity.length > 0 && <pre className="activity">{activity.join("\n")}</pre>}
         </div>
