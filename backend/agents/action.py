@@ -18,6 +18,7 @@ from tools.mac_control import (
     search_spotify_candidates_tool,
     type_in_field_tool,
 )
+from tools.native_apps import create_calendar_event_tool
 from .verifier_callbacks import log_tool_result_callback
 
 action_agent = LlmAgent(
@@ -121,7 +122,16 @@ action_agent = LlmAgent(
         "whole milestone sentence\n"
         "  - due_date: the date mentioned or implied (e.g. 'tomorrow', "
         "'2026-08-13') - pass it as plain text, don't compute it yourself\n"
-        "  - due_time: the time mentioned or implied (e.g. '5pm', '17:00')\n\n"
+        "  - due_time: the time mentioned or implied (e.g. '5pm', '17:00')\n"
+        "- create_calendar_event: use this when the milestone is about a "
+        "calendar event existing/being created (e.g. 'a dentist "
+        "appointment exists tomorrow at 3pm'). Extract:\n"
+        "  - title: the event's title (e.g. 'Dentist appointment')\n"
+        "  - event_date / event_time: same plain-text extraction as "
+        "create_reminder's due_date/due_time above - never compute dates "
+        "yourself\n"
+        "  - duration_minutes: only if a duration/end time was actually "
+        "mentioned - otherwise leave it unset and the default is used\n\n"
         "For milestones about a web page in the browser (not a native Mac "
         "app), use these instead of open_app/click_ui/type_in_field:\n"
         "- navigate_to_url: use this when the milestone is about the browser "
@@ -156,6 +166,7 @@ action_agent = LlmAgent(
         click_ui_tool,
         type_in_field_tool,
         create_reminder_tool,
+        create_calendar_event_tool,
         navigate_to_url_tool,
         find_web_element_tool,
         click_web_element_tool,
