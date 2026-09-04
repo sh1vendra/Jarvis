@@ -757,6 +757,55 @@ unchanged - this section is what wraps around it.
 
 **Step by step:**
 
+0. **Setup check - runs before any of this, every launch.** The renderer
+   mounts in `data-state="setup"` (a distinct, larger glass card - see
+   `styles.css`) *before* it ever shows the normal idle pill, unless the
+   user has already explicitly skipped it with real problems still
+   present (see below). Two frontend-only facts and eight backend facts,
+   shown as one ordered checklist (`SETUP_CHECK_ORDER`, `App.jsx`):
+
+   - **Frontend-only** (things only the Electron process can answer):
+     `backend_connection` is a projection of the exact same `connection`
+     state the header's own conn dot already tracks (`ws/client.js`) -
+     not a separate probe. `mic_permission` is queried directly from
+     `electron/main.js` (`systemPreferences.getMediaAccessStatus`, exposed
+     through `preload.cjs`'s `getMicPermissionStatus`) - the real current
+     macOS TCC state, not "was a prompt ever shown."
+   - **Backend** (`google_api_key`, `accessibility`, `screen_recording`,
+     four `automation_*` checks, `chrome_extension`) - real checks in
+     `backend/tools/setup_checks.py`, run on request. The renderer sends
+     `{"type": "run_setup_checks"}` once the socket reaches `connected`
+     (and again on demand - the screen's "Recheck" button); the server
+     runs each check via `run_in_executor` (several of these do real,
+     potentially slow I/O - a Gemini call, `osascript` subprocess calls -
+     off the event loop so they can't stall wake word or anything else
+     sharing it) and streams results back one at a time as
+     `{"type": "setup_check_result", id, status, detail, fix_url}`,
+     followed by `{"type": "setup_checks_complete"}` - live per-row
+     updates, not a batched freeze-then-reveal.
+
+   Every check reports one of three real, distinct statuses - `passed`,
+   `failed` (with a real reason and, where one exists, a verified
+   `x-apple.systempreferences:...?Privacy_<Pane>` deep link opened only
+   through a main-process IPC handler restricted to that exact scheme -
+   `jarvis:open-external`), or `unknown` (a genuinely different, honest
+   outcome from failure: some Automation permissions have no proactive
+   query API on macOS at all - see planning.md - so the app being probed
+   isn't running and can't be checked without launching it as a side
+   effect; that check is confirmed reactively instead, the first time a
+   real command actually needs it).
+
+   Once every row lands on a terminal status with none `failed`, the
+   screen hands off to the normal idle pill on its own (a brief "all set"
+   beat, then `setSetupVisible(false)`). If real failures remain and the
+   user clicks "Skip for now," that's remembered in `localStorage`
+   (`jarvis-setup-dismissed`) so the full screen doesn't force itself on
+   every subsequent launch - but a small amber dot stays in the normal
+   header for as long as something is genuinely still missing
+   (`setupIndicatorVisible`, re-derived from the same live checks every
+   launch, never a static "you skipped this once" badge), and clicking it
+   reopens the same real checklist.
+
 1. **Trigger - two of them, genuinely different transports now, both
    ending at the renderer's `beginCapture(source)`:**
    - **Hotkey** (`Cmd+Shift+Space` via `globalShortcut`, fires while any app

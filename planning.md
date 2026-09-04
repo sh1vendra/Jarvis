@@ -3517,3 +3517,110 @@ explicitly.
 confirmed with a clean run immediately after explicitly unmuting system
 output, not cherry-picked from a run that happened to work. `make test`
 alone (the fast suite) runs in ~1.5 seconds.
+
+## The setup-check screen: why it matters, and what's actually checkable
+
+Flagged in an earlier regression pass as the single biggest gap between
+"impressive demo" and "something a real stranger could actually use." A
+cold-start user has to survive seven scattered, silent failure points with
+no guidance: a missing/invalid `GOOGLE_API_KEY`, the backend not running,
+no microphone permission, no Accessibility permission, no per-app
+Automation permission, no Screen Recording permission, and the Chrome
+extension not loaded. Every one of these fails silently or as a cryptic
+error buried in a terminal log a real user never sees - the app just
+doesn't work, with no path from "broken" to "fixed." This is that path:
+a real check against real system state for each of the seven, run before
+the normal idle pill ever appears, with a real fix for whatever's wrong.
+
+**What's genuinely checkable proactively, verified directly before writing
+any of this (not assumed from documentation):**
+
+- `GOOGLE_API_KEY` - a real, cheap Gemini call (`client.models.list()`,
+  ~0.1-0.2s), not "is the env var merely present." An invalid key raises a
+  structured `google.genai.errors.ClientError` (`.code`, `.status`,
+  `.message`) - confirmed against both a real invalid key and the real
+  valid key from `.env`.
+- Backend reachable - the existing WebSocket connection state
+  (`ws/client.js`'s `connection`) already *is* this check; the setup
+  screen just projects it into the checklist rather than re-implementing
+  it.
+- Accessibility - `AXIsProcessTrusted()` (pyobjc `ApplicationServices`),
+  real and proactive, confirmed returning `True` for this project's
+  already-granted process.
+- Screen Recording - `Quartz.CGPreflightScreenCaptureAccess()`, real,
+  documented (macOS 10.15+), proactive, confirmed without prompting or
+  capturing anything.
+- Microphone - Electron's `systemPreferences.getMediaAccessStatus`
+  (main.js), the real current TCC state, distinct from
+  `askForMediaAccess` (which prompts) - confirmed real via a standalone
+  Electron process, and confirmed for real that `ELECTRON_RUN_AS_NODE`
+  being set in the shell silently breaks this exact API (main.js already
+  carried a comment warning about this footgun elsewhere; this
+  investigation hit it directly, not hypothetically).
+- Chrome extension connected - the existing `browser_bridge.is_connected()`
+  (`backend/browser/bridge.py`) already *is* this check, same reasoning as
+  backend-reachable above.
+
+**What's honestly only reactive, and why - the one place this had to stop
+short of "always shows a clean proactive answer":** Automation permission
+(Reminders, Spotify, System Events, Google Chrome) has no public,
+proactive query API on macOS - confirmed by design, not assumed, after
+looking for an equivalent to `AXIsProcessTrusted()`/
+`CGPreflightScreenCaptureAccess()` for Apple Events authorization and
+finding none. The only real signal is a live, minimal, read-only
+AppleScript probe (`tell application "X" to get name`) that either
+succeeds or fails with the documented `-1743` / "not authorized" error -
+the exact pattern `create_reminder` (`mac_control.py`) already had to
+build reactively for its own error handling, reused here rather than
+reinvented. Two further honest constraints on top of that:
+
+- A `tell application "X"` command launches X if it isn't already
+  running - fine for a headless helper like System Events, but launching
+  Reminders/Spotify/Chrome just to run a permission check would be a real,
+  unwanted side effect a setup screen has no business causing. So:
+  System Events is always probed directly; the other three are only
+  probed if `NSWorkspace.runningApplications()` (confirmed to need no
+  special permission) shows them already running - otherwise the check
+  honestly reports "can't verify until you open it" (status `unknown`,
+  a real third outcome, never silently reported as passed or failed) and
+  is confirmed reactively the first time a real command actually needs it.
+- Live-testing a genuinely *revoked* Accessibility/Screen Recording/
+  Automation permission was investigated and found impractical in this
+  environment: `tccutil reset` traces back to Claude Code's own native
+  binary process, not Jarvis's real backend process, so revoking there
+  would test the wrong thing and disrupt an unrelated tool. Mitigated by
+  thoroughly testing the currently-granted path for real (all three
+  proactive checks above, confirmed `True`/passed on this machine) and by
+  reusing the exact, already-real `-1743` error-parsing logic
+  `create_reminder` already proved against a real historical denial,
+  rather than inventing new parsing untested against anything real. The
+  one scenario that *was* fully within reach - `GOOGLE_API_KEY` missing or
+  invalid - was live-tested both directions through the real running
+  backend: `.env` renamed away, the real server reported the real
+  `google_api_key` check as `failed` with the real reason; `.env`
+  restored, the same real server reported it `passed` with a real Gemini
+  call succeeding.
+
+**Design and flow:** the backend streams each real check result over the
+WebSocket as soon as it's known (`run_setup_checks` request,
+`setup_check_result` per check, `setup_checks_complete` - see
+`agent_server.py`), not one batched response, so the screen shows live
+checking → passed/failed/unknown per row instead of a freeze-then-reveal.
+A `failed` row with a real fix gets a real deep link - the same verified
+`x-apple.systempreferences:...?Privacy_<Pane>` URLs already confirmed
+correct (opened for real, screenshotted, visually confirmed the right
+pane) - opened only through a main-process IPC handler restricted to that
+exact URL scheme, never a general "open anything" surface. Where no deep
+link applies (the Chrome extension), the row carries plain instructions
+instead. Once every check lands on a terminal status with none `failed`,
+the screen hands off to the normal idle pill on its own after a brief
+"all set" beat. If the user explicitly skips with real failures still
+present, that choice is remembered (`localStorage`) so the full screen
+doesn't force itself on every launch - but a small, real, never-silent
+amber dot stays in the normal header for as long as something is actually
+still missing, and clicking it reopens the same live checklist. All of
+this - the streamed results, the auto-transition, the skip-and-remember,
+the persistent indicator, the deep links, both directions of the
+`GOOGLE_API_KEY` degraded scenario - was exercised against the real
+running app (real backend, real Electron process, real screenshots of the
+real window) before being called done, not assumed from reading the code.
