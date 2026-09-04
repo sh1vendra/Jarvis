@@ -398,7 +398,7 @@ _MAX_ZOOM_ITERATIONS = 2  # caps total vision calls at 3 (1 whole-screen + up to
 
 
 def _locate_via_vision_zoom(
-    target_description: str, max_iterations: int = _MAX_ZOOM_ITERATIONS
+    target_description: str, app_name: str, max_iterations: int = _MAX_ZOOM_ITERATIONS
 ) -> tuple[float, float] | None:
     """Iteratively zooms in on a screenshot to get a more precise coordinate
     guess for small UI elements than a single whole-screen vision call can
@@ -419,9 +419,14 @@ def _locate_via_vision_zoom(
 
     Returns final coordinates in point-space (already divided by the Retina
     scale factor, ready for _dispatch_click), or None if even the initial
-    whole-screen guess fails.
+    whole-screen guess fails (including if app_name has no verified
+    on-screen window to scope the capture to - see capture_screenshot).
     """
-    full_screenshot = capture_screenshot()
+    try:
+        full_screenshot = capture_screenshot(app_name=app_name)
+    except RuntimeError as exc:
+        logger.info("zoom search for %r: could not capture %r's window - %s", target_description, app_name, exc)
+        return None
     coords = _ask_vision_for_coordinates_in_image(full_screenshot, target_description)
     if coords is None:
         logger.info("zoom search for %r: initial whole-screen guess failed", target_description)
@@ -672,7 +677,7 @@ def _locate_element(
     # icon landed ~100pt off the real element; zooming in narrows that
     # because the target occupies a much larger fraction of what vision
     # sees once cropped.
-    coordinates = _locate_via_vision_zoom(target_description)
+    coordinates = _locate_via_vision_zoom(target_description, app_name)
     if coordinates is None:
         return {"error": f"Could not locate '{target_description}' via accessibility or vision."}
 
@@ -687,7 +692,7 @@ def _locate_element(
         # doesn't pay this extra click + screenshot + model round-trip.
         _dispatch_click(coordinates[0], coordinates[1])
         time.sleep(0.5)
-        refined = _locate_via_vision_zoom(target_description)
+        refined = _locate_via_vision_zoom(target_description, app_name)
         if refined is not None:
             coordinates = refined
             reveal_expanded = True
@@ -746,11 +751,21 @@ def _spotify_player_state() -> dict | None:
     confirming Spotify is the frontmost app, but worth knowing before
     reusing this pattern elsewhere.
 
-    "|||" is used as a field delimiter when concatenating the three values
-    in one AppleScript return (rather than three separate osascript calls,
-    which would triple the subprocess overhead and risk state changing
+    "|||" is used as a field delimiter when concatenating the four values in
+    one AppleScript return (rather than four separate osascript calls,
+    which would quadruple the subprocess overhead and risk state changing
     between the calls) - not bulletproof against a track name containing
     "|||" itself, but adequate for this use case.
+
+    Includes the track's own Spotify URI - confirmed directly, necessary:
+    on the Free tier, "player state" legitimately transitions to "playing"
+    for an inserted ad (its URI looks like "spotify:ad:...", not
+    "spotify:track:...") exactly the same way it does for a real track -
+    ad playback is otherwise indistinguishable from real playback by
+    player_state/track_name/track_artist alone (a live ad genuinely
+    reported track_name "CHRISTUS Health", track_artist "" - not obviously
+    fake-looking data). Callers that need to confirm a *specific requested
+    track* is playing, not just that *something* is, must check this.
     """
     script = (
         'tell application "Spotify"\n'
@@ -758,9 +773,10 @@ def _spotify_player_state() -> dict | None:
         "  set ps to player state as string\n"
         "  set tn to name of current track\n"
         "  set ta to artist of current track\n"
-        '  return ps & "|||" & tn & "|||" & ta\n'
+        "  set tu to spotify url of current track\n"
+        '  return ps & "|||" & tn & "|||" & ta & "|||" & tu\n'
         "on error\n"
-        '  return "error||||"\n'
+        '  return "error||||||"\n'
         "end try\n"
         "end tell"
     )
@@ -777,9 +793,17 @@ def _spotify_player_state() -> dict | None:
     if result.returncode != 0:
         return None
     parts = result.stdout.strip().split("|||")
-    if len(parts) != 3 or parts[0] == "error":
+    if len(parts) != 4 or parts[0] == "error":
         return None
-    return {"player_state": parts[0], "track_name": parts[1], "track_artist": parts[2]}
+    return {"player_state": parts[0], "track_name": parts[1], "track_artist": parts[2], "track_uri": parts[3]}
+
+
+def _spotify_state_is_ad(state: dict | None) -> bool:
+    """True if a _spotify_player_state() snapshot is a Spotify Free ad
+    rather than a real track - see _spotify_player_state's docstring for
+    why this needs its own explicit check rather than trusting
+    player_state/track_name alone."""
+    return bool(state) and str(state.get("track_uri", "")).startswith("spotify:ad:")
 
 
 def _spotify_playback_changed(before: dict | None, after: dict | None) -> bool:
@@ -984,6 +1008,264 @@ def play_spotify_track(query: str) -> dict:
 play_spotify_track_tool = FunctionTool(play_spotify_track)
 
 
+# --- search_spotify_candidates: read-before-you-act search selection -------
+#
+# play_spotify_track above resolves a query to a URI via the Spotify Web
+# API and plays it deterministically - but that API is unavailable here (no
+# SPOTIFY_CLIENT_ID/SECRET configured, and this account's Free tier was
+# confirmed blocked from it). Without a resolvable URI, the only way to
+# start a specific track is Spotify's own in-app search, and Spotify's own
+# top-ranked result for an ambiguous query (e.g. "Mad World") is not always
+# the one the user meant (a cover can outrank the studio original).
+#
+# This function only reads back what Spotify's search actually shows -
+# never plays anything - so the Action agent can reason about whether the
+# top result is a confident match before acting. Investigated and confirmed
+# directly (see planning.md): Spotify's Electron UI exposes ~nothing via
+# the Accessibility API (re-verified three separate ways, most recently a
+# 40-level-deep AX walk that found 17 total nodes, all window chrome), so
+# vision-on-a-scoped-screenshot is the only viable way to read the results.
+#
+# Real limits this design works within, confirmed by direct testing, not
+# assumed: there is no keyboard/AX/AppleScript path to select or play any
+# result other than the top one (arrow keys + Tab produce no reachable
+# selection state; Spotify's own scripting dictionary - read straight from
+# Spotify.app's Spotify.sdef - has no search verb and `play track` requires
+# a URI we don't have here). So the only two honest outcomes downstream of
+# this read are: accept the top result via click_ui's existing fixed-offset
+# "Top result" click (already verified reliable, see _APP_TOP_RESULT_OFFSET),
+# or don't act at all and say so - never guess at a non-top position.
+
+
+def _ask_vision_for_spotify_candidates(image_bytes: bytes, query: str) -> list[dict] | None:
+    """Asks Gemini vision to read back Spotify's visible search results as
+    structured data, instead of just a location - the Action agent needs
+    to reason about which one (if any) is a confident match, not just where
+    it is on screen. Returns a list of {"position", "title", "artist",
+    "kind"} dicts in on-screen top-to-bottom order, or None if the reply
+    wasn't usable JSON."""
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-flash-lite-latest",
+        contents=[
+            genai_types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            (
+                f"This is a screenshot of Spotify's search results for the query {query!r}. "
+                "List every visible track/song result, in the order they actually appear on "
+                "screen (top to bottom). For each one give its exact title, its artist(s) as "
+                "shown, and your best read of what kind of version it is - one of: \"song\" "
+                "for a normal studio track, \"cover\", \"live\", \"remix\", \"music video\", "
+                "or \"other\" if you can't tell. Only list actual song/track results - skip "
+                "albums, artists, playlists, and podcasts unless no track results are visible "
+                "at all.\n"
+                "Reply with ONLY raw JSON (no markdown fences): a list like "
+                '[{"position": 1, "title": "...", "artist": "...", "kind": "song"}, ...]. '
+                "If you see no track results at all, reply with an empty list []."
+            ),
+        ],
+    )
+    text = response.text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def _normalize_track_title(title: str) -> str:
+    """Normalizes a track title for same-song comparison: lowercase, drop
+    parenthetical/bracketed suffixes ('(feat. ...)', '[Live]', remaster
+    years, etc.) and non-alphanumeric noise, so 'Mad World' and 'Mad World
+    (feat. K.J. Apa...)' compare as the same underlying title."""
+    lowered = title.lower()
+    lowered = re.sub(r"[\(\[].*?[\)\]]", "", lowered)
+    return re.sub(r"[^a-z0-9]+", " ", lowered).strip()
+
+
+def _detect_spotify_ambiguity(query: str, candidates: list[dict]) -> str | None:
+    """Deterministic same-title/different-artist check - the reason this
+    exists instead of leaving it to the Action agent's own judgment: tested
+    directly against a real case (query 'Mad World', top result Gary Jules,
+    a Tears For Fears result one position below), the small, fast model this
+    project uses for the Action agent twice accepted the top result without
+    flagging it, even with an explicit prompt instruction to check for
+    exactly this. A real title/artist collision is a hard, mechanical fact
+    the code can check directly rather than trust a small model's judgment
+    for - same "don't trust self-reported/inferred judgment when a real
+    check exists" principle this codebase already applies to click/type
+    verification (pixel-diff before vision, tool result before agent prose).
+
+    Only counts as ambiguous when the user's own query doesn't already name
+    one of the conflicting artists (that's the user disambiguating already)
+    and titles match after normalization (not just loosely similar, to
+    avoid false ambiguity on merely-similar titles). Returns a human-
+    readable reason naming the conflicting artists, or None if no
+    conflict is detected - this says nothing about live/remix/music-video
+    badging, which is left to the Action agent's own reasoning over `kind`.
+    """
+    groups: dict[str, set[str]] = {}
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        title, artist = candidate.get("title"), candidate.get("artist")
+        if not title or not artist:
+            continue
+        key = _normalize_track_title(str(title))
+        if not key:
+            continue
+        groups.setdefault(key, set()).add(str(artist).strip())
+
+    query_lower = query.lower()
+
+    def named_in_query(artist: str) -> bool:
+        # Candidate artist fields are often comma-joined ("Gary Jules,
+        # Michael Andrews") - check each named artist individually, since a
+        # query naming just one of them ("Mad World by Gary Jules") still
+        # means the user disambiguated, even though the joined string as a
+        # whole never appears verbatim in the query.
+        return any(part.strip() and part.strip() in query_lower for part in artist.lower().split(","))
+
+    conflicts: list[str] = []
+    for artists in groups.values():
+        if len(artists) < 2:
+            continue
+        if any(named_in_query(artist) for artist in artists):
+            continue  # the user already named one of these - not ambiguous
+        conflicts.append(", ".join(sorted(artists)))
+
+    if not conflicts:
+        return None
+    return "different artists have a matching title: " + "; ".join(conflicts)
+
+
+def search_spotify_candidates(query: str) -> dict:
+    """Searches Spotify for `query` and reads back the visible results
+    WITHOUT starting playback - the first step in picking the right track
+    when Spotify's own search ranking might not match what the user asked
+    for (a cover/live/remix outranking the studio original, etc).
+
+    Launches/foregrounds Spotify itself if needed (same as play_spotify_track
+    - no open_app call needed first), opens its search via the keyboard
+    shortcut (no click), types the query, submits it, and reads the visible
+    result cards via Gemini vision on a window-scoped screenshot.
+
+    `success` in the returned dict is ALWAYS False - this is a read-only
+    step, not a completion signal. Reading candidates back is never the
+    same as the requested song actually playing, so treating this as a
+    milestone's last/deciding tool call must never be mistaken for
+    success. `ambiguous`/`ambiguity_reason` are a deterministic check (same
+    title, different artists, and the query didn't already name one) - not
+    a suggestion: when ambiguous is True, do not call click_ui, respond
+    with a clarifying question instead. When it's False, still reason over
+    `candidates`' `kind` before playing the top one (e.g. a live/remix/
+    music-video badge the user didn't ask for is still a reason to ask) -
+    the deterministic check only covers the same-title-different-artist
+    case, nothing else. There is no reliable way to select any result
+    other than the top one either way.
+
+    Returns a dict with:
+        success: bool - always False, see above
+        ambiguous: bool - True if a same-title/different-artist conflict
+            was detected and the query didn't already name one of them
+        ambiguity_reason: str | None - human-readable detail when ambiguous
+        read_ok: bool - True if at least one candidate was read back
+        candidates: list of {"position", "title", "artist", "kind"}, in
+            on-screen order
+        message: human-readable summary
+        error: raw error string if something went wrong, else None
+    """
+    _require_macos()
+
+    launch = open_app("Spotify")
+    if not launch["success"]:
+        return {
+            "success": False,
+            "read_ok": False,
+            "candidates": [],
+            "message": f"Could not bring Spotify to the foreground: {launch['message']}",
+            "error": launch["error"],
+        }
+    time.sleep(0.5)  # let a just-launched window finish settling before driving it
+
+    shortcut = _APP_SEARCH_SHORTCUTS.get("Spotify")
+    if shortcut is None:
+        return {
+            "success": False,
+            "read_ok": False,
+            "candidates": [],
+            "message": "No search keyboard shortcut configured for Spotify.",
+            "error": "no_search_shortcut",
+        }
+
+    _dispatch_keyboard_shortcut(53, 0)  # escape - clear any stray dropdown/focus state first
+    time.sleep(0.3)
+    _dispatch_keyboard_shortcut(*shortcut)  # Cmd+L - opens the search field already focused
+    time.sleep(0.6)
+
+    _select_all_and_paste(query)
+    time.sleep(0.2)
+
+    _dispatch_keyboard_shortcut(36, 0)  # return - submits to the full results page (does not play anything)
+    # Measured necessary directly: the results page's render is not
+    # immediate, and testing in separate process invocations with shorter
+    # gaps captured stale/unrelated content mid-transition - this is a
+    # single continuous call with a generous settle time instead.
+    time.sleep(2.5)
+
+    try:
+        screenshot = capture_screenshot(app_name="Spotify")
+    except RuntimeError as exc:
+        return {
+            "success": False,
+            "read_ok": False,
+            "candidates": [],
+            "message": f"Could not capture Spotify's window to read results: {exc}",
+            "error": "capture_failed",
+        }
+
+    candidates = _ask_vision_for_spotify_candidates(screenshot, query)
+    if not candidates:
+        return {
+            "success": False,
+            "read_ok": False,
+            "candidates": [],
+            "message": f"Searched Spotify for {query!r} but could not read back any visible track results.",
+            "error": "no_candidates_read",
+        }
+
+    ambiguity_reason = _detect_spotify_ambiguity(query, candidates)
+    if ambiguity_reason is not None:
+        message = (
+            f"Searched Spotify for {query!r} and read back {len(candidates)} visible result(s) "
+            f"- AMBIGUOUS ({ambiguity_reason}). Do not call click_ui for this - respond with a "
+            "clarifying question naming the specific candidates involved, since the user didn't "
+            "say which one they meant."
+        )
+    else:
+        message = (
+            f"Searched Spotify for {query!r} and read back {len(candidates)} visible result(s) "
+            "with no title/artist conflict detected. Still confirm the top one is a real match "
+            "(e.g. not a live/remix/music-video version the user didn't ask for) before calling "
+            "click_ui to play it."
+        )
+
+    return {
+        "success": False,
+        "read_ok": True,
+        "candidates": candidates,
+        "ambiguous": ambiguity_reason is not None,
+        "ambiguity_reason": ambiguity_reason,
+        "message": message,
+        "error": None,
+    }
+
+
+search_spotify_candidates_tool = FunctionTool(search_spotify_candidates)
+
+
 _VERIFY_REGION_SIZE = (400.0, 160.0)  # width, height in points, centered on the field
 _NO_CHANGE_DIFF_THRESHOLD = 2.0  # mean 0-255 grayscale diff below this = "nothing visibly happened"
 
@@ -1146,6 +1428,10 @@ def _looks_like_playback_outcome(text: str) -> bool:
     return bool(_PLAYBACK_OUTCOME_PATTERN.search(text.lower()))
 
 
+_SPOTIFY_AD_RETRY_ATTEMPTS = 5  # ~5s total absorbs a normal short pre-roll ad without blocking indefinitely
+_SPOTIFY_AD_RETRY_INTERVAL = 1.0
+
+
 def _verify_click_outcome(
     app_name: str,
     expected_outcome: str,
@@ -1164,11 +1450,32 @@ def _verify_click_outcome(
     state_check = _APP_PLAYER_STATE_CHECKS.get(app_name)
     if state_check is not None and before_player_state is not None and _looks_like_playback_outcome(expected_outcome):
         after_player_state = state_check()
+        # Spotify's Free tier can insert an ad on a play action - confirmed
+        # directly: player_state legitimately went paused -> playing with a
+        # plausible-looking track_name/track_artist that was actually an ad
+        # (its URI was "spotify:ad:...", not "spotify:track:..."), which the
+        # plain "did playback change" check below can't tell apart from a
+        # real track starting. Give a short window for the ad to clear
+        # before judging - not indefinitely (ads can run well past what's
+        # reasonable to block a single tool call on), but long enough to
+        # absorb a normal short pre-roll ad rather than reporting a
+        # confident-looking false success.
+        for _ in range(_SPOTIFY_AD_RETRY_ATTEMPTS):
+            if not _spotify_state_is_ad(after_player_state):
+                break
+            time.sleep(_SPOTIFY_AD_RETRY_INTERVAL)
+            after_player_state = state_check()
+
         if after_player_state is not None:
-            changed = _spotify_playback_changed(before_player_state, after_player_state)
             detail = (
                 f"Spotify's real player state before={before_player_state}, after={after_player_state}"
             )
+            if _spotify_state_is_ad(after_player_state):
+                return False, (
+                    f"Spotify started playing an ad instead of the requested track - {detail}. "
+                    "Cannot verify the requested track is playing while an ad is active."
+                )
+            changed = _spotify_playback_changed(before_player_state, after_player_state)
             if changed:
                 return True, f"confirmed via Spotify's player state - {detail}"
             return False, f"no playback change per Spotify's player state - {detail}"
@@ -1275,7 +1582,15 @@ def locate_and_click_via_grid_search(
     if guard_error is not None:
         return guard_error
 
-    full_screenshot = capture_screenshot()
+    try:
+        full_screenshot = capture_screenshot(app_name=app_name)
+    except RuntimeError as exc:
+        return {
+            "success": False,
+            "message": f"Could not capture '{app_name}''s window: {exc}",
+            "tier": None,
+            "error": "capture_failed",
+        }
     rough = _ask_vision_for_coordinates_in_image(full_screenshot, target_description)
     if rough is None:
         return {
@@ -1347,6 +1662,43 @@ def locate_and_click_via_grid_search(
         "tier": "grid_search",
         "error": "grid_search_exhausted",
     }
+
+
+def _select_all_and_paste(text: str) -> None:
+    """Selects all text in whatever field currently has keyboard focus, then
+    replaces it via clipboard paste (Cmd+V), not per-character CGEvents.
+
+    Select-all-first matters: found necessary directly when a field that
+    already had leftover text in it (e.g. a relaunched app resuming its
+    last search rather than starting blank) ended up with the new text
+    silently concatenated onto the old instead of replacing it - exactly
+    the kind of silent-wrong-state bug this project is built to catch, just
+    this time in a place nothing was checking yet.
+
+    Clipboard-paste, rather than one CGEvent per character, is far more
+    reliable: it doesn't depend on mapping every character to a virtual
+    keycode (which breaks for anything non-ASCII) and it's a single paste
+    event instead of dozens of keystrokes that could be dropped if the
+    app's event loop is busy.
+    """
+    select_all_down = Quartz.CGEventCreateKeyboardEvent(None, 0, True)  # 0 = 'a'
+    Quartz.CGEventSetFlags(select_all_down, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, select_all_down)
+    time.sleep(0.05)
+    select_all_up = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
+    Quartz.CGEventSetFlags(select_all_up, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, select_all_up)
+    time.sleep(0.05)
+
+    subprocess.run(["pbcopy"], input=text.encode(), check=True)
+
+    key_down = Quartz.CGEventCreateKeyboardEvent(None, 9, True)  # 9 = 'v'
+    Quartz.CGEventSetFlags(key_down, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_down)
+    time.sleep(0.05)
+    key_up = Quartz.CGEventCreateKeyboardEvent(None, 9, False)
+    Quartz.CGEventSetFlags(key_up, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_up)
 
 
 def click_ui(target_description: str, expected_app_name: str, expected_outcome: str) -> dict:
@@ -1553,38 +1905,7 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
         _dispatch_click(located["x"], located["y"])
         time.sleep(0.2)  # give the field a moment to actually gain focus
 
-    # Select-all before pasting so the paste always *replaces* the field's
-    # contents rather than inserting at wherever the cursor happens to be.
-    # Found necessary directly: a field that already had leftover text in
-    # it (e.g. a relaunched app resuming its last search rather than
-    # starting blank) ended up with the new text silently concatenated
-    # onto the old instead of replacing it, corrupting the query with no
-    # error anywhere - exactly the kind of silent-wrong-state bug this
-    # project has been built to catch, just this time in a place nothing
-    # was checking yet.
-    select_all_down = Quartz.CGEventCreateKeyboardEvent(None, 0, True)  # 0 = 'a'
-    Quartz.CGEventSetFlags(select_all_down, Quartz.kCGEventFlagMaskCommand)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, select_all_down)
-    time.sleep(0.05)
-    select_all_up = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
-    Quartz.CGEventSetFlags(select_all_up, Quartz.kCGEventFlagMaskCommand)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, select_all_up)
-    time.sleep(0.05)
-
-    # Typing via the clipboard (pbcopy + Cmd+V) is far more reliable than
-    # synthesizing one CGEvent per character: it doesn't depend on mapping
-    # every character to a virtual keycode (which breaks for anything
-    # non-ASCII) and it's a single paste event instead of dozens of
-    # keystrokes that could be dropped if the app's event loop is busy.
-    subprocess.run(["pbcopy"], input=text.encode(), check=True)
-
-    key_down = Quartz.CGEventCreateKeyboardEvent(None, 9, True)  # 9 = 'v'
-    Quartz.CGEventSetFlags(key_down, Quartz.kCGEventFlagMaskCommand)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_down)
-    time.sleep(0.05)
-    key_up = Quartz.CGEventCreateKeyboardEvent(None, 9, False)
-    Quartz.CGEventSetFlags(key_up, Quartz.kCGEventFlagMaskCommand)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, key_up)
+    _select_all_and_paste(text)
 
     if used_shortcut:
         # Pasting into Spotify's search field only populates the live

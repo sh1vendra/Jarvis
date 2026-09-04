@@ -161,18 +161,26 @@ async def run_command(
     return None
 
 
-async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milestone, on_event=None) -> bool:
+async def run_action(
+    runner: InMemoryRunner, session_id: str, milestone: Milestone, on_event=None
+) -> tuple[bool, str | None]:
     """Sends one milestone (goal + success_signal) to the Action agent and
     prints the tool call it makes plus the tool's own success/failure
     result.
 
-    Returns True only if the milestone's *last* tool call reported
-    `success: true` - i.e. the tools that actually ran confirmed the
-    outcome. A milestone whose last tool reported `success: false`, or that
-    called no tool at all, returns False. This is the honest per-milestone
-    signal the pipeline uses to decide whether the whole run succeeded (see
-    planning.md's "honest failure state" entry) - never the agent's own
-    prose summary.
+    Returns (milestone_ok, last_agent_text). milestone_ok is True only if
+    the milestone's *last* tool call reported `success: true` - i.e. the
+    tools that actually ran confirmed the outcome. A milestone whose last
+    tool reported `success: false`, or that called no tool at all, is
+    False. This is the honest per-milestone signal the pipeline uses to
+    decide whether the whole run succeeded (see planning.md's "honest
+    failure state" entry) - never the agent's own prose summary.
+
+    last_agent_text is the Action agent's own final piece of reply text (if
+    any) - e.g. a clarifying question it asked instead of guessing at an
+    ambiguous Spotify result. Callers that need to show *why* a milestone
+    didn't complete (not just that it didn't) use this; it plays no part in
+    deciding milestone_ok itself.
 
     success_signal is included alongside goal (not just goal alone) so the
     Action agent has a concrete, observable description to draw on when it
@@ -196,6 +204,7 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
     )
 
     tool_successes: list[bool | None] = []
+    last_agent_text: str | None = None
 
     async for event in runner.run_async(
         user_id=USER_ID,
@@ -228,8 +237,11 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
                         },
                     )
                 if part.text:
-                    print(f"[{event.author}] {part.text.strip()}")
-                    await _emit(on_event, {"type": "agent_text", "text": part.text.strip()})
+                    stripped = part.text.strip()
+                    print(f"[{event.author}] {stripped}")
+                    if stripped:
+                        last_agent_text = stripped
+                    await _emit(on_event, {"type": "agent_text", "text": stripped})
 
     milestone_ok = bool(tool_successes) and tool_successes[-1] is True
     print(f"[milestone {milestone.step_number}] outcome: {'OK' if milestone_ok else 'FAILED'} "
@@ -243,7 +255,7 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
             "success": milestone_ok,
         },
     )
-    return milestone_ok
+    return milestone_ok, last_agent_text
 
 
 async def run_milestones_until_approval(
@@ -277,7 +289,7 @@ async def run_milestones_until_approval(
             print("Execution paused here - this milestone was NOT run.")
             print("!" * 60)
             return milestone, all_ok
-        ok = await run_action(action_runner, session_id, milestone)
+        ok, _last_text = await run_action(action_runner, session_id, milestone)
         all_ok = all_ok and ok
     return None, all_ok
 
@@ -303,7 +315,8 @@ async def run_plan_with_approval_gate(
             break
         input("\n[APPROVAL GATE] Paused. Press Enter to simulate the user approving this step...")
         print(f"[TEST] Simulated approval granted for: {pending.goal!r}")
-        all_ok = (await run_action(action_runner, session_id, pending)) and all_ok
+        ok, _last_text = await run_action(action_runner, session_id, pending)
+        all_ok = ok and all_ok
         remaining = remaining[remaining.index(pending) + 1:]
     return "completed" if all_ok else "failed"
 

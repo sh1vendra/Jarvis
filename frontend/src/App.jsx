@@ -78,8 +78,12 @@ export default function App() {
           case "state":
             setState(msg.state);
             if (msg.state === "failed") {
-              setFailedGoals(msg.failed_goals || []);
-              log(`FAILED: ${(msg.failed_goals || [msg.reason]).join("; ")}`);
+              const goals = msg.failed_goals || [];
+              setFailedGoals(goals);
+              const lines = goals.length
+                ? goals.map((g) => (g.message ? `${g.goal} - ${g.message}` : g.goal))
+                : [msg.reason || "unknown"];
+              log(`FAILED: ${lines.join("; ")}`);
             } else if (msg.state === "cancelled") {
               setCancelledGoal(msg.goal || "");
               log(`CANCELLED: ${msg.goal || "step rejected"}`);
@@ -107,6 +111,14 @@ export default function App() {
             break;
           case "reply":
             setReply(msg.text);
+            break;
+          case "agent_text":
+            // The Action agent's own reply text - e.g. a clarifying
+            // question it asked instead of guessing at an ambiguous
+            // Spotify result, rather than a tool result. Was previously
+            // silently dropped (no case here at all) - the only place
+            // that text was visible was the backend's own stdout.
+            if (msg.text) log(`Jarvis: ${msg.text}`);
             break;
           case "error":
             setError(msg.message);
@@ -357,7 +369,10 @@ export default function App() {
               {failedGoals.length > 0 && (
                 <ul className="outcomeList">
                   {failedGoals.map((g, i) => (
-                    <li key={i}>{g}</li>
+                    <li key={i}>
+                      {g.goal}
+                      {g.message && <div className="outcomeDetail">{g.message}</div>}
+                    </li>
                   ))}
                 </ul>
               )}

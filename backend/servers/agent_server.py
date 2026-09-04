@@ -37,7 +37,16 @@ Protocol (JSON, one message per WebSocket frame):
 
   server -> client
     {"type": "pong", "server": "jarvis-agent"}
-    {"type": "state", "state": "thinking"|"doing"|"done"|"idle"}
+    {"type": "state", "state": "thinking"|"doing"|"done"}
+    {"type": "state", "state": "failed",
+     "failed_goals": [{"goal": str, "message": str}, ...]}   a milestone's
+                                       tools didn't verify; message is the
+                                       Action agent's own explanation for why
+                                       when it has one (e.g. a clarifying
+                                       question it asked instead of guessing
+                                       at an ambiguous Spotify result)
+    {"type": "state", "state": "cancelled", "goal": str}   an approval gate
+                                       was rejected before that step ran
     {"type": "transcript", "text": str}
     {"type": "plan", "milestones": [...]}
     {"type": "milestone_start"|"milestone_done", "step_number", "goal"}
@@ -160,7 +169,7 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
 
     await session.send({"type": "state", "state": "doing"})
 
-    failed_goals: list[str] = []
+    failed_goals: list[dict] = []
     for milestone in plan.milestones:
         if milestone.requires_approval:
             logger.info("agent server: awaiting real approval for %r", milestone.goal)
@@ -181,9 +190,14 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
                 await session.send({"type": "state", "state": "cancelled", "goal": milestone.goal})
                 return "rejected"
 
-        ok = await run_action(action_runner, action_session.id, milestone, on_event=session.send)
+        ok, last_text = await run_action(action_runner, action_session.id, milestone, on_event=session.send)
         if not ok:
-            failed_goals.append(milestone.goal)
+            # last_text carries the Action agent's own explanation for why -
+            # e.g. a clarifying question it asked instead of guessing at an
+            # ambiguous Spotify result (see planning.md) - so the UI can
+            # show the real reason, not just the abstract goal that didn't
+            # verify.
+            failed_goals.append({"goal": milestone.goal, "message": last_text or ""})
 
     if failed_goals:
         logger.info("agent server: run FAILED - milestones did not verify: %s", failed_goals)
