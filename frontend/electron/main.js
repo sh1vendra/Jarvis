@@ -17,7 +17,7 @@
 // almost certainly ELECTRON_RUN_AS_NODE being set in the environment, which
 // makes the Electron binary behave as plain Node - see the `dev:electron`
 // script in package.json.
-import { app, BrowserWindow, globalShortcut, ipcMain, screen, systemPreferences } from "electron";
+import { app, BrowserWindow, globalShortcut, ipcMain, screen, shell, systemPreferences } from "electron";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -361,6 +361,33 @@ ipcMain.on("jarvis:log", (_event, message) => {
 // where the WebSocket connection lives) but only main can spawn `say`.
 ipcMain.on("jarvis:speak", (_event, text) => {
   speak(text);
+});
+
+// The renderer's setup screen needs the REAL current mic permission state
+// (granted/denied/not-determined/restricted), not just "was a prompt shown
+// at some point" - systemPreferences.getMediaAccessStatus queries macOS's
+// actual TCC state directly, no prompt involved, unlike askForMediaAccess
+// above (which is fire-once-at-launch and can trigger a prompt). Only
+// meaningful on darwin; elsewhere there's no such permission model, so this
+// reports "granted" rather than a status Electron doesn't define there.
+ipcMain.handle("jarvis:mic-permission-status", () => {
+  if (process.platform !== "darwin") return "granted";
+  return systemPreferences.getMediaAccessStatus("microphone");
+});
+
+// The setup screen's only "Open System Settings" links - the sandboxed
+// renderer can't launch an external URL on its own, and only main should
+// ever be trusted to. Restricted to exactly the verified deep-link scheme
+// (see backend/tools/setup_checks.py for how each specific pane URL was
+// confirmed real) so this can never become a general-purpose "open
+// whatever URL the renderer asks for" hole.
+ipcMain.handle("jarvis:open-external", (_event, url) => {
+  if (typeof url !== "string" || !url.startsWith("x-apple.systempreferences:")) {
+    console.error(`[main] refused to open non-Settings URL: ${url}`);
+    return false;
+  }
+  shell.openExternal(url);
+  return true;
 });
 
 app.on("will-quit", () => {

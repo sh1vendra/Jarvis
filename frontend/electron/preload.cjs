@@ -70,4 +70,27 @@ contextBridge.exposeInMainWorld("jarvis", {
   closeWindow() {
     ipcRenderer.send("jarvis:close");
   },
+
+  /**
+   * Real current macOS microphone permission state - "granted" | "denied" |
+   * "not-determined" | "restricted" | "unknown" (non-darwin always resolves
+   * "granted", see main.js). Queried on demand for the setup screen, not
+   * pushed - there is no OS event for "the user changed this in System
+   * Settings," so the setup screen re-checks by calling this again.
+   * @returns {Promise<string>}
+   */
+  getMicPermissionStatus() {
+    return ipcRenderer.invoke("jarvis:mic-permission-status");
+  },
+
+  /**
+   * Opens a System Settings deep link - main.js only accepts the verified
+   * x-apple.systempreferences: scheme, so this is not a general "open any
+   * URL" surface.
+   * @param {string} url
+   * @returns {Promise<boolean>}
+   */
+  openExternal(url) {
+    return ipcRenderer.invoke("jarvis:open-external", String(url || ""));
+  },
 });

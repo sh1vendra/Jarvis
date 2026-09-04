@@ -27,6 +27,66 @@ const STATE_LABEL = {
   cancelled: "Cancelled",
 };
 
+// The setup screen's checklist, in the exact order it's shown - a fixed
+// display order independent of the order results actually arrive in (the
+// backend streams its checks one at a time over the WebSocket; two are
+// purely frontend facts - see below). Every id here must match either a
+// backend `setup_check_result.id` (see backend/tools/setup_checks.py) or
+// one of the two frontend-only ids handled locally in this file.
+const SETUP_CHECK_ORDER = [
+  { id: "google_api_key", label: "Gemini API key" },
+  { id: "backend_connection", label: "Backend connection" },
+  { id: "mic_permission", label: "Microphone" },
+  { id: "accessibility", label: "Accessibility" },
+  { id: "automation_system_events", label: "Automation – System Events" },
+  { id: "automation_reminders", label: "Automation – Reminders" },
+  { id: "automation_spotify", label: "Automation – Spotify" },
+  { id: "automation_chrome", label: "Automation – Google Chrome" },
+  { id: "screen_recording", label: "Screen Recording" },
+  { id: "chrome_extension", label: "Chrome extension" },
+];
+
+const SETUP_STATUS_TEXT = {
+  checking: "checking…",
+  passed: "OK",
+  failed: "needs attention",
+  unknown: "can’t verify yet",
+};
+
+const SETUP_INITIAL_CHECKS = Object.fromEntries(
+  SETUP_CHECK_ORDER.map((c) => [c.id, { status: "checking", detail: "", fix_url: null }])
+);
+
+// Real current macOS mic permission (electron/main.js), not just "was a
+// prompt shown at some point" - see preload.cjs. The deep link is the same
+// verified x-apple.systempreferences URL scheme the backend's own checks
+// use for Accessibility/Automation/Screen Recording (setup_checks.py) -
+// duplicated here rather than round-tripped from the backend because this
+// is the one check the backend process can't answer: mic permission is
+// granted per-process, and the Electron app, not the Python backend, is
+// the process that actually opens the microphone.
+const MIC_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+
+function micCheckFromStatus(status) {
+  if (status === "granted") {
+    return { status: "passed", detail: "Microphone access is granted.", fix_url: null };
+  }
+  if (status === "not-determined") {
+    return {
+      status: "failed",
+      detail: "macOS hasn't recorded a decision yet – grant access when prompted, or enable it directly.",
+      fix_url: MIC_SETTINGS_URL,
+    };
+  }
+  return {
+    status: "failed",
+    detail: `Microphone access is ${status} – Jarvis can't hear you until this is granted.`,
+    fix_url: MIC_SETTINGS_URL,
+  };
+}
+
+const SETUP_DISMISSED_KEY = "jarvis-setup-dismissed";
+
 // Real scroll affordance for any scrollable region in this small, fixed-size
 // window - a subtle bottom-edge fade (styles.css, [data-scroll-more="true"])
 // that's only ever on when there is genuinely more content below the fold,
@@ -88,6 +148,21 @@ export default function App() {
   // needed to make that true.
   const [conversation, setConversation] = useState([]); // [{role: "user"|"jarvis", text}]
   const [transcriptOpen, setTranscriptOpen] = useState(false);
+
+  // ── Setup-check screen ──
+  // See planning.md for why this exists: a cold-start user hits seven
+  // scattered, silent failure points with no guidance otherwise. Shown
+  // before the normal idle pill on a fresh launch (or whenever something
+  // still needs attention and hasn't been explicitly skipped), hidden and
+  // remembered once the user dismisses it with real failures still present.
+  const [setupChecks, setSetupChecks] = useState(SETUP_INITIAL_CHECKS);
+  const [setupVisible, setSetupVisible] = useState(() => {
+    try {
+      return localStorage.getItem(SETUP_DISMISSED_KEY) !== "1";
+    } catch {
+      return true; // no localStorage access - default to showing it, never silently skip
+    }
+  });
 
   const recorderRef = useRef(null);
   const clientRef = useRef(null);
@@ -194,6 +269,21 @@ export default function App() {
             // indistinguishable from a hotkey-triggered one.
             log('wake word: "Hey Jarvis" detected');
             beginCapture("wakeword");
+            break;
+          case "setup_check_result":
+            // One real backend-side setup check's result (see
+            // backend/tools/setup_checks.py / agent_server.py's
+            // run_setup_checks). setSetupChecks is the useState setter,
+            // referentially stable for the component's lifetime, so
+            // calling it directly here (rather than through a memoized
+            // helper) is still always writing into the current state.
+            setSetupChecks((prev) => ({
+              ...prev,
+              [msg.id]: { status: msg.status, detail: msg.detail || "", fix_url: msg.fix_url || null },
+            }));
+            break;
+          case "setup_checks_complete":
+            log("setup checks: all backend checks reported");
             break;
           case "speak":
             // The backend already decided the final text (personality
@@ -423,6 +513,164 @@ export default function App() {
   // actually reporting speaking:false.
   const voiceActivity = state === "listening" ? "user" : speaking ? "jarvis" : "neutral";
 
+  // ── Setup-check screen: derived state + real check triggers ──
+
+  // "backend_connection" is not a distinct probe - it's the exact same
+  // `connection` state the header's own conn dot already reflects (see
+  // ws/client.js), just projected into the checklist's shape so it can sit
+  // in the list alongside everything else instead of being a special case.
+  useEffect(() => {
+    setSetupChecks((prev) => ({
+      ...prev,
+      backend_connection:
+        connection === "connected"
+          ? { status: "passed", detail: "Connected to the backend.", fix_url: null }
+          : connection === "connecting"
+            ? { status: "checking", detail: "", fix_url: null }
+            : {
+                status: "failed",
+                detail: "Backend not reachable - make sure agent_server.py is running (cd backend && python servers/agent_server.py).",
+                fix_url: null,
+              },
+    }));
+  }, [connection]);
+
+  // Real mic permission, queried on mount - see preload.cjs/main.js. No OS
+  // event fires when this changes, so re-checking happens explicitly (this
+  // effect on mount, recheckSetup on demand), never assumed still current.
+  useEffect(() => {
+    window.jarvis.getMicPermissionStatus().then((status) => {
+      setSetupChecks((prev) => ({ ...prev, mic_permission: micCheckFromStatus(status) }));
+    });
+  }, []);
+
+  // Runs the backend's real checks (google_api_key, accessibility,
+  // screen_recording, the automation probes, chrome_extension) every time
+  // the connection actually (re)establishes - including a reconnect after
+  // the backend restarts, which is exactly when a just-fixed .env or a
+  // just-granted permission needs to be seen again.
+  useEffect(() => {
+    if (connection === "connected") {
+      clientRef.current.send({ type: "run_setup_checks" });
+    }
+  }, [connection]);
+
+  const setupList = SETUP_CHECK_ORDER.map((c) => ({ ...c, ...setupChecks[c.id] }));
+  const setupAnyFailed = setupList.some((c) => c.status === "failed");
+  const setupAllDone = setupList.every((c) => c.status !== "checking");
+  const setupAllGood = setupAllDone && !setupAnyFailed;
+
+  // Once every check has landed on passed/unknown (never "checking") and
+  // none are "failed", there's nothing left to show the user - transition
+  // to the normal idle pill on its own, after a brief "all set" beat rather
+  // than an instant cut.
+  useEffect(() => {
+    if (!setupVisible || !setupAllGood) return undefined;
+    const t = setTimeout(() => {
+      setSetupVisible(false);
+      try {
+        localStorage.removeItem(SETUP_DISMISSED_KEY);
+      } catch {
+        // No localStorage access - nothing to clear, and setSetupVisible above
+        // already took effect for this session regardless.
+      }
+    }, 900);
+    return () => clearTimeout(t);
+  }, [setupVisible, setupAllGood]);
+
+  // Re-runs every real check live, without a restart - what makes "fix the
+  // .env, come back and see it pass" actually possible instead of forcing a
+  // relaunch. Resets everything except backend_connection (that one is
+  // driven purely by the live socket state above, not a one-shot probe).
+  const recheckSetup = useCallback(() => {
+    setSetupChecks((prev) => {
+      const next = { ...prev };
+      for (const c of SETUP_CHECK_ORDER) {
+        if (c.id !== "backend_connection") next[c.id] = { status: "checking", detail: "", fix_url: null };
+      }
+      return next;
+    });
+    window.jarvis.getMicPermissionStatus().then((status) => {
+      setSetupChecks((prev) => ({ ...prev, mic_permission: micCheckFromStatus(status) }));
+    });
+    clientRef.current.send({ type: "run_setup_checks" });
+  }, []);
+
+  // Explicit skip while real failures remain - remembered so the full
+  // screen doesn't force itself on every single launch once acknowledged,
+  // but never silently: setupIndicatorVisible below keeps a small dot in
+  // the normal header for as long as something is actually still missing.
+  const dismissSetup = useCallback(() => {
+    setSetupVisible(false);
+    if (setupAnyFailed) {
+      try {
+        localStorage.setItem(SETUP_DISMISSED_KEY, "1");
+      } catch {
+        // No localStorage access - can't remember the choice, so the setup
+        // screen will simply show again next launch. Not worse than before.
+      }
+    }
+  }, [setupAnyFailed]);
+
+  // The persistent "something's still missing" indicator - only real once
+  // every check has actually reported (setupAllDone), so a still-in-flight
+  // check never flashes it on for a moment before its real result arrives.
+  const setupIndicatorVisible = !setupVisible && setupAllDone && setupAnyFailed;
+
+  if (setupVisible) {
+    return (
+      <div className="stage" data-state="setup">
+        <div className="glass glassSetup">
+          <div className="header">
+            <span className="orb" />
+            <span className="stateLabel">Setup check</span>
+            <div className="controls">
+              <button className="winBtn" onClick={() => window.jarvis.minimize()} title="Minimize">
+                &#8211;
+              </button>
+              <button className="winBtn" onClick={() => window.jarvis.closeWindow()} title="Close">
+                &#215;
+              </button>
+            </div>
+          </div>
+          <div className="body setupBody">
+            <p className="setupIntro">Making sure Jarvis can actually do its job before handing you the mic.</p>
+            <ul className="setupList">
+              {setupList.map((c) => (
+                <li className="setupItem" data-status={c.status} key={c.id}>
+                  <span className="setupDot" data-status={c.status} />
+                  <div className="setupItemBody">
+                    <div className="setupItemHead">
+                      <span className="setupItemLabel">{c.label}</span>
+                      <span className="setupItemStatus">{SETUP_STATUS_TEXT[c.status]}</span>
+                    </div>
+                    {c.detail && <div className="setupItemDetail">{c.detail}</div>}
+                    {c.status === "failed" && c.fix_url && (
+                      <button className="setupFixBtn" onClick={() => window.jarvis.openExternal(c.fix_url)}>
+                        Open System Settings
+                      </button>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <div className="setupActions">
+              <button className="btn" onClick={recheckSetup}>
+                Recheck
+              </button>
+              {setupAnyFailed && (
+                <button className="btn btnGhost" onClick={dismissSetup}>
+                  Skip for now
+                </button>
+              )}
+            </div>
+            {setupAllGood && <div className="setupAllGood">All set — starting Jarvis…</div>}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       className="stage"
@@ -470,6 +718,17 @@ export default function App() {
             }
           />
           <span className="conn" data-conn={connection} title={`backend: ${connection}`} />
+          {setupIndicatorVisible && (
+            // A real, never-silent reminder: shown only once every check
+            // has actually reported and at least one genuinely failed - not
+            // a static "you skipped setup" badge that outlives the problem.
+            // Clicking it reopens the same real checklist, not a summary.
+            <button
+              className="setupIndicator"
+              onClick={() => setSetupVisible(true)}
+              title="Setup still has something that needs attention"
+            />
+          )}
           <div className="controls">
             <button
               className="winBtn"
