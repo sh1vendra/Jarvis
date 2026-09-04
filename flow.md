@@ -742,46 +742,87 @@ The real request lifecycle. Everything in sections 2-9 still applies
 unchanged - this section is what wraps around it.
 
 **Processes.** Two, on one machine:
-- **Electron** (`frontend/`) - a main process owning the window, the global
-  hotkey, and the Porcupine wake-word listener; and a renderer owning audio
-  capture, the WebSocket, and the React UI.
-- **Python** (`backend/servers/agent_server.py` run directly) - starts *two*
-  asyncio tasks on one event loop: the agent server on `ws://127.0.0.1:8766`
-  and the browser bridge on `ws://127.0.0.1:8765`. Same loop is a hard
+- **Electron** (`frontend/`) - a main process owning the window and the
+  global hotkey only (wake word no longer lives here - see below); and a
+  renderer owning audio capture, the WebSocket, and the React UI.
+- **Python** (`backend/servers/agent_server.py` run directly) - starts
+  *three* things on one event loop: the agent server on
+  `ws://127.0.0.1:8766`, the browser bridge on `ws://127.0.0.1:8765`, and
+  (only in this non-Cloud-Run entry point - see `_main()`) the wake-word
+  listener (`voice/wakeword.py`), a background thread reading the real
+  microphone continuously. Agent server + bridge sharing one loop is a hard
   requirement, not tidiness: `browser/bridge.py`'s `asyncio.Event`s are only
   awaitable from the loop that created them, and the Action agent's browser
   tools await them from inside the agent server's request handling.
 
 **Step by step:**
 
-1. **Trigger - two of them, both in `electron/main.js`, both funnelling
-   through one `startListening(source)`:**
+1. **Trigger - two of them, genuinely different transports now, both
+   ending at the renderer's `beginCapture(source)`:**
    - **Hotkey** (`Cmd+Shift+Space` via `globalShortcut`, fires while any app
-     is focused). A **toggle** - `globalShortcut` exposes key-down only, so
-     hold-to-talk isn't expressible without a native module. Press again to
-     stop.
-   - **Wake word** ("Jarvis" via Porcupine, `electron/wakeword.cjs`). Runs
-     in the main process using `@picovoice/porcupine-node` +
-     `@picovoice/pvrecorder-node` (prebuilt native addons, load in Electron
-     with no rebuild; the acoustic model and the "Jarvis" keyword are
-     bundled). Needs `PICOVOICE_ACCESS_KEY` in the repo-root `.env`; missing
-     key or broken addon -> wake word off, hotkey unaffected. Wake word only
-     ever *starts* a capture - the renderer ends it on ~1.2 s of trailing
-     silence (RMS gate, 9 s hard cap), since there's no "say it again to
-     stop".
+     is focused, still lives entirely in `electron/main.js`). A **toggle** -
+     `globalShortcut` exposes key-down only, so hold-to-talk isn't
+     expressible without a native module. Press again to stop. Main sets
+     `isRecording` and sends `jarvis:hotkey {action, source: "hotkey"}` to
+     the renderer over IPC, same as before.
+   - **Wake word** ("Hey Jarvis" via openWakeWord, `backend/voice/
+     wakeword.py`) - runs on the **Python backend**, not Electron main.
+     Real architectural fork, not a detail: openWakeWord is a Python/
+     `onnxruntime` library with no Node binding at all, unlike Porcupine
+     (which shipped a prebuilt N-API addon and could load directly into
+     Electron's main process - `electron/wakeword.cjs`, kept in the repo
+     but no longer wired into `main.js` at all, since Picovoice's signup
+     turned out broken/restricted for this account). Detection has to run
+     wherever Python already runs, so it lives in `agent_server.py`
+     alongside the WebSocket server, and its trigger travels over that
+     *same WebSocket connection* instead of Electron IPC: the server
+     broadcasts `{"type": "wakeword_detected"}` to every connected client,
+     and `App.jsx`'s WS message handler calls `beginCapture("wakeword")`
+     directly - the exact same convergence point the hotkey path calls via
+     `onHotkey`, just reached a different way. `WakeWordListener.start()`
+     loads `Model(wakeword_models=["hey_jarvis_v0.1"], inference_framework=
+     "onnx")` and runs a background thread on `sd.RawInputStream` (1280-
+     sample/80ms frames, the same callback+queue idiom `voice/capture.py`'s
+     push-to-talk path already uses), calling `predict()` per frame
+     (~1.4ms) against a 0.5 score threshold. Missing `openwakeword`/
+     `sounddevice`/`numpy` (guarded imports, exactly like `mac_control.py`'s
+     `pyobjc` guard) -> wake word off, hotkey unaffected - this is also
+     what keeps it off on Cloud Run, see below. Wake word only ever
+     *starts* a capture - the renderer ends it on ~1.2s of trailing silence
+     (RMS gate, 9s hard cap), same as it always did.
 
-   Either way, main sets `isRecording`, calls `wakeWord.pauseCapture()`
-   (fully releases the `PvRecorder` mic so the renderer's `getUserMedia`
-   is uncontended), and sends `jarvis:hotkey` `{action, source}` to the
-   renderer. `wakeWord.resumeCapture()` runs when the renderer reports
-   `recording-state -> false`.
+   **Mic handoff** is now cross-process (renderer <-> backend, not
+   renderer <-> Electron main), so it travels over the WebSocket too: the
+   renderer sends `{"type": "mic_state", "active": bool}` at the exact two
+   points it already calls `window.jarvis.reportRecordingState(...)` (mic
+   acquired in `beginCapture`, released in `stopAndSend`) - regardless of
+   which trigger started the capture, since the backend needs to know "is
+   ANY renderer capture using the mic right now." `agent_server.py`'s
+   `_set_mic_active()` is the one place this actually changes hands:
+   `active=true` calls `WakeWordListener.pause()`, which fully closes the
+   input stream (not just "ignore audio while still open" - the renderer's
+   `getUserMedia` must never contend with this process for the same
+   device); `active=false` calls `resume()`, reopening it. On the
+   detection side, `_on_wakeword_detected` pauses the listener immediately,
+   before even broadcasting - closing the contention window as early as
+   possible, mirroring how the old Porcupine `startListening()` called
+   `pauseCapture()` before sending its trigger. A 3-second watchdog resumes
+   the listener if no `mic_state(active=true)` ack ever arrives (a real gap
+   the old same-process IPC design didn't have to guard against - a
+   WebSocket message can be lost or the renderer can disconnect mid-
+   handoff in a way an in-process function call can't); disconnect cleanup
+   covers the same failure mode for a connection that dies outright.
+   Verified live: a test client that deliberately never acked showed the
+   listener correctly self-resume after 3s in the server's own logs.
 
 2. **Bridge.** `electron/preload.cjs` exposes a small `window.jarvis` -
-   `onHotkey`, `onWakeWordStatus`, `reportRecordingState`, `log`,
-   `minimize`, `closeWindow` - and nothing else: no `ipcRenderer`, no node
-   APIs. Audio does **not** travel over IPC; the renderer holds its own
-   WebSocket straight to Python, so captured audio never detours through the
-   main process.
+   `onHotkey`, `reportRecordingState`, `log`, `minimize`, `closeWindow` -
+   and nothing else: no `ipcRenderer`, no node APIs. `onWakeWordStatus` was
+   removed along with the rest of the Porcupine IPC wiring - wake-word
+   status now arrives as a WebSocket message (`wakeword_status`, sent once
+   per connection) instead. Audio does **not** travel over IPC either way;
+   the renderer holds its own WebSocket straight to Python, so captured
+   audio never detours through the main process.
 
 3. **Capture** (`src/audio/recorder.js`). `getUserMedia` -> `AudioContext` ->
    an `AudioWorkletNode` running a `pcm-collector` processor loaded from an

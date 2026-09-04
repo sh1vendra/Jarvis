@@ -2694,3 +2694,155 @@ Spotify's own top-result ranking is still the only thing ever offered for
 the "confident" case - Jarvis still cannot play a specific non-top result
 by voice ("play the second one") without reintroducing the click-accuracy
 risk this whole investigation exists to avoid.
+
+## openWakeWord built: real "Hey Jarvis" detection, running on the backend
+
+Porcupine's wiring (`frontend/electron/wakeword.cjs`, `main.js`) was real,
+tested infrastructure - but Picovoice's signup turned out broken/restricted
+for this account, so it never actually detected anything in practice; wake
+word was effectively off since that entry was written. openWakeWord
+(investigated earlier, confirmed viable: `openwakeword` 0.6.0 +
+`onnxruntime` 1.29.0, `hey_jarvis_v0.1` pretrained model bundled in the
+package, no account/API key) is what actually got built and wired end to
+end this session.
+
+**Why the backend, not Electron main (a real architectural fork, not a
+detail):** Porcupine ships a prebuilt N-API `.node` addon that loads
+directly into Electron's main process - that's the entire reason wake word
+could live there at all. openWakeWord is a Python/`onnxruntime` library
+with no Node binding whatsoever; there is no way to run it inside Electron.
+Detection has to live wherever Python already runs, which is this backend
+process (`backend/servers/agent_server.py`, alongside the WebSocket server
+that already talks to the renderer). The real consequence: the wake-word
+*trigger* can no longer travel over Electron's IPC (`jarvis:hotkey`) the
+way the hotkey does, since this process isn't Electron's main - it now
+travels over the existing WebSocket connection instead, and the renderer
+calls the exact same `beginCapture(source)` convergence point the hotkey
+already uses (see `frontend/src/App.jsx`'s `wakeword_detected` case). This
+is the one thing about this build that was messier than the original spec
+assumed ("a second trigger, same shape as the hotkey") - it isn't the same
+shape, it's a genuinely different transport, and worth naming plainly
+rather than glossing over.
+
+**What actually got built** (`backend/voice/wakeword.py`,
+`backend/servers/agent_server.py`):
+- `WakeWordListener` - a background thread running `sd.RawInputStream` (the
+  same callback + `queue.Queue` idiom `voice/capture.py`'s push-to-talk
+  path already uses, not a new pattern) feeding fixed 1280-sample (80ms @
+  16kHz) frames into `openwakeword.Model.predict()`. `start()`/`stop()` own
+  the whole lifecycle; `pause()`/`resume()` fully close and reopen the
+  actual input stream - not "ignore audio while still holding the device
+  open" - deliberately mirroring `wakeword.cjs`'s already-proven mic-
+  handoff pattern, since it already solved this exact contention problem
+  once.
+- `agent_server.py`'s `_set_mic_active()` is the one choke point mic
+  ownership actually changes hands through - called from a new client
+  message, `{"type": "mic_state", "active": bool}`, which the renderer now
+  sends at the exact two points it already reports `jarvis:recording-state`
+  to Electron main (mic acquired in `beginCapture`, released in
+  `stopAndSend`) - regardless of trigger source, hotkey or wake word,
+  since the backend needs to know "is ANY renderer capture using the mic
+  right now."
+- Detection runs on the listener's own thread; `_on_wakeword_detected`
+  pauses the listener immediately (before even scheduling anything, same
+  reasoning as `wakeword.cjs`'s `startListening()` calling `pauseCapture()`
+  before sending its trigger) and hops onto the event loop via
+  `asyncio.run_coroutine_threadsafe` to broadcast `{"type":
+  "wakeword_detected"}` to every connected session.
+- A watchdog (`_handle_wakeword_detected`, 3s) resumes the listener if no
+  `mic_state(active=True)` ack ever arrives - a real gap the same-process
+  Porcupine IPC design didn't have to worry about (a dropped WebSocket
+  message, or a renderer that disconnects/crashes mid-handoff, can't
+  self-recover the way an in-process function call implicitly does).
+  Verified live, not theoretical: a test client that received
+  `wakeword_detected` but never sent the ack (deliberately, to exercise
+  this path) showed the listener correctly resume itself after 3s in the
+  real server's own logs. Disconnect cleanup (`agent_handler`'s `finally`)
+  covers the same failure mode for "the connection itself died."
+
+**Confirmed directly before and during the build, not assumed:**
+- `Model(wakeword_models=["hey_jarvis_v0.1"], inference_framework="onnx")`
+  loads in ~80ms; `predict()` on one 1280-sample chunk takes ~1.4ms.
+- `sd.RawInputStream(samplerate=16000, blocksize=1280, ...)` really does
+  deliver exactly 1280-sample callbacks - 24 callbacks over 2s of real mic
+  input, every one exactly 2560 bytes, no manual buffering of partial
+  frames needed.
+- Real synthesized speech (`say -o ... "Hey Jarvis"`, converted to 16kHz
+  mono PCM and chunked the same way the live path does) scored 0.98 for
+  "Hey Jarvis" and 0.999 for "Hey Jarvis, what's the weather", against
+  0.000008 for unrelated speech ("Please play some music on Spotify") -
+  wide margin either side of the 0.5 default threshold, and higher than
+  the earlier investigation's own benchmark (0.76/0.999), not just
+  consistent with it.
+- The full `WakeWordListener` class, played through actual speakers into
+  the actual microphone (not an offline file read) while listening for
+  real: detected at score 0.776. `pause()` while a clip was playing
+  produced zero detections (mic genuinely closed, confirmed via
+  `listener._stream is None`); `resume()` afterward detected again (0.55).
+- The full real `agent_server.py` process, started exactly as it runs in
+  production (`python servers/agent_server.py`, not a mock), with a real
+  WebSocket test client standing in for the Electron renderer: (a) starts
+  wake word cleanly with no errors, confirmed via its own real startup
+  logs; (b) a simulated hotkey-triggered command (`mic_state active=true`
+  -> a full Orchestrator/Planner/Action run -> `mic_state active=false`)
+  completed normally while wake word was live in the background, with logs
+  confirming the mic was actually released and reacquired around it
+  (`input stream closed - microphone released` / `... opened - microphone
+  acquired`); (c) a genuinely idle connected client received a real
+  `wakeword_detected` message (score 0.795) when "Hey Jarvis" was played
+  through real speakers into the real mic - the complete backend-to-
+  WebSocket path, verified end to end.
+
+**Cloud Run - verified, not just gated and assumed safe:** wake word must
+never start there (no microphone in that container) and must not crash
+startup by existing at all. `start_wakeword_listener()` is only ever
+called from `_main()`, which the Cloud Run branch of `__main__` never
+reaches (it calls `serve_forever()` directly) - but "the code path is
+gated" isn't the same as "it's actually safe," so this was verified for
+real: built the actual `Dockerfile` image (`docker build`), ran it with
+`K_SERVICE`/`PORT` set exactly as Cloud Run would, and confirmed the
+container started cleanly, stayed up, and answered its health check.
+Confirmed inside that exact running container that `sounddevice`,
+`openwakeword`, and `onnxruntime` are genuinely absent (matches
+`requirements-cloudrun.txt`'s deliberate exclusion, now extended to cover
+these two new packages alongside the existing `sounddevice` exclusion) and
+that `voice/wakeword.py` still imports cleanly and reports itself
+unavailable rather than raising - the same guarded-import pattern already
+used for `pyobjc`/Quartz elsewhere in this codebase, now exercised for
+real against a genuinely dependency-less environment, not just reasoned
+about.
+
+**Frontend wiring, and what got removed, not just added:** since
+Porcupine's Electron-side code was already fully inert (broken signup), and
+the real signal now arrives over WebSocket instead, leaving the old IPC
+wiring (`main.js`'s `startWakeWord()`, `wakeWord.pauseCapture()`/
+`resumeCapture()` calls, `readRepoEnv("PICOVOICE_ACCESS_KEY")`,
+`preload.cjs`'s `onWakeWordStatus`) in place would have been actively
+misleading - a second, permanently-false status source that could in
+principle race the real one. Removed from `main.js`/`preload.cjs` entirely;
+`wakeword.cjs` itself is kept, unreferenced, in case Picovoice access is
+ever unblocked (same "superseded, not deleted" pattern as
+`play_spotify_track`). `App.jsx`'s existing `wakeWord` state and
+`data-wakeword` attribute (already plumbed from the Porcupine build) were
+reused, not replaced - now fed by two new WebSocket message types
+(`wakeword_status` once per connection, `wakeword_detected` on the real
+event) instead of IPC. `data-wakeword` now carries three real values
+instead of on/off, per the explicit ask to distinguish "listening" from
+"unavailable" from "currently processing a command": `"unavailable"`
+(openwakeword/mic deps missing on the backend - hotkey still works,
+nothing wrong), `"paused"` (available, but this exact renderer capture
+currently holds the mic - derived locally as `state === "listening"`,
+since that's precisely when the mic_state handoff makes the backend's
+listener paused, no extra round-trip needed), `"listening"` (backend is
+actively listening). A small dot in the header (`.wakeword`, styled in
+`styles.css` next to the existing `.conn` connection dot) is the actual
+visible signal - green/amber/dim - since the attribute existed before but
+nothing in `styles.css` ever keyed off it.
+
+**What's left, deliberately, for a real human:** every mechanical piece of
+this was tested for real above - startup, mic handoff, the full backend-to-
+WebSocket detection path, Cloud Run safety. The one thing that cannot be
+tested by an agent is whether *this specific person's real voice, in their
+real room, through their real microphone* actually triggers it reliably -
+that's a genuinely different question from "does the mechanism work," and
+is explicitly left for direct confirmation.
