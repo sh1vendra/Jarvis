@@ -27,6 +27,38 @@ const STATE_LABEL = {
   cancelled: "Cancelled",
 };
 
+// Real scroll affordance for any scrollable region in this small, fixed-size
+// window - a subtle bottom-edge fade (styles.css, [data-scroll-more="true"])
+// that's only ever on when there is genuinely more content below the fold,
+// not a static decoration. `el.dataset.scrollMore` is set imperatively
+// (not React state) since scroll fires far too often to route through a
+// re-render; a MutationObserver covers content growing while already
+// mounted (new activity lines, new conversation turns) since none of these
+// containers change their own box size when their content overflows it, so
+// a ResizeObserver on the element itself would never fire for that.
+// `remountKey` re-attaches everything when a conditionally-rendered element
+// (`.activity`, `.conversation`) actually mounts - a plain ref doesn't
+// trigger a re-run on its own when the element it points to appears.
+function useScrollFade(ref, remountKey) {
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    const update = () => {
+      const hasMore = el.scrollHeight - el.clientHeight - el.scrollTop > 2;
+      el.dataset.scrollMore = hasMore ? "true" : "false";
+    };
+    update();
+    el.addEventListener("scroll", update, { passive: true });
+    const observer = new MutationObserver(update);
+    observer.observe(el, { childList: true, subtree: true, characterData: true });
+    return () => {
+      el.removeEventListener("scroll", update);
+      observer.disconnect();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remountKey]);
+}
+
 export default function App() {
   const [state, setState] = useState("idle");
   const [connection, setConnection] = useState("connecting");
@@ -61,6 +93,8 @@ export default function App() {
   const clientRef = useRef(null);
   const autoStopRef = useRef(null); // { timers, done } for a wake-word capture
   const conversationRef = useRef(null); // scrolled to bottom on new turns, see below
+  const bodyRef = useRef(null); // the whole scrollable state-content column
+  const activityRef = useRef(null);
 
   // Trailing-silence auto-stop for the wake-word path (the hotkey stays a
   // manual toggle). RMS threshold and windows tuned for a quiet room; a
@@ -339,6 +373,15 @@ export default function App() {
     }
   }, [conversation, transcriptOpen]);
 
+  // Real "there's more below" scroll cue for every scrollable region in this
+  // small, fixed-size window - see useScrollFade above. Declared after the
+  // scroll-to-bottom effect above (same commit, same order) so this one
+  // reads the conversation panel's scrollTop only after it's already been
+  // moved to the bottom, not the stale pre-scroll value.
+  useScrollFade(bodyRef, null);
+  useScrollFade(activityRef, activity.length > 0);
+  useScrollFade(conversationRef, transcriptOpen);
+
   const decide = useCallback((approved) => {
     clientRef.current.send({ type: "approval_response", approved });
     setPendingApproval(null);
@@ -437,7 +480,7 @@ export default function App() {
           </div>
         )}
 
-        <div className="body">
+        <div className="body" ref={bodyRef}>
           {transcript && (
             <div className="transcript">
               <div className="caption">Heard</div>
@@ -506,7 +549,11 @@ export default function App() {
             </div>
           )}
 
-          {activity.length > 0 && <pre className="activity">{activity.join("\n")}</pre>}
+          {activity.length > 0 && (
+            <pre className="activity" ref={activityRef}>
+              {activity.join("\n")}
+            </pre>
+          )}
 
           {/* Hidden by default (see the toggle button in the header) - an
               extra block appended after everything else this state already

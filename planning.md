@@ -3111,3 +3111,71 @@ fold in busy states feels acceptable in practice, or whether the panel
 should be reordered earlier in `.body` (before the activity log) once
 there's a real sense of how often someone actually wants both open at
 once - a UX call, not a mechanical one.
+
+## Transcript panel fix: the panel takes priority when open, and a real scroll cue everywhere it was missing
+
+The "what's left" question above got answered directly by testing: landing
+below the fold was NOT acceptable - confirmed for real (`scrollHeight`/
+`clientHeight`/`offsetTop`) that in `doing` with a milestone list and the
+activity log both present, the conversation panel existed in the DOM but
+was genuinely not visible without already knowing to scroll, with no cue
+that anything was even down there. Two real fixes, not one patch:
+
+**1. The panel takes visual priority while open, by collapsing its two
+biggest competitors, not by resizing the window or restructuring `.body`.**
+`.stage[data-transcript="open"] .plan, .stage[data-transcript="open"]
+.activity { display: none; }` - the exact same binary show/hide idiom
+`.body`'s other per-`data-state` rules already use, just keyed on
+`data-transcript` instead of `data-state`. Deliberately only those two:
+the milestone list and the activity log are both "detail" views - useful,
+but secondary once someone has explicitly asked to see the conversation.
+The approval card, error banner, and failed/cancelled outcome cards are
+deliberately EXEMPT - those carry a real pending decision (Approve/Reject)
+or a safety-relevant result, and hiding either behind a UI preference
+toggle would be a real regression of the "honest terminal states" work
+elsewhere in this file, not just a style choice. Confirmed live: the
+`failed` state's red outcome card and the conversation panel both
+rendered fully, at the same time, with the milestone list correctly
+absent.
+
+**2. A real, live scroll-more cue - not a static decoration - reused
+everywhere a scroll affordance was weak, not just the new panel.** Checked
+`.activity`'s existing scroll treatment first, per the explicit ask: a 6px
+translucent scrollbar thumb, no fade, no other cue - genuinely easy to
+miss, especially since macOS commonly auto-hides scrollbars entirely by
+default. Rather than only fixing the new `.conversation` panel and leaving
+`.activity` with the same weak affordance, both (and `.body` itself, the
+outer container that actually had the original bug) got the same
+treatment: `useScrollFade` (`App.jsx`) tracks real `scrollHeight` /
+`clientHeight` / `scrollTop` via a scroll listener plus a `MutationObserver`
+(content growing inside a `max-height` container doesn't resize the
+container's own box, so a `ResizeObserver` on the element itself would
+never fire for that - confirmed this reasoning against the actual CSS
+before writing it, not assumed), and sets `data-scroll-more` on the
+element itself imperatively - not React state, since scroll fires far too
+often to route through a re-render. `styles.css` masks the element's own
+content to transparent at the bottom edge when that attribute is true
+(`mask-image`, not an opaque overlay trying to match `.glass`'s gradient
+background at one specific scroll position, which would only ever be
+correct there) - live and accurate, on only when there is genuinely more
+below, off exactly when scrolled to the real end.
+
+**Tested for real, in the exact scenario that found the bug, not inferred
+from the CSS alone:** drove the real app through a real hotkey-triggered,
+real-microphone Spotify command, and polled the live DOM until it actually
+caught `data-state="doing"` mid-flight (not a mock, not a guessed timing -
+a real poll loop against the running app). At that exact real moment: `.plan`
+and `.activity` both computed `display: none`; `.conversation` existed and
+was `display: flex`; and decisively, `.body`'s own `scrollHeight` and
+`clientHeight` were equal (104 === 104) with `data-scroll-more="false"` -
+proof, not inference, that there was zero overflow left and the panel
+needed no scrolling to see. Also re-confirmed, in the same live session,
+every scenario the original feature already passed still works after this
+change: default state unaffected (nothing in this fix fires outside
+`data-transcript="open"`/an actual overflow), toggling closed then open
+again preserved every turn accumulated across the whole session (including
+through a real failed Spotify attempt and a real completed reminder,
+verified by reading the turns back out of the live DOM by exact text), and
+a live screenshot of a real `failed` result showed the red outcome card and
+the conversation panel coexisting correctly with the milestone list
+properly absent.

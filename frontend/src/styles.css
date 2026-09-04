@@ -150,6 +150,25 @@ body {
   display: none;
 }
 
+/* The conversation panel takes visual priority while open - that's the
+   whole point of asking for it. In a content-heavy state (doing, with a
+   milestone list AND the activity log both already present) those two
+   blocks alone can be taller than this window's fixed .body height, which
+   pushed the actual conversation panel below the scroll fold with no cue
+   it was even there - a real bug, confirmed via scrollHeight/clientHeight/
+   offsetTop, not assumed. Fix is the same binary show/hide idiom already
+   used above for data-state, just keyed on data-transcript instead:
+   collapse the two bulkiest, most "detail" blocks so the panel actually
+   has room, rather than trying to squeeze everything in or make the window
+   itself taller. The approval card, error banner, and failed/cancelled
+   outcome cards are deliberately NOT in this list - those carry either a
+   real decision (Approve/Reject) or a safety-relevant outcome and must
+   never be hidden by a UI preference toggle. */
+.stage[data-transcript="open"] .plan,
+.stage[data-transcript="open"] .activity {
+  display: none;
+}
+
 /* ── Header row: orb, state label, hotkey hint, connection dot ── */
 
 .header {
@@ -389,6 +408,25 @@ body {
 .body::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.15);
   border-radius: 3px;
+}
+
+/* ── Scroll-more fade: one real, shared affordance for every scrollable
+      region in this window (.body itself, .activity, .conversation) - a
+      6px translucent scrollbar thumb alone was measured to be easy to miss
+      (this window is small, and macOS often auto-hides scrollbars
+      entirely), so this is the actual "there's more below" cue, not the
+      scrollbar. [data-scroll-more] is set imperatively by useScrollFade
+      (App.jsx) from real scrollHeight/clientHeight/scrollTop - live, not a
+      static decoration - so it's only ever on when there truly is more
+      content below the visible area, and turns off exactly when scrolled
+      to the real end. Masks the element's own rendered content to
+      transparent at the bottom edge (not an opaque overlay trying to match
+      .glass's gradient background at a given scroll position, which would
+      only ever be right for one exact background) so it looks correct
+      regardless of what's actually behind it. ── */
+[data-scroll-more="true"] {
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
+  mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
 }
 
 .body > * {
