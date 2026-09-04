@@ -2990,3 +2990,124 @@ call this pass can't make; everything mechanical (does it speak, does it
 say the right thing, does it avoid flavor where it shouldn't, does it
 avoid the mic-feedback problem, does it stay off Cloud Run) was verified
 for real above.
+
+## Chat-style transcript UI: hidden by default, reusing real transcript/TTS data
+
+Now that voice input and voice output are both real, there's an actual
+back-and-forth worth showing - a small toggle in the header reveals a
+scrollable conversation view; hidden by default so the overlay's normal
+pill/card presence is completely unchanged until someone asks for it.
+
+**Data model - reused, not duplicated, per the explicit ask:** a new
+`conversation` array in `App.jsx` accumulates `{role, text}` turns for the
+whole session, but captures nothing new. User turns come from the exact
+same `transcript` WebSocket event the single "Heard" quote block already
+renders (`case "transcript"` now also appends, right alongside the
+existing `setTranscript`). Jarvis turns come from the exact same `speak`
+event that drives real TTS (`case "speak"`, right alongside the existing
+`window.jarvis.speak(msg.text)` call) - which means a Jarvis turn is
+*already* the real, final, personality-flavored-where-applicable text that
+actually got spoken aloud, not a second copy of some other field
+(`agent_text`/`reply`) that might drift from what was really said.
+Deliberately never cleared by `beginCapture`'s existing per-command reset
+(`transcript`/`plan`/`reply`/etc. all still reset each command;
+`conversation` is the one piece of state meant to survive across all of
+them). No cross-session persistence, and none was needed: a fresh Electron
+launch is a fresh JS environment, so the array starts empty with zero code
+written to make that true - exactly the "don't overthink it" the request
+asked for.
+
+**UI - reuses the existing hover-revealed `.controls` chip, not a new
+pattern:** the toggle is a third `.winBtn` (a small inline SVG speech-
+bubble, `currentColor` so it inherits the same hover-color transition
+text glyphs already get) added to the same chip that already holds
+minimize/close - same size, same hover-reveal-on-`.glass:hover` behavior,
+same interaction language, just one more icon. Marked active via
+`aria-pressed`, styled with the identical background `.winBtn:hover`
+already uses, just not conditional on the pointer being over it.
+
+**Layering onto the existing state-driven morph, not fighting it:** when
+the panel is open, `.glass` takes on the SAME width/border-radius/padding
+values the "full card" states (doing/approving/done/failed/cancelled)
+already use - `.stage[data-transcript="open"] .glass` is one override rule
+using those exact existing numbers, riding the same `transition` already
+declared on `.glass`, so opening/closing reads as the same kind of morph a
+state change already produces, not a different animation system. This
+also answers the "does this work in idle/listening/thinking" question
+directly: those states are normally a narrow pill (236-360px, radius 999px)
+that would look wrong stretched wide with a chat panel inside a pill
+shape; the override forces the card shape regardless of which state is
+actually active, so the panel always sits in a properly-cornered container
+no matter what state opened it. The panel itself (`.conversation`) is an
+ordinary appended block inside the already-scrollable `.body` - not a
+special case requiring per-state visibility rules, since JSX conditional
+rendering (not CSS) already controls whether it exists at all. Turns are
+distinguished by a subtle background difference, not left/right bubble
+alignment (rejected as a genuinely new visual pattern in a container this
+narrow, per the explicit ask to avoid that): user turns reuse `.quote`'s
+existing italic treatment, Jarvis turns reuse the same inset-card language
+`.approval`/`.outcome` already use (`--inset-bg`/`--inset-border`). No new
+CSS variables, fonts, or spacing values anywhere in this feature - every
+token is one already defined in `:root` or reused wholesale from an
+existing block (`.caption` for the row labels, `.activity`'s scrollbar
+styling).
+
+**Tested for real, through the actual running app, not a mock:** a
+same-origin second WebSocket test client was tried first and produced
+nothing in the UI - a real, useful finding, not a dead end: `agent_server`
+sends `transcript`/`speak` to the *session that issued the command*, and a
+second client is a different session entirely, so the real app's own
+connection never saw those events. Confirms the design is correctly
+session-scoped, but meant testing had to go through the app's own trigger
+path, not a side channel. Also needed for the same reason blind pixel-
+coordinate clicking on the small (18px) toggle button proved unreliable
+(the exact category of problem this project already has a house style
+against, see the Spotify entries above) - a positioning collision with
+another app's floating widget wasted a few attempts before the fix
+(reposition the window, verified with `CGWindowListCopyWindowInfo`).
+Switched to Chrome DevTools Protocol (`--remote-debugging-port`,
+`--remote-allow-origins=*`) for deterministic `Runtime.evaluate`/`.click()`
+against the real DOM, and to the real global hotkey (via synthesized
+Cmd+Shift+Space, exactly the keystroke a user would press) plus real
+speech played through the speakers into the real microphone for two full
+voice commands, so what got tested was the actual capture -> STT ->
+pipeline -> TTS -> conversation-append path, not a shortcut around it:
+- Default state, confirmed via the real DOM: toggle button present,
+  `aria-pressed="false"`, `.conversation` absent entirely, `data-
+  transcript="closed"`, glass at its normal 236px idle width - the overlay
+  is unchanged until touched.
+- Clicked the real button via CDP: `.conversation` appeared, glass widened
+  to 436px/22px radius (the card shape, even while `data-state="idle"`),
+  showing "Nothing said yet this session." - confirmed both via the DOM
+  and a real screenshot.
+- Two full real voice commands, hotkey-triggered, spoken with `say`
+  through the speakers into the real mic ("create a reminder tomorrow at
+  9am...", "what is the capital of France") - the resulting conversation
+  array held all four turns in correct order, each one matching the real
+  transcript/spoken text exactly (including STT's real imperfection on the
+  first one, dropping a few words - an honest artifact of real speech
+  recognition, not a bug in this feature).
+- Toggled closed from the real `done` state mid-conversation, then ran a
+  second command while closed, then reopened - all four turns were still
+  there in order, confirming the panel's visibility and the underlying
+  data are genuinely independent (closing never clears anything).
+- The `idle` and `done` states cover the two distinct `.glass` sizing
+  branches that exist (pill states vs. card states) - both directly
+  confirmed morphing correctly with the panel open; every other state
+  falls into one of those same two branches with no state-specific
+  branching in the override rule itself, so this is real coverage of the
+  mechanism, not just two states out of eight.
+- A real, honest layout limitation surfaced by testing, not glossed over:
+  in a content-heavy state (`done`, with the heard-quote/capture-info/plan/
+  activity-log all already shown), the conversation panel can land below
+  `.body`'s own fold in this project's small, fixed-size window and need a
+  scroll to reach - confirmed via `scrollHeight`/`clientHeight`/
+  `offsetTop`, not assumed. This is consistent with how the activity log
+  already behaves in the same states (scroll for more), not a new problem
+  this feature introduces, so it was left as-is rather than restructured.
+
+**What's left, deliberately, for a real human:** whether landing below the
+fold in busy states feels acceptable in practice, or whether the panel
+should be reordered earlier in `.body` (before the activity log) once
+there's a real sense of how often someone actually wants both open at
+once - a UX call, not a mechanical one.

@@ -988,6 +988,32 @@ unchanged - this section is what wraps around it.
    (`main.js`) is what makes the in-page morphing read as the window itself
    changing shape - nothing outside the glass container ever paints.
 
+11. **Conversation transcript** - hidden by default, a toggle in `.controls`
+   (the same hover-revealed chip minimize/close already live in) reveals a
+   scrollable full-session history. No new capture path: user turns are
+   appended in the same `transcript` case that already sets the single
+   "Heard" quote, Jarvis turns in the same `speak` case that already
+   triggers real TTS (see step 9) - a Jarvis turn's text is the literal
+   string that got spoken, personality flavor included where it applied.
+   Held in a `conversation` array that `beginCapture`'s per-command reset
+   deliberately does not touch, so it survives across every command in the
+   session; nothing persists it across an app relaunch, and nothing needs
+   to; a fresh process is a fresh empty array.
+
+   Opening the panel forces `.glass` into the same width/radius/padding the
+   "full card" states already use, via a `data-transcript="open"` attribute
+   independent of `data-state` - so a pill state (idle/listening/thinking)
+   with the panel open still gets proper card corners instead of a
+   stretched pill, and the transition is the same one `.glass` already
+   declares, not a separate animation. The panel itself is just another
+   block appended inside the existing scrollable `.body`, shown or hidden
+   by React conditional rendering rather than a `data-state` CSS rule -
+   visible in every state the same way, including states that otherwise
+   show nothing else (idle/listening). Turns are told apart by a subtle
+   background difference, not chat-bubble alignment: user turns reuse
+   `.quote`'s italic style, Jarvis turns reuse the same inset-card look
+   `.approval`/`.outcome` already use - no new colors or spacing introduced.
+
 **Running it:**
 ```
 # terminal 1 - backend (agent server + browser bridge, one process)
