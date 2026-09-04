@@ -33,11 +33,22 @@ run wherever Python already runs). The consequence: the wake-word trigger
 can't use Electron's IPC (`jarvis:hotkey`) - it travels over this same
 WebSocket instead (`wakeword_detected` below), and the renderer calls the
 exact same `beginCapture(source)` convergence point the hotkey already
-uses. `_set_mic_active()` is the mic-handoff choke point - every renderer
-mic acquisition/release (hotkey- or wake-word-triggered, doesn't matter)
-reports through `mic_state`, and the wake-word listener is fully paused/
-resumed accordingly, so the two never contend for the microphone. Started
-only outside Cloud Run (see `_main()`) - no microphone exists there.
+uses. `_sync_wakeword_pause_state()` is the mic-handoff choke point - the
+wake-word listener is paused whenever EITHER the renderer holds the mic for
+a command capture (`mic_state`) OR the renderer is playing speech out loud
+(`tts_state`) - the latter guards against Jarvis's own voice, through the
+speakers, being picked up by its own wake-word mic and false-triggering or
+confusing detection. Resumed only once BOTH are false. Started only outside
+Cloud Run (see `_main()`) - no microphone exists there.
+
+Also decides what Jarvis actually says out loud for a completed command -
+see the `speak` message below and `_speak_text_for_*` - but does not run
+`say` itself. `say` is a macOS-only CLI with no Python binding, and (unlike
+wake word) speech playback needs to be tightly correlated with the
+renderer's own UI state for the future speaking indicator, so it runs in
+Electron's main process instead, driven by this server's WebSocket message
+the same way the browser bridge drives the extension - see planning.md for
+why this was verified, not just assumed, to be the right split.
 
 Protocol (JSON, one message per WebSocket frame):
 
@@ -53,6 +64,14 @@ Protocol (JSON, one message per WebSocket frame):
                                   regardless of trigger source - pauses/
                                   resumes the backend's own wake-word mic
                                   capture so the two never contend
+    {"type": "tts_state", "speaking": bool}   relayed from Electron main's
+                                  real `say` process lifecycle (via IPC to
+                                  the renderer, then here) - true while
+                                  audio is actually playing through the
+                                  speakers, false once it stops (finished
+                                  or interrupted). Also pauses/resumes the
+                                  wake-word listener, same reasoning as
+                                  mic_state - see module docstring above.
     {"type": "cancel"}
 
   server -> client
@@ -84,6 +103,15 @@ Protocol (JSON, one message per WebSocket frame):
     {"type": "wakeword_detected"}   "Hey Jarvis" heard - the renderer should
                                   start listening exactly as if the hotkey
                                   had just been pressed
+    {"type": "speak", "text": str}   sent once a command reaches a genuine
+                                  terminal state (done/failed/cancelled) -
+                                  the renderer should relay this to
+                                  Electron main (`window.jarvis.speak`) to
+                                  actually say it via `say -v Daniel`. Text
+                                  is already final: personality flavor (if
+                                  any - never on failed/cancelled/error) and
+                                  any trimming-for-speech already applied
+                                  here, not the renderer's job.
     {"type": "error", "message": str}
 """
 
@@ -92,6 +120,7 @@ import base64
 import json
 import logging
 import os
+import random
 import sys
 from http import HTTPStatus
 from typing import Any, Dict, Optional
@@ -142,6 +171,7 @@ _wakeword_listener: Optional[WakeWordListener] = None
 _wakeword_available = False
 _wakeword_reason: Optional[str] = None
 _mic_active = False  # true whenever ANY connected renderer currently holds the mic
+_tts_speaking = False  # true whenever ANY connected renderer is currently playing speech
 _WAKEWORD_MIC_ACK_TIMEOUT = 3.0  # seconds to wait for a mic_state ack before un-pausing anyway
 
 
@@ -150,21 +180,41 @@ async def _broadcast(payload: Dict[str, Any]) -> None:
         await session.send(payload)
 
 
-def _set_mic_active(active: bool) -> None:
-    """The one place mic ownership actually changes hands. Called both from
-    `mic_state` messages (every renderer capture, hotkey- or wake-word-
-    triggered) and from disconnect cleanup - the wake-word listener is
-    fully paused/resumed here, never left to infer state on its own."""
-    global _mic_active
-    _mic_active = active
+def _sync_wakeword_pause_state() -> None:
+    """The one place mic ownership actually changes hands. Wake word must
+    stay paused as long as EITHER reason to pause is true - two independent
+    callers (mic_state, tts_state) each flip one flag and call this rather
+    than calling pause()/resume() directly, so an overlap (e.g. speech
+    still finishing right as a new capture starts) can never cause one
+    caller to incorrectly resume what the other still needs paused.
+    """
     if _wakeword_listener is None:
         return
-    if active:
-        logger.info("agent server: renderer acquired the mic - pausing wake word")
+    should_pause = _mic_active or _tts_speaking
+    if should_pause:
         _wakeword_listener.pause()
     else:
-        logger.info("agent server: renderer released the mic - resuming wake word")
         _wakeword_listener.resume()
+
+
+def _set_mic_active(active: bool) -> None:
+    """Called from `mic_state` messages (every renderer capture, hotkey- or
+    wake-word-triggered) and from disconnect cleanup."""
+    global _mic_active
+    _mic_active = active
+    logger.info("agent server: renderer mic %s", "acquired" if active else "released")
+    _sync_wakeword_pause_state()
+
+
+def _set_tts_speaking(speaking: bool) -> None:
+    """Called from `tts_state` messages, relayed from Electron main's real
+    `say` process lifecycle. Guards against Jarvis's own voice, through the
+    speakers, being picked up by its own wake-word mic - see module
+    docstring."""
+    global _tts_speaking
+    _tts_speaking = speaking
+    logger.info("agent server: renderer %s speaking", "started" if speaking else "stopped")
+    _sync_wakeword_pause_state()
 
 
 def _on_wakeword_detected(score: float, loop: asyncio.AbstractEventLoop) -> None:
@@ -217,6 +267,76 @@ def start_wakeword_listener() -> None:
         logger.info("agent server: wake word listening for \"Hey Jarvis\"")
     else:
         logger.info("agent server: wake word unavailable - %s (hotkey still works)", _wakeword_reason)
+
+
+# -- What Jarvis actually says out loud -------------------------------------
+#
+# Deliberately separate from every other text this pipeline produces
+# (agent_text, reply, failed_goals' message) - those are written for a
+# transcript/UI a person reads, this is written for a person to HEAR, which
+# is a real, different constraint: reading the full plan or a technical
+# tool-failure string aloud is a wall of text, not a spoken confirmation.
+# This is also the ONLY place personality flavor ("Very well.", "Right
+# away.") is allowed to appear - never in the Orchestrator/Planner/Action
+# agents' own prompts or reasoning, so the flavor can be changed, disabled,
+# or A/B'd without touching anything that affects what Jarvis actually
+# does. And per the explicit rule: flavor is for action confirmations only
+# - never on errors, never on a question, never on failed/cancelled.
+
+_ACTION_CONFIRMATIONS = [
+    "Right away. All done.",
+    "Very well, that's complete.",
+    "Done - all set.",
+    "Consider it done.",
+]
+
+
+def _speak_text_for_done_plan() -> str:
+    """A real task (produced a plan, at least one milestone actually ran)
+    completed with every milestone verified. Deliberately does not read
+    the plan back milestone-by-milestone - that's what the transcript/plan
+    UI is for; this is the brief spoken confirmation, picked from a small
+    rotating set so it doesn't sound identical (and therefore obviously
+    canned) every single time."""
+    return random.choice(_ACTION_CONFIRMATIONS)
+
+
+def _speak_text_for_conversational(reply_text: str) -> str:
+    """The Orchestrator answered directly (no plan) - e.g. "2 plus 2 is 4."
+    This is already the actual answer, already short, and not a
+    confirmation that some real-world action happened - so it's spoken
+    verbatim, with no personality prefix (a flavor phrase in front of a
+    direct answer reads as a non sequitur, not an acknowledgment of
+    anything)."""
+    return reply_text.strip()
+
+
+def _speak_text_for_failed(failed_goals: list[dict]) -> str:
+    """A milestone ran but didn't verify. No personality flavor - this is
+    explicitly not an action confirmation. Prefers the Action agent's own
+    message when it has one, since that's often the single most important
+    thing to actually say out loud - e.g. a clarifying question it asked
+    instead of guessing at an ambiguous Spotify result (see planning.md) -
+    real content a person needs to hear and respond to, not boilerplate."""
+    messages = [g.get("message") for g in failed_goals if g.get("message")]
+    if messages:
+        return " ".join(messages)
+    return "I couldn't complete that."
+
+
+def _speak_text_for_cancelled(goal: str) -> str:
+    """An approval gate was rejected. No personality flavor - a rejected
+    action isn't something to sound pleased about completing."""
+    return f"Cancelled - {goal} was not done." if goal else "That was cancelled. Nothing was done."
+
+
+def _speak_text_for_error() -> str:
+    """An uncaught exception, not a normal tool-reported failure. No
+    personality flavor. Deliberately generic - the real exception string
+    is often technical (a stack-trace-adjacent message) and unsuitable to
+    read aloud verbatim; the full detail is still in the `error` event and
+    the activity log for anyone reading the transcript."""
+    return "Something went wrong completing that."
 
 
 class ClientSession:
@@ -302,6 +422,7 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
             if not approved:
                 logger.info("agent server: user REJECTED %r - not executing it", milestone.goal)
                 await session.send({"type": "state", "state": "cancelled", "goal": milestone.goal})
+                await session.send({"type": "speak", "text": _speak_text_for_cancelled(milestone.goal)})
                 return "rejected"
 
         ok, last_text = await run_action(action_runner, action_session.id, milestone, on_event=session.send)
@@ -316,9 +437,11 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
     if failed_goals:
         logger.info("agent server: run FAILED - milestones did not verify: %s", failed_goals)
         await session.send({"type": "state", "state": "failed", "failed_goals": failed_goals})
+        await session.send({"type": "speak", "text": _speak_text_for_failed(failed_goals)})
         return "failed"
 
     await session.send({"type": "state", "state": "done", "reason": "completed"})
+    await session.send({"type": "speak", "text": _speak_text_for_done_plan()})
     return "completed"
 
 
@@ -332,6 +455,17 @@ async def _handle_command(session: ClientSession, text: str) -> None:
     """
     plan_summary: Optional[str] = None
     success = False
+    reply_text: Optional[str] = None
+
+    async def _on_event(payload: Dict[str, Any]) -> None:
+        # Intercepts run_command's own `reply` event just to capture its
+        # text for speech - still forwarded to the client unchanged, this
+        # is not a substitute for that event.
+        nonlocal reply_text
+        if payload.get("type") == "reply":
+            reply_text = payload.get("text")
+        await session.send(payload)
+
     try:
         await session.send({"type": "state", "state": "thinking"})
 
@@ -339,12 +473,14 @@ async def _handle_command(session: ClientSession, text: str) -> None:
         orch_session = await orchestrator_runner.session_service.create_session(
             app_name=APP_NAME, user_id=USER_ID
         )
-        plan = await run_command(orchestrator_runner, orch_session.id, text, on_event=session.send)
+        plan = await run_command(orchestrator_runner, orch_session.id, text, on_event=_on_event)
 
         if plan is None:
             # Conversational input the Orchestrator answered itself - the
             # `reply` event was already emitted by run_command.
             await session.send({"type": "state", "state": "done", "reason": "conversational"})
+            if reply_text:
+                await session.send({"type": "speak", "text": _speak_text_for_conversational(reply_text)})
             return
 
         plan_summary = summarize_plan(plan)
@@ -357,6 +493,7 @@ async def _handle_command(session: ClientSession, text: str) -> None:
         logger.exception("agent server: command failed")
         await session.send({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
         await session.send({"type": "state", "state": "failed", "reason": "error"})
+        await session.send({"type": "speak", "text": _speak_text_for_error()})
     finally:
         if plan_summary is not None:
             # success reflects the real execution outcome ("completed"), not
@@ -441,6 +578,10 @@ async def agent_handler(websocket):
                 _set_mic_active(bool(data.get("active")))
                 continue
 
+            if msg_type == "tts_state":
+                _set_tts_speaking(bool(data.get("speaking")))
+                continue
+
             if msg_type in ("audio", "text"):
                 if session._task is not None and not session._task.done():
                     await session.send(
@@ -474,11 +615,13 @@ async def agent_handler(websocket):
     finally:
         session.cancel_pending()
         _connected_sessions.discard(session)
-        # A client that disconnects mid-capture must not leave wake word
-        # paused forever - same reasoning as _handle_wakeword_detected's
-        # timeout, just for the "the connection itself died" case.
+        # A client that disconnects mid-capture (or mid-speech) must not
+        # leave wake word paused forever - same reasoning as
+        # _handle_wakeword_detected's timeout, just for the "the connection
+        # itself died" case.
         if not _connected_sessions:
             _set_mic_active(False)
+            _set_tts_speaking(False)
 
 
 _HEALTH_BODY = '{"status": "ok", "service": "jarvis-agent"}\n'
