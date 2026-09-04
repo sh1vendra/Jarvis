@@ -18,7 +18,7 @@ from tools.mac_control import (
     search_spotify_candidates_tool,
     type_in_field_tool,
 )
-from tools.native_apps import create_calendar_event_tool
+from tools.native_apps import create_calendar_event_tool, create_note_tool
 from .verifier_callbacks import log_tool_result_callback
 
 action_agent = LlmAgent(
@@ -131,7 +131,13 @@ action_agent = LlmAgent(
         "create_reminder's due_date/due_time above - never compute dates "
         "yourself\n"
         "  - duration_minutes: only if a duration/end time was actually "
-        "mentioned - otherwise leave it unset and the default is used\n\n"
+        "mentioned - otherwise leave it unset and the default is used\n"
+        "- create_note: use this when the milestone is about a note "
+        "existing/being created (e.g. 'a note with the grocery list "
+        "exists'). Extract:\n"
+        "  - content: the note's actual body text\n"
+        "  - title: only if the user actually said one - otherwise leave "
+        "it unset and one is derived automatically\n\n"
         "For milestones about a web page in the browser (not a native Mac "
         "app), use these instead of open_app/click_ui/type_in_field:\n"
         "- navigate_to_url: use this when the milestone is about the browser "
@@ -167,6 +173,7 @@ action_agent = LlmAgent(
         type_in_field_tool,
         create_reminder_tool,
         create_calendar_event_tool,
+        create_note_tool,
         navigate_to_url_tool,
         find_web_element_tool,
         click_web_element_tool,

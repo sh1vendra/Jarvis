@@ -14,6 +14,7 @@ send_message's own docstring for why it's scoped narrower instead, and
 planning.md for the full investigation behind that scope decision.
 """
 
+import html
 import subprocess
 from datetime import timedelta
 
@@ -22,6 +23,8 @@ from google.adk.tools import FunctionTool
 from .mac_control import _applescript_date_lines, _parse_datetime, _require_macos
 
 _DEFAULT_CALENDAR = "Jarvis Test"
+_DEFAULT_NOTES_ACCOUNT = "iCloud"
+_DEFAULT_NOTES_FOLDER = "Jarvis Test"
 
 
 # --- create_calendar_event --------------------------------------------------
@@ -154,3 +157,154 @@ def create_calendar_event(
 
 
 create_calendar_event_tool = FunctionTool(create_calendar_event)
+
+
+# --- create_note -------------------------------------------------------------
+
+_NOTE_TITLE_MAX_LEN = 60
+
+
+def _derive_note_title(content: str) -> str:
+    """Notes derives a note's *displayed* name from its body's first line
+    when no explicit `name` property is given (confirmed directly) - but
+    create_note always sets `name` explicitly instead of relying on that,
+    so a note's title is deterministic. When the caller doesn't supply one,
+    this derives the same kind of title Notes itself would: the content's
+    first line, capped to a sane length."""
+    first_line = content.strip().splitlines()[0] if content.strip() else "Untitled Note"
+    if len(first_line) > _NOTE_TITLE_MAX_LEN:
+        first_line = first_line[:_NOTE_TITLE_MAX_LEN].rstrip() + "…"
+    return first_line
+
+
+def _notes_body_html(title: str, content: str) -> str:
+    """Builds Notes' HTML body: title as the first line, content below it,
+    real newlines converted to `<br>`. Content is HTML-escaped first since
+    Notes' `body` property is real HTML, not plain text - confirmed
+    directly this matters: an unescaped '<' or '&' in the note's own
+    content would otherwise be interpreted as markup instead of shown
+    literally."""
+    escaped_title = html.escape(title)
+    escaped_content = html.escape(content).replace("\n", "<br>")
+    return f"{escaped_title}<br>{escaped_content}"
+
+
+def _build_note_applescript(title: str, content: str, account: str, folder: str) -> str:
+    safe_account = account.replace('"', '""')
+    safe_folder = folder.replace('"', '""')
+    safe_title = title.replace('"', '""')
+    body_html = _notes_body_html(title, content).replace('"', '""')
+    return f'''
+tell application "Notes"
+    tell account "{safe_account}"
+        if not (exists folder "{safe_folder}") then
+            make new folder with properties {{name:"{safe_folder}"}}
+        end if
+        tell folder "{safe_folder}"
+            make new note with properties {{name:"{safe_title}", body:"{body_html}"}}
+        end tell
+    end tell
+end tell
+return "ok"
+'''
+
+
+def _verify_note_exists(title: str, content: str, account: str, folder: str) -> bool:
+    """Real read-back: queries the note's own rendered `plaintext` (Notes'
+    computed plain-text view of its HTML body, confirmed directly) and
+    checks the actual content is present in it - stronger than a title-only
+    match, since a stale note with a coincidentally matching title would
+    fail this check on content."""
+    safe_account = account.replace('"', '""')
+    safe_folder = folder.replace('"', '""')
+    safe_title = title.replace('"', '""')
+    script = f'''
+tell application "Notes"
+    tell account "{safe_account}"
+        tell folder "{safe_folder}"
+            try
+                return plaintext of note "{safe_title}"
+            on error
+                return ""
+            end try
+        end tell
+    end tell
+end tell
+'''
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        return False
+    content_stripped = content.strip()
+    return bool(content_stripped) and content_stripped in result.stdout
+
+
+def create_note(content: str, title: str | None = None, account: str = _DEFAULT_NOTES_ACCOUNT, folder: str = _DEFAULT_NOTES_FOLDER) -> dict:
+    """Creates a real note in the macOS Notes app.
+
+    Args:
+        content: The note's body text.
+        title: The note's title. If omitted, one is derived from content's
+            first line (the same way Notes itself would, if left to infer
+            it).
+        account: Which Notes account to use. Defaults to "iCloud" (this
+            Mac's default Notes account).
+        folder: Which folder to create it in. Defaults to "Jarvis Test"
+            (created automatically if it doesn't exist yet) so automated/
+            test notes stay out of the user's real folders - same
+            reasoning as create_reminder's "Jarvis Test" list.
+
+    Returns:
+        A dict with:
+            success: bool, True only if the note was independently
+                confirmed to exist (by title) with the given content
+                actually present (by reading its rendered text back) -
+                not just that the creation command didn't error
+            message: human-readable summary of what happened
+            error: the raw error string if something went wrong, else None
+    """
+    _require_macos()
+    real_title = title.strip() if title and title.strip() else _derive_note_title(content)
+
+    script = _build_note_applescript(real_title, content, account, folder)
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "success": False,
+            "message": "osascript timed out - Notes may be waiting on a permission dialog.",
+            "error": str(exc),
+        }
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if "-1743" in stderr or "not authorized" in stderr.lower():
+            return {
+                "success": False,
+                "message": (
+                    "macOS denied automation access to Notes. Grant it under "
+                    "System Settings -> Privacy & Security -> Automation, then "
+                    "allow this process to control Notes, and try again."
+                ),
+                "error": stderr,
+            }
+        return {"success": False, "message": "osascript failed while creating the note.", "error": stderr}
+
+    if not _verify_note_exists(real_title, content, account, folder):
+        return {
+            "success": False,
+            "message": (
+                f"osascript reported no error creating note '{real_title}' but its content could "
+                f"not be confirmed on read-back in folder '{folder}' - treating this as not "
+                "actually created."
+            ),
+            "error": "verify_failed",
+        }
+
+    return {
+        "success": True,
+        "message": f"Created note '{real_title}' in folder '{folder}', confirmed by reading its content back.",
+        "error": None,
+    }
+
+
+create_note_tool = FunctionTool(create_note)
