@@ -80,7 +80,14 @@ body {
 /* Morph targets per state: pill when idle/listening/thinking, card once
    there is real content to show. */
 .stage[data-state="idle"] .glass {
-  width: 236px;
+  /* Widened from 236px - real, measured overflow (see planning.md):
+     header content needed 288px against 194px available at 236px, with
+     the state label crushed to 0 width (flex min-width:auto resolves to 0
+     once overflow:hidden is set for its own ellipsis truncation - the row
+     absorbed the shortfall entirely there) and the controls chip clipped
+     completely outside .glass's bounds. Confirmed via the real running
+     app, not assumed. */
+  width: 400px;
   border-radius: 999px;
   padding: 10px 20px;
 }
@@ -305,6 +312,44 @@ body {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* ── Voice-activity dot: which direction audio is flowing, right now ──
+   Sits immediately after .orb, not grouped with the wakeword/conn pair -
+   those are system-status dots (is wake word available, is the backend
+   reachable); this is real-time activity, the same category .orb already
+   is, just a fact .orb alone can't carry (nothing in data-state means
+   "Jarvis is speaking" - that's TTS playback, which can happen during
+   done/failed/cancelled just as easily as any other state). Three real
+   states, mutually exclusive by construction (see App.jsx's voiceActivity):
+   dim/muted = neutral (matches .wakeword's own neutral tone, for the same
+   "nothing wrong, just nothing happening" reason), red = user's mic is
+   open (same red .orb already uses for data-state="listening" - one
+   color, one meaning, throughout this UI), blue = Jarvis is speaking
+   (same blue .orb already uses for data-state="doing" - "Jarvis is
+   producing something"). Reuses the existing breathe keyframe rather than
+   a new animation - only animates while actually active, not while
+   neutral, so it doesn't compete for attention when nothing is happening. */
+
+.voiceActivity {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.18);
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.voiceActivity[data-voice="user"] {
+  background: var(--accent-red);
+  box-shadow: 0 0 6px rgba(255, 69, 58, 0.6);
+  animation: breathe 1s ease-in-out infinite;
+}
+
+.voiceActivity[data-voice="jarvis"] {
+  background: var(--accent-blue);
+  box-shadow: 0 0 6px rgba(10, 132, 255, 0.6);
+  animation: breathe 1s ease-in-out infinite;
 }
 
 /* ── Wake-word dot: same shape as .conn, sits just before it ──

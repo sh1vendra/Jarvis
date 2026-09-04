@@ -408,12 +408,27 @@ export default function App() {
   // backend's pause/resume, so this side already knows the same thing.
   const wakewordStatus = !wakeWord.available ? "unavailable" : state === "listening" ? "paused" : "listening";
 
+  // The voice-activity indicator - reuses the two real signals already
+  // tracked for mic/TTS coordination, doesn't introduce a third. "user":
+  // state === "listening" is exactly "the renderer's mic is open right
+  // now", true regardless of trigger (hotkey or wake word) - the same fact
+  // that already drives the mic_state(active=true) send above. "jarvis":
+  // `speaking` is the same real `say` process lifecycle that already
+  // drives tts_state. Checking "user" first makes the two mutually
+  // exclusive by construction in the display itself, not just by relying
+  // on the backend's own pause/resume guarantee (agent_server.py's
+  // _sync_wakeword_pause_state) - belt and suspenders, since the hotkey
+  // path's speech-interrupt-on-new-capture (main.js) has a real, if brief,
+  // async gap between killing an in-progress `say` and its close event
+  // actually reporting speaking:false.
+  const voiceActivity = state === "listening" ? "user" : speaking ? "jarvis" : "neutral";
+
   return (
     <div
       className="stage"
       data-state={state}
       data-wakeword={wakewordStatus}
-      data-speaking={speaking}
+      data-voice={voiceActivity}
       data-transcript={transcriptOpen ? "open" : "closed"}
     >
       <div className="glass">
@@ -428,6 +443,17 @@ export default function App() {
             `no-drag`, is what makes them clickable. See planning.md. */}
         <div className="header">
           <span className="orb" />
+          <span
+            className="voiceActivity"
+            data-voice={voiceActivity}
+            title={
+              voiceActivity === "user"
+                ? "listening to you"
+                : voiceActivity === "jarvis"
+                  ? "Jarvis is speaking"
+                  : "no audio flowing"
+            }
+          />
           <span className="stateLabel">{STATE_LABEL[state] || state}</span>
           {state === "idle" && (
             <span className="hint">{wakeWord.available ? '⌘⇧Space · “Hey Jarvis”' : "⌘⇧Space"}</span>
