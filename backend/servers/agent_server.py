@@ -137,6 +137,7 @@ from agents.orchestrator import orchestrator_agent  # noqa: E402
 from agents.planner import MilestonePlan  # noqa: E402
 from main import APP_NAME, USER_ID, run_action, run_command, summarize_plan  # noqa: E402
 from memory import store as memory_store  # noqa: E402
+from tools import setup_checks  # noqa: E402
 from voice.stt import TranscriptionError, transcribe_audio  # noqa: E402
 from voice.wakeword import WakeWordListener  # noqa: E402
 
@@ -541,6 +542,40 @@ async def _transcribe(session: ClientSession, data: Dict[str, Any]) -> Optional[
     return transcript
 
 
+# Ordered exactly as the setup screen shows them. Each entry is a no-arg
+# callable returning either one result dict or (for automation) a list of
+# them - kept as real functions from tools/setup_checks.py, not
+# reimplemented here, so the server and any future CLI/test caller see the
+# identical, real check.
+_SETUP_CHECK_STEPS = [
+    setup_checks.check_google_api_key,
+    setup_checks.check_accessibility,
+    setup_checks.check_screen_recording,
+    setup_checks.all_automation_checks,
+    setup_checks.check_browser_extension,
+]
+
+
+async def _run_setup_checks(session: "ClientSession") -> None:
+    """Runs every backend-side setup check and streams each real result to
+    the client as soon as it's known - not one batched response - so the
+    setup screen can show live checking/passed/failed per row instead of a
+    single freeze-then-reveal.
+
+    Each check does real, potentially slow I/O (a network call to Gemini,
+    several `osascript` subprocess calls) - run off the event loop via the
+    default executor so a slow check doesn't stall wakeword/other clients
+    sharing this same asyncio loop.
+    """
+    loop = asyncio.get_running_loop()
+    for step in _SETUP_CHECK_STEPS:
+        result = await loop.run_in_executor(None, step)
+        results = result if isinstance(result, list) else [result]
+        for r in results:
+            await session.send({"type": "setup_check_result", **r})
+    await session.send({"type": "setup_checks_complete"})
+
+
 async def agent_handler(websocket):
     logger.info("agent server: UI client connected")
     session = ClientSession(websocket)
@@ -572,6 +607,10 @@ async def agent_handler(websocket):
             if msg_type == "cancel":
                 session.cancel_pending()
                 await session.send({"type": "state", "state": "idle", "reason": "cancelled"})
+                continue
+
+            if msg_type == "run_setup_checks":
+                asyncio.create_task(_run_setup_checks(session))
                 continue
 
             if msg_type == "mic_state":
