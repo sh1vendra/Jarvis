@@ -2430,3 +2430,117 @@ settled before any scoping plan is proposed:**
 changes, nothing wired into `main.py` or `agent_server.py`. The four
 questions above are exactly what a scoping session needs to resolve before
 writing anything - deliberately left open rather than guessed at here.
+
+---
+
+## Agentic Spotify result selection: reading is solved, keyboard selection is not - real investigation, decision needed
+
+**Context.** `play_spotify_track` (see the two entries above) resolves a
+query via the Spotify Web API and plays the resulting URI by AppleScript -
+reliable, but the Web API's `/search` is blocked for this account (Free
+tier / new-app restrictions confirmed directly, not assumed: unauthenticated
+search -> 401, client-credentials without real keys -> `invalid_client`,
+the unofficial anonymous-token endpoint -> 403 blocked). Falling back to
+Spotify's own in-app search means Spotify's own ranking picks the track -
+which is wrong exactly when the query is genuinely ambiguous (a cover vs.
+the original, a live version, a remix). The ask: read the visible
+candidates, have the Action agent reason about which one actually matches
+the request, then select *that one* - still without pixel-coordinate
+clicking, preserving the reliability lesson from the AppleScript fix.
+
+**What was actually tested, live, on this Mac - not assumed:**
+
+1. **Accessibility API: re-confirmed empty, this time with a real window
+   open** (earlier sessions found `get_ui_tree` returning 0 elements, but
+   Spotify had no open window at all at that point - an unfair test). With
+   Spotify genuinely frontmost and a real 800x600 window (`AXWindows`
+   count: 1), `get_ui_tree('Spotify')` still returns **0 elements**, and a
+   raw, unfiltered `AXUIElementCopyAttributeValue` walk with a real error
+   code (not just an empty result) confirms it: `AXWindows` returns
+   `SUCCESS` with an empty array. The window *shell* is exposed; nothing
+   inside it is. Not viable for reading results.
+
+2. **Vision on a scoped screenshot: works well.** `capture_region` on just
+   the Spotify window (not a full-screen capture - see the safety note
+   below) reads track names, artists, and media-type labels cleanly. Real
+   test case: searching "Mad World" surfaces exactly the ambiguity this
+   feature exists for - Spotify's own top result is **Gary Jules'
+   cover** ("Song - Gary Jules, Michael...", the one used in *Donnie
+   Darko*), with **Tears For Fears' original** appearing lower in the
+   list as "Music video - Tears For Fears," alongside unrelated matches
+   (a Riverdale cast cover, two Sickick tracks). A human/LLM reading this
+   list can trivially tell these apart; Spotify's own ranking picked the
+   cover.
+
+3. **Keyboard navigation through the results: tested directly, does not
+   work.** The pre-submit autocomplete dropdown visibly labels itself
+   "↑↓ Navigate / Enter Search," which reads promising - but that hint
+   applies only to the small autocomplete list, not the real results.
+   Once a search is submitted (Return) and the actual results page is
+   showing:
+   - Down-arrow, tested 3x in sequence with a screenshot after each press,
+     produced **zero visible change** - confirmed by pixel-diffing the
+     before/after screenshots (grayscale), not eyeballing: max pixel
+     delta 178 out of 255, 160 changed pixels out of 1.92M (0.008%,
+     consistent with a UI animation flicker, not a state change).
+   - Tab *does* do something - it draws a focus ring, but around the
+     *entire results panel as one region* (confirmed visually and by a
+     real pixel diff showing ~9600 changed pixels, concentrated in a
+     border outline, not a moving highlight). A second Tab would move to
+     the *next* panel/landmark, not descend into individual rows.
+   - With that panel now holding keyboard focus, Down-arrow was tested
+     again - still no per-row highlight change.
+   - Conclusion: Spotify's results page is a normal scrollable web-style
+     page with one focusable region, not a native listbox with a keyboard
+     selection cursor. There is no way, found or evident, to move a
+     keyboard selection onto a specific non-top result and activate it
+     without a mouse/pixel click.
+
+**A real safety note from this investigation, unrelated to Spotify
+specifically:** an early, careless `capture_screenshot()` call (full
+display, not scoped to Spotify's window) captured the live contents of
+this machine's actual foreground window at that moment - which turned out
+to be the IDE and this very conversation, not Spotify (Spotify's window
+was, at that moment, not actually on screen despite macOS reporting it as
+the frontmost app - a real "frontmost app" vs. "visually on screen"
+divergence, confirmed via `CGWindowListCopyWindowInfo`, the window-server
+list, returning zero on-screen windows for Spotify at the time). That
+screenshot was not re-shared or described further. Practical fix applied
+for the rest of this investigation: capture only the target app's own
+window region (`capture_region`, bounds taken from `CGWindowListCopyWindowInfo`,
+not from AX which was already known to be blind here) - never a
+full-display screenshot - and confirm the window is actually on screen
+(non-empty `CGWindowListCopyWindowInfo` result) before capturing anything.
+This is a real hardening `mac_control.py`'s existing `capture_screenshot`
+path should probably pick up generally, not just for this feature.
+
+**The decision this leaves open - genuinely a fork, not decided here:**
+since a specific, agent-chosen *non-top* result cannot be activated by
+keyboard, the only two honest options are:
+- **(A) Keep accepting Spotify's own top result** (today's de facto
+  behavior) - preserves the no-pixel-clicking reliability guarantee
+  completely, but does not actually solve the ambiguity problem this
+  entry set out to solve: Jarvis would still play Gary Jules over Tears
+  For Fears whenever Spotify's ranking says so.
+  - a partial middle ground worth naming: the agent could still *read and
+    reason* about the candidate list and, if the top result looks wrong,
+    *say so out loud / ask the user* rather than silently playing it -
+    clarification instead of either guessing or clicking. That's a
+    smaller, self-contained piece of this that doesn't need a click at
+    all, and would compose with the (separately deferred) conversational
+    clarification entry above.
+- **(B) Reintroduce a coordinate click, but a verified, targeted one** -
+  the agent identifies which candidate is correct from a real vision read
+  (not a blind fixed offset the way the old ~1/3-reliable path guessed),
+  clicks that specific row/play button's real screen position, then
+  verifies via `_spotify_player_state()` exactly as `play_spotify_track`
+  already does. This is a real improvement over the old approach (the
+  target is chosen from actual content, not assumed to always be in the
+  same place) but it does not remove the fundamental risk that got that
+  path into trouble - a click can still land wrong, and would need the
+  same before/after verification discipline as everything else in this
+  project, plus real hit-rate testing (5x+) before being trusted the way
+  AppleScript-by-URI now is.
+
+Neither was built. Per the explicit ask that came with this investigation,
+this is reported for a decision, not decided unilaterally.
