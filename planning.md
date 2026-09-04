@@ -2264,3 +2264,107 @@ still captures audio end to end** (`recording at 24000 Hz [triggered by
 hotkey]` -> `captured 65280 samples, peak 3845 [stopped by hotkey]` ->
 sent to backend). The "say 'Jarvis', watch it start listening" test is the
 user's, once the key is in place.
+
+---
+
+## Spotify playback moves from pixel-clicking to the Web API + AppleScript
+
+**The regression test failed the Spotify command outright.** `play_spotify_track`
+replaces the `type_in_field` + `click_ui` path for playing a specific
+track. That path typed into Spotify's search box and clicked the "Top
+result" card at a hardcoded window-offset - which this project's own notes
+already grade at ~1/3 reliability ("systematic bias, not per-image
+imprecision", "confidently and repeatably wrong"). It never should have
+survived past the demo.
+
+**Why this is the right fix, not a patch.** Spotify has a real scripting
+API. `tell application "Spotify" to play track "spotify:track:<uri>"` starts
+a track deterministically - verified directly: instant, no window focus
+needed, launches Spotify itself if closed. The *only* thing the pixel path
+was actually doing was turning a query string ("Billie Jean by Michael
+Jackson") into a URI, and the Spotify Web API's `/search` endpoint does
+exactly that. So `play_spotify_track`:
+1. gets a client-credentials token (`SPOTIFY_CLIENT_ID` /
+   `SPOTIFY_CLIENT_SECRET` from `.env` - search needs no user context, so
+   no OAuth redirect dance),
+2. `/search?type=track&limit=1` -> the track's `spotify:` URI,
+3. `osascript` `play track "<uri>"`,
+4. reads Spotify's **real `player state`** back and confirms it's `playing`
+   the resolved track - the same "verify against real state, don't trust
+   the dispatch" pattern used everywhere else.
+
+The Action agent instruction now routes any "a specific song is playing"
+milestone to this tool and explicitly forbids `type_in_field`/`click_ui`
+for Spotify search; the Planner makes it a single milestone (the tool
+launches Spotify, so no separate "Spotify is open" step).
+
+**Permissions this removes for the Spotify path** (confirmed, not assumed -
+the regression re-run showed `play_spotify_track` as the only tool called):
+- **Screen Recording**: gone. The click path fell through to
+  `capture_screenshot`/`capture_region` for vision targeting and pixel-diff
+  verification. `play_spotify_track` takes no screenshots.
+- **Accessibility**: gone for this path. The click path posted CGEvents
+  (`_dispatch_click`), which needs Accessibility. AppleScript `play track`
+  does not.
+- Still needs **Automation -> Spotify** (the AppleScript `tell`), which
+  `_spotify_player_state` already required. Net: fewer prompts, not more.
+
+**Cost.** One more pair of `.env` keys (a free app at developer.spotify.com,
+2 minutes, no redirect URI). Without them the tool returns a clear
+`spotify_not_configured` failure - which, usefully, is exactly the honest
+tool-failure the next entry's UI was tested against.
+
+---
+
+## An honest failure state: "done" must mean it actually worked
+
+**The regression test caught the integrity hole.** When Spotify's clicks
+failed, the pipeline still emitted `state: done, reason: completed` and
+memory logged `success=True`. Two real tool failures, no music playing, and
+every surface reported success. For a project whose entire thesis is
+"verify, don't trust self-reports," that's the worst possible bug - the
+system lying to the user in the same way it's built to stop the *agent*
+from lying to *it*.
+
+**Root cause.** "Done" was defined as "the pipeline function returned
+without raising." A tool returning `{"success": false}` is not an
+exception, so it sailed straight through. The pipeline had exactly two
+terminal states - `done` and `error` (uncaught exception) - and nothing in
+between for "it ran, it just didn't work."
+
+**Fix - the real execution outcome propagates end to end:**
+- `run_action` now returns a `bool`: True only if the milestone's *last*
+  tool call reported `success: true`. A last-tool failure, or no tool
+  called at all, is False. (Last-tool, not any-tool, so a tool that fails
+  and is then successfully retried still counts as OK.)
+- `run_milestones_until_approval` / `run_plan_with_approval_gate` /
+  `_run_plan` aggregate those bools. Any failed milestone makes the whole
+  run's outcome `"failed"`.
+- Terminal states are now four, not two: `done` (every milestone verified),
+  `failed` (a milestone's tools didn't verify), `cancelled` (user rejected
+  an approval gate - the step never ran), and an uncaught exception now
+  lands in `failed` too, not a separate silent `done/error`.
+- **Memory**: `command_history.success` is written from the run outcome
+  (`outcome == "completed"`), not from "the pipeline didn't crash." A run
+  where the Action agent's own tools failed logs `success=False`. Verified:
+  the no-creds Spotify command logs `success=False`; a real reminder logs
+  `success=True`; a rejected Kayak gate logs `success=False`.
+
+**Why this is architectural, not cosmetic.** The approval gate, the
+generation-based browser verification, the AX-value read-back, the
+pixel-diff-before-vision ordering - every one of those exists so a *failure
+is visible as a failure*. A terminal state that collapses failure into
+success defeats all of them at the last step. The UI treatment (a distinct
+red "Jarvis couldn't complete this" card listing the milestones that
+didn't verify; a neutral "Cancelled - nothing was done" card for a rejected
+gate) is downstream of that - it's just making the honest signal legible.
+
+**Verified for real** (driving the running Electron renderer via its own
+WebSocket, checking computed DOM state):
+- Spotify-with-no-creds -> `state: failed`, red orb, card lists "Billie
+  Jean ... is playing in Spotify" as the milestone that failed, memory
+  `success=False`.
+- Kayak with the gate rejected -> `state: cancelled`, neutral orb, card
+  names the step that was refused, memory `success=False`.
+- A real reminder -> `state: done`, green orb, no failure card, memory
+  `success=True`, reminder actually created. No regression.

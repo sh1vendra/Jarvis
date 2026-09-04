@@ -139,10 +139,10 @@ milestone reads "the destination Austin, Texas is entered".
 
 ## 4. Action agent's tool selection and execution loop
 
-`agents/action.py` defines `action_agent`, given eight tools -
-`open_app_tool`, `click_ui_tool`, `type_in_field_tool`,
-`create_reminder_tool` (native macOS control, from `tools/mac_control.py`)
-plus `navigate_to_url_tool`, `find_web_element_tool`,
+`agents/action.py` defines `action_agent`, given nine tools -
+`open_app_tool`, `play_spotify_track_tool`, `click_ui_tool`,
+`type_in_field_tool`, `create_reminder_tool` (native macOS control, from
+`tools/mac_control.py`) plus `navigate_to_url_tool`, `find_web_element_tool`,
 `click_web_element_tool`, `type_in_web_field_tool` (browser control, from
 `tools/browser_tools.py`, see section 8). It receives one milestone goal
 per turn (driven by
@@ -154,10 +154,20 @@ milestone 2 ("Billie Jean is playing") is still about Spotify without
 being told again.
 
 The instruction maps milestone shape to tool choice: "app open/foreground"
--> `open_app`; "something clicked" -> `click_ui` (requires
-`expected_app_name`); "text entered" -> `type_in_field` (same requirement);
-"reminder exists" -> `create_reminder` (extracts `task`/`due_date`/
-`due_time` as plain text, no manual date computation by the model);
+-> `open_app`; **"a specific song/track/artist is playing in Spotify"
+-> `play_spotify_track(query)`** - resolves the query to a `spotify:` URI
+via the Spotify Web API, plays it with AppleScript `play track`, verifies
+against Spotify's real `player state`. This *replaces* the old
+`type_in_field` + `click_ui` search-and-click path (documented at ~1/3
+reliability, and it failed the regression test); the instruction explicitly
+forbids `click_ui`/`type_in_field` for Spotify search, and the Planner
+makes it a single milestone (the tool launches Spotify itself). Needs
+`SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`; without them the tool returns a
+clear failure and the run ends `failed` (section 10). "something clicked"
+-> `click_ui` (requires `expected_app_name`); "text entered" ->
+`type_in_field` (same requirement); "reminder exists" -> `create_reminder`
+(extracts `task`/`due_date`/`due_time` as plain text, no manual date
+computation by the model);
 "browser is open at a website" (e.g. "Google Chrome is open with
 www.kayak.com loaded") -> `navigate_to_url`, with the agent turning a site
 name into a URL itself (Kayak -> `https://www.kayak.com`) - this is always
@@ -773,9 +783,13 @@ unchanged - this section is what wraps around it.
    `on_event` callback (defaulting to `None`, so CLI behavior is unchanged),
    which the server passes to forward each pipeline event to the UI:
    `plan`, `milestone_start`, `tool_call`, `tool_result`,
-   `milestone_done`, `agent_text`, `reply`. `tool_result` carries the
-   **tool's own `success` field**, never the agent's summary of it - the
-   same "don't trust the self-report" rule the rest of the system runs on.
+   `milestone_done` (now carrying `success`), `agent_text`, `reply`.
+   `tool_result` carries the **tool's own `success` field**, never the
+   agent's summary of it - the same "don't trust the self-report" rule the
+   rest of the system runs on. `run_action` returns a bool per milestone
+   (True only if its *last* tool reported `success: true`); the plan loop
+   aggregates those, and any failed milestone makes the run's outcome
+   `failed` rather than `completed`.
 
    The pipeline runs as a separate `asyncio.Task`, not awaited inline in the
    message loop. Inline, the handler would stop reading messages while the
@@ -792,22 +806,38 @@ unchanged - this section is what wraps around it.
    `asyncio.Future`. `App.jsx` renders Approve/Reject (clickable, or Enter /
    Escape) and sends `{type: "approval_response", approved}`, which resolves
    the Future. On **reject the milestone is never executed at all** and the
-   run ends with `{state: "done", reason: "rejected"}`. A client that
-   disconnects mid-gate resolves the Future as a rejection, so the pipeline
-   unwinds rather than hanging forever.
+   run ends with `{state: "cancelled", goal: <the refused step>}`. A client
+   that disconnects mid-gate resolves the Future as a rejection, so the
+   pipeline unwinds rather than hanging forever.
 
-8. **UI state** (`src/App.jsx` + `src/styles.css`). A state machine -
-   `idle`, `listening`, `thinking`, `doing`, `approving`, `done` - driven
-   entirely by server messages after the audio is sent. Everything before
-   that (`idle` -> `listening`) is local to the renderer. All visual design
+8. **Terminal states - four, not two** (`agent_server._run_plan` /
+   `_handle_command`). `done` (`reason: completed`) means *every* milestone's
+   tools verified. `failed` (`{state: "failed", failed_goals: [...]}`) means
+   a milestone ran but its tools reported `success: false` - it is never
+   silently shown as `done` (that was a real integrity bug the regression
+   test caught; see planning.md). `cancelled` is a rejected approval gate.
+   An uncaught exception also lands in `failed` now, not a separate silent
+   state. `command_history.success` (section 11) is written from this
+   outcome - `success == "completed"` - so a run whose tools failed logs
+   `success=False`.
+
+9. **UI state** (`src/App.jsx` + `src/styles.css`). A state machine -
+   `idle`, `listening`, `thinking`, `doing`, `approving`, `done`, `failed`,
+   `cancelled` - driven entirely by server messages after the audio is
+   sent. `failed` paints a red orb and a "Jarvis couldn't complete this"
+   card listing the milestones that didn't verify; `cancelled` paints a
+   neutral "Cancelled - nothing was done" card naming the refused step.
+   Everything before the send (`idle` -> `listening`) is local to the
+   renderer. All visual design
    lives in `src/styles.css`, keyed off a `data-state` attribute `App.jsx`
    sets on its root element: the glass container morphs between a compact
    pill (idle/listening/thinking) and a full card (doing/approving/done),
    and per-state CSS rules decide which content blocks are visible, so the
-   component body carries no presentation logic. The whole glass surface is
-   the window's drag region; every interactive element (window controls,
-   approval buttons, the scrollable activity log) opts back out with
-   `-webkit-app-region: no-drag`. The transparent, fixed-size window
+   component body carries no presentation logic. The `.header` row is the
+   window's drag region (not the whole glass - an absolutely-positioned
+   `no-drag` child doesn't carve itself out on macOS; see planning.md), and
+   the window controls live in it as normal-flow `no-drag` children. The
+   transparent, fixed-size window
    (`main.js`) is what makes the in-page morphing read as the window itself
    changing shape - nothing outside the glass container ever paints.
 
@@ -841,13 +871,16 @@ owns the whole command, not by `run_command`:
 - CLI voice path: `main.run_spoken_command`, in a `try/finally` around
   `run_plan_with_approval_gate`.
 - Electron path: `agent_server._handle_command`, in a `finally`, using the
-  `"completed"` / `"rejected"` return from `_run_plan`.
-- Typed regression: one `log_command` call after each demo command.
+  `"completed"` / `"rejected"` / `"failed"` return from `_run_plan`.
+- Typed regression: one `log_command` call after each demo command, passing
+  the real `run_plan_with_approval_gate` outcome.
 
-`success` = ran end to end with no exception and no rejection. A conversational
-input that never produced a plan is not logged (nothing was executed). A soft
-tool failure (a tool returning `success: false` without raising) is currently
-still logged as success - a documented Tier 1 limitation.
+`success` = the run's outcome was `"completed"`, i.e. every milestone's own
+tools verified. A run where a tool reported `success: false` (no exception),
+or where the user rejected an approval gate, logs `success=False` - the
+"soft tool failure logged as success" gap the regression test caught is
+fixed (see section 8, planning.md). A conversational input that never
+produced a plan is not logged (nothing was executed).
 
 **`preferences(key, value, updated_at)`** - explicit user-stated facts, set by
 hand for now: `python -m memory.set_preference "default_flight_destination"
