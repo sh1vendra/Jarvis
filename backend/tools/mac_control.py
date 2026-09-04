@@ -800,6 +800,190 @@ def _spotify_playback_changed(before: dict | None, after: dict | None) -> bool:
     return started_playing or track_changed
 
 
+# --- play_spotify_track: Spotify Web API search + AppleScript play ---------
+#
+# Replaces the click_ui/type_in_field path for playing a specific track.
+# That path drove Spotify's search box and clicked the "Top result" card at
+# a fixed pixel offset - which planning.md documents as ~1/3 reliable
+# ("systematic bias, not per-image imprecision") and which failed outright
+# in the regression test. Spotify has a real scripting API: once we have a
+# `spotify:track:...` URI, `tell application "Spotify" to play track "<uri>"`
+# starts it deterministically (verified: instant, no window focus needed,
+# launches Spotify itself). The only thing pixels were buying us was
+# resolving a query string to a URI - which the Spotify Web API's /search
+# endpoint does exactly, so that's what we use.
+
+import base64 as _base64
+import urllib.error as _urlerror
+import urllib.parse as _urlparse
+import urllib.request as _urlrequest
+
+_SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+_SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
+# Client-credentials tokens last 3600s; cache and refresh a minute early.
+_spotify_token_cache: dict = {"token": None, "expires_at": 0.0}
+
+
+def _spotify_access_token() -> tuple[str | None, str | None]:
+    """Client-credentials token for the Spotify Web API (search only - no
+    user context). Needs SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET in the
+    environment (create a free app at developer.spotify.com; no redirect URI
+    needed for this grant). Returns (token, error)."""
+    now = time.time()
+    if _spotify_token_cache["token"] and now < _spotify_token_cache["expires_at"]:
+        return _spotify_token_cache["token"], None
+
+    client_id = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        return None, "spotify_not_configured"
+
+    basic = _base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    req = _urlrequest.Request(
+        _SPOTIFY_TOKEN_URL,
+        data=b"grant_type=client_credentials",
+        headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with _urlrequest.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+    except _urlerror.HTTPError as exc:
+        return None, f"spotify_auth_failed ({exc.code})"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"spotify_auth_error ({exc})"
+
+    token = payload.get("access_token")
+    if not token:
+        return None, "spotify_auth_no_token"
+    _spotify_token_cache["token"] = token
+    _spotify_token_cache["expires_at"] = now + int(payload.get("expires_in", 3600)) - 60
+    return token, None
+
+
+def _spotify_search_track(query: str, token: str) -> tuple[dict | None, str | None]:
+    """First track match for `query`. Returns (track_dict, error) where
+    track_dict has uri / name / artist."""
+    url = f"{_SPOTIFY_SEARCH_URL}?" + _urlparse.urlencode({"q": query, "type": "track", "limit": 1})
+    req = _urlrequest.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with _urlrequest.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+    except _urlerror.HTTPError as exc:
+        return None, f"spotify_search_failed ({exc.code})"
+    except Exception as exc:  # noqa: BLE001
+        return None, f"spotify_search_error ({exc})"
+
+    items = (payload.get("tracks") or {}).get("items") or []
+    if not items:
+        return None, "no_match"
+    t = items[0]
+    return {
+        "uri": t.get("uri", ""),
+        "name": t.get("name", ""),
+        "artist": ", ".join(a.get("name", "") for a in t.get("artists", [])),
+    }, None
+
+
+def play_spotify_track(query: str) -> dict:
+    """Plays a specific song in Spotify. Give a natural query like
+    "Billie Jean by Michael Jackson" or "Bohemian Rhapsody".
+
+    Resolves the query to a track via the Spotify Web API, then plays it
+    with AppleScript (`play track "<uri>"`), which launches Spotify if
+    needed. Verified against Spotify's real player state afterwards.
+
+    Returns a dict with:
+        success: bool - True only if Spotify's real state confirms the
+            resolved track is now playing
+        message: human-readable summary
+        error: raw error string if something went wrong, else None
+    """
+    _require_macos()
+
+    token, err = _spotify_access_token()
+    if err == "spotify_not_configured":
+        return {
+            "success": False,
+            "message": (
+                "Spotify playback needs API credentials. Add SPOTIFY_CLIENT_ID and "
+                "SPOTIFY_CLIENT_SECRET to the repo-root .env (create a free app at "
+                "developer.spotify.com - no redirect URI needed)."
+            ),
+            "error": "spotify_not_configured",
+        }
+    if err:
+        return {"success": False, "message": f"Could not authenticate with Spotify: {err}", "error": err}
+
+    track, err = _spotify_search_track(query, token)
+    if err == "no_match":
+        return {"success": False, "message": f"Spotify search found no track for {query!r}.", "error": "no_match"}
+    if err:
+        return {"success": False, "message": f"Spotify search failed: {err}", "error": err}
+    if not track["uri"]:
+        return {"success": False, "message": f"Spotify returned a match for {query!r} with no playable URI.", "error": "no_uri"}
+
+    before = _spotify_player_state()
+
+    script = (
+        'tell application "Spotify"\n'
+        f'  play track "{track["uri"]}"\n'
+        "  activate\n"
+        "end tell"
+    )
+    launch = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+    if launch.returncode != 0:
+        return {
+            "success": False,
+            "message": f"Resolved {track['name']!r} by {track['artist']!r} but the AppleScript play command failed.",
+            "error": launch.stderr.strip() or "osascript_failed",
+        }
+
+    # Give Spotify a moment to actually start, then read the real state back.
+    after = None
+    for _ in range(6):
+        time.sleep(0.4)
+        after = _spotify_player_state()
+        if after and after.get("player_state") == "playing":
+            break
+
+    if after is None:
+        return {
+            "success": False,
+            "message": f"Sent play for {track['name']!r} but couldn't read Spotify's player state back to confirm it.",
+            "error": "state_unreadable",
+        }
+
+    playing = after.get("player_state") == "playing"
+    # The API's track name is the authority; Spotify's own current-track name
+    # should now match it (allow a loose contains-match for remaster suffixes).
+    want = track["name"].lower()
+    got = (after.get("track_name") or "").lower()
+    right_track = want in got or got in want or _spotify_playback_changed(before, after)
+
+    if playing and right_track:
+        return {
+            "success": True,
+            "message": (
+                f"Playing '{after['track_name']}' by {after['track_artist']} in Spotify "
+                f"(resolved from {query!r}, verified via player state)."
+            ),
+            "error": None,
+        }
+    return {
+        "success": False,
+        "message": (
+            f"Sent play for '{track['name']}' by {track['artist']}, but Spotify's state is "
+            f"player_state={after.get('player_state')!r}, current track={after.get('track_name')!r} "
+            f"- not the confirmed 'playing the right track' outcome."
+        ),
+        "error": "playback_not_verified",
+    }
+
+
+play_spotify_track_tool = FunctionTool(play_spotify_track)
+
+
 _VERIFY_REGION_SIZE = (400.0, 160.0)  # width, height in points, centered on the field
 _NO_CHANGE_DIFF_THRESHOLD = 2.0  # mean 0-255 grayscale diff below this = "nothing visibly happened"
 
