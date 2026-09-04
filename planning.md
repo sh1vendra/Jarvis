@@ -3296,3 +3296,106 @@ real:
   436px card shape regardless of the new dot; `listening` state (the other
   previously-tightest pill) still measured zero header overflow with the
   new dot's extra width included.
+
+## capture_region_unverified: making the mistake structurally impossible, not just documented
+
+The previous entry ended with a real incident, told plainly rather than
+smoothed over: a lower-level, unverified capture primitive
+(`capture_region`, raw point-space coordinates, no on-screen-window check
+at all) sat right next to the hardened one (`capture_screenshot`) at the
+same import level, and under time pressure it got called directly with
+stale, self-computed coordinates instead of respecting `capture_screenshot`'s
+own "no verified window" refusal - capturing an unrelated app's window
+instead of Jarvis's. That entry said the fix wasn't done yet, just
+documented as a lesson. This entry is the actual fix.
+
+**Why a rename/comment alone wouldn't have been enough, and what "structural"
+actually means here:** the explicit bar was that this needed to be harder
+to do *by accident*, not just discouraged by convention - and a comment,
+or even a leading underscore, is still something a rushed call can miss or
+route around, exactly as happened. What can't be missed is a function that
+*refuses to run* without an argument that didn't exist before. So:
+`capture_region` is now `capture_region_unverified(x, y, width, height, *,
+reason: str)` - renamed (the "unverified" is now impossible to miss in the
+name itself, wherever it's imported, called, or grepped), *and* `reason` is
+mandatory, keyword-only, with no default, and validated at call time
+(`ValueError` on empty/whitespace, not silently accepted). Concretely: the
+exact call that caused the incident -
+`capture_region(computed_x, computed_y, 460, 340)` - no longer compiles
+into anything callable at all; Python raises `TypeError: missing 1
+required keyword-only argument: 'reason'` before a single pixel is
+captured. There is no way to reach this function "the old way," from
+inside this module or any other, ever again - confirmed directly, not
+assumed (see Tested, below).
+
+**What `reason` actually buys, beyond the refusal itself:** every
+legitimate call site now says out loud, in its own words, why skipping
+verification is safe there - which is also genuinely informative, not just
+ceremony. `capture_screenshot`'s own internal call passes `reason=
+f"{app_name!r}'s real on-screen window bounds, just verified via
+_real_window_bounds"` - it's the *only* caller that should ever construct
+those coordinates from a trusted lookup. `mac_control.py`'s seven call
+sites (all before/after pixel-diff regions for click/type verification)
+share one honest, real justification, defined once as
+`_DIFF_REGION_CAPTURE_REASON` rather than restated seven slightly-different
+ways: the coordinates are never independently guessed there - they're
+always a point that same call already resolved via AX, vision, or a fixed
+window offset, inside an app `_verify_expected_app_frontmost` already
+confirmed frontmost before any of it ran. That's a real, different safety
+story than `capture_screenshot`'s (procedural/contextual vs. a fresh
+ground-truth lookup), and now it's written down at the point of use
+instead of being an unstated assumption a future reader would have to
+reconstruct.
+
+**Audited the rest of the codebase for the same shape - a safe wrapper
+with an easily-reachable unsafe sibling at the same access level - per the
+explicit ask, not just this one spot:**
+- `mac_control.py`'s `_dispatch_click(x, y)` / `_dispatch_keyboard_shortcut`
+  are the direct analog (raw Quartz mouse/keyboard events at any
+  coordinate, no verification) - already correctly underscore-prefixed
+  *and*, checked directly, never imported or called from any other module
+  (`grep` confirms every call site is inside `mac_control.py` itself,
+  right alongside `click_ui`/`type_in_field`, the safe callers that do the
+  actual verification). This is what `capture_region` should have looked
+  like from the start and didn't - no fix needed here, already the right
+  shape.
+- `memory/store.py`: every query is parameterized (`conn.execute("...
+  WHERE key = ?", (key,))` throughout) - no raw-SQL-string or
+  caller-supplied-query capability exists anywhere to misuse.
+- `tools/browser_tools.py` / `browser/bridge.py`: no arbitrary-JS-eval or
+  "run this script on the page" capability sits next to the ref-based
+  `click_web_element`/`type_in_web_field` - the only way to act on a page
+  is through `find_web_element`'s resolved `ref_id`, there is no raw path.
+- `memory/store.py`'s DB path (`_DB_PATH`) is resolved once at import time
+  from a fixed location or `JARVIS_MEMORY_DB`, never accepts a
+  caller-supplied path at query time - no path-injection-shaped risk to
+  check for here.
+
+No other instance of this exact pattern (a safe, verified wrapper with a
+reachable, unverified sibling at the same public/importable level) was
+found. Noted honestly, not overclaimed: this was a real, careful pass
+against this codebase's actual public surface (grepped every non-
+underscore `def` across `tools/`, `browser/`, `memory/`, `servers/`,
+`voice/` and checked each one), not an exhaustive formal audit - if this
+shape exists somewhere subtler, it wasn't found today.
+
+**Tested for real, not just reasoned about:**
+- The exact old call shape (`capture_region_unverified(x, y, w, h)`, no
+  `reason`) raises `TypeError` before any capture happens - confirmed by
+  calling it directly.
+- An explicit empty string and a whitespace-only string for `reason` both
+  raise `ValueError` - confirmed directly; a caller can't satisfy the
+  check by passing a throwaway value that looks like an argument but says
+  nothing.
+- The safe path is completely unchanged: `capture_screenshot(app_name=
+  "Spotify")` against a real, verified Spotify window succeeded exactly as
+  before (231164 real bytes back), and the unscoped/no-`allow_full_display`
+  call still refuses exactly as before - same behavior, same error, before
+  and after this refactor.
+- The actual legitimate callers still work end to end: ran a real
+  "play Bohemian Rhapsody by Queen in Spotify" command through the full
+  live pipeline - `search_spotify_candidates` -> `click_ui` (fixed-offset
+  tier, which still calls `capture_region_unverified` for its before/after
+  region regardless of tier) -> verified via Spotify's real player state,
+  completed successfully, no exceptions, no behavior change from before
+  this refactor.

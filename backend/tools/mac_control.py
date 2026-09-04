@@ -26,7 +26,13 @@ from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 from PIL import Image, ImageChops
 
-from .perception import capture_region, capture_screenshot, get_field_values, get_frontmost_window_frame, get_ui_tree
+from .perception import (
+    capture_region_unverified,
+    capture_screenshot,
+    get_field_values,
+    get_frontmost_window_frame,
+    get_ui_tree,
+)
 
 try:
     import Quartz
@@ -1269,6 +1275,19 @@ search_spotify_candidates_tool = FunctionTool(search_spotify_candidates)
 _VERIFY_REGION_SIZE = (400.0, 160.0)  # width, height in points, centered on the field
 _NO_CHANGE_DIFF_THRESHOLD = 2.0  # mean 0-255 grayscale diff below this = "nothing visibly happened"
 
+# The one honest justification every capture_region_unverified() call in this
+# module shares - see that function's docstring in perception.py for why it
+# requires one at all. Every call site below passes a point this same call
+# already resolved via _locate_element (AX or vision) or a fixed window
+# offset, for before/after diff-checking a click/type it's about to perform
+# (or just performed) inside expected_app_name - which _verify_expected_app_
+# frontmost already confirmed is actually frontmost before any of this ran.
+# Not independently guessed coordinates the way the real incident's did.
+_DIFF_REGION_CAPTURE_REASON = (
+    "small before/after diff-check region centered on a point this same call already resolved "
+    "(AX/vision/fixed offset), inside an app already verified frontmost - not guessed coordinates"
+)
+
 
 def _region_pixel_diff_score(before_png: bytes, after_png: bytes) -> float:
     """Mean per-pixel grayscale difference (0-255) between two same-region
@@ -1322,7 +1341,7 @@ def _verify_text_entered(
 
     x, y = region_center
     width, height = _VERIFY_REGION_SIZE
-    after_region_png = capture_region(x, y, width, height)
+    after_region_png = capture_region_unverified(x, y, width, height, reason=_DIFF_REGION_CAPTURE_REASON)
     diff_score = _region_pixel_diff_score(before_region_png, after_region_png)
 
     if diff_score < _NO_CHANGE_DIFF_THRESHOLD:
@@ -1484,7 +1503,7 @@ def _verify_click_outcome(
 
     x, y = region_center
     width, height = _VERIFY_REGION_SIZE
-    after_region_png = capture_region(x, y, width, height)
+    after_region_png = capture_region_unverified(x, y, width, height, reason=_DIFF_REGION_CAPTURE_REASON)
     diff_score = _region_pixel_diff_score(before_region_png, after_region_png)
 
     if diff_score < _NO_CHANGE_DIFF_THRESHOLD:
@@ -1608,7 +1627,9 @@ def locate_and_click_via_grid_search(
     # after every failed candidate to check for accidental navigation,
     # independent of which candidate point was actually tried.
     wide_region_center = (center_x, center_y)
-    wide_before = capture_region(*wide_region_center, 800.0, 500.0)
+    wide_before = capture_region_unverified(
+        *wide_region_center, 800.0, 500.0, reason=_DIFF_REGION_CAPTURE_REASON
+    )
 
     state_check = _APP_PLAYER_STATE_CHECKS.get(app_name)
     before_player_state = state_check() if state_check is not None else None
@@ -1616,7 +1637,9 @@ def locate_and_click_via_grid_search(
     attempts_log = []
     for i, (x, y) in enumerate(candidates, start=1):
         region_center = (x, y)
-        before_region_png = capture_region(*region_center, *_VERIFY_REGION_SIZE)
+        before_region_png = capture_region_unverified(
+            *region_center, *_VERIFY_REGION_SIZE, reason=_DIFF_REGION_CAPTURE_REASON
+        )
 
         _dispatch_click(x, y)
         time.sleep(0.3)
@@ -1638,7 +1661,9 @@ def locate_and_click_via_grid_search(
                 "error": None,
             }
 
-        wide_after = capture_region(*wide_region_center, 800.0, 500.0)
+        wide_after = capture_region_unverified(
+            *wide_region_center, 800.0, 500.0, reason=_DIFF_REGION_CAPTURE_REASON
+        )
         wide_diff = _region_pixel_diff_score(wide_before, wide_after)
         if wide_diff > _GRID_SEARCH_NAV_DIFF_THRESHOLD:
             return {
@@ -1758,7 +1783,9 @@ def click_ui(target_description: str, expected_app_name: str, expected_outcome: 
         return {"success": False, "message": located["error"], "tier": None, "error": located["error"]}
 
     region_center = (located["x"], located["y"])
-    before_region_png = capture_region(*region_center, *_VERIFY_REGION_SIZE)
+    before_region_png = capture_region_unverified(
+        *region_center, *_VERIFY_REGION_SIZE, reason=_DIFF_REGION_CAPTURE_REASON
+    )
     state_check = _APP_PLAYER_STATE_CHECKS.get(expected_app_name)
     before_player_state = state_check() if state_check is not None else None
 
@@ -1899,7 +1926,9 @@ def type_in_field(target_description: str, text: str, expected_app_name: str) ->
     # missed its target, rather than trusting a single after-the-fact vision
     # opinion in isolation.
     region_center = (located["x"], located["y"])
-    before_region_png = capture_region(*region_center, *_VERIFY_REGION_SIZE)
+    before_region_png = capture_region_unverified(
+        *region_center, *_VERIFY_REGION_SIZE, reason=_DIFF_REGION_CAPTURE_REASON
+    )
 
     if not used_shortcut:
         _dispatch_click(located["x"], located["y"])

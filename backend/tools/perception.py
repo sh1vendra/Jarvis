@@ -245,9 +245,32 @@ def get_frontmost_window_frame(app_name: str) -> tuple[float, float, float, floa
     return (position[0], position[1], size[0], size[1])
 
 
-def capture_region(x: float, y: float, width: float, height: float) -> bytes:
-    """Captures a rectangular region of the screen, centered on point-space
-    coordinates (x, y), and returns PNG bytes.
+def capture_region_unverified(x: float, y: float, width: float, height: float, *, reason: str) -> bytes:
+    """Captures a rectangular region of the screen by raw point-space
+    coordinates - (x, y) is the region's center - with NO verification that
+    those coordinates correspond to anything real or intended. The caller
+    is fully responsible for that. Returns PNG bytes.
+
+    This is the exact function whose direct use - called from an ad hoc
+    script with coordinates computed from a stale position check, instead
+    of going through capture_screenshot's ground-truth window lookup -
+    caused a real privacy incident: it captured a different app's window
+    than the one intended. See planning.md's "capture_region_unverified"
+    entry for the full incident and the reasoning behind this function's
+    shape.
+
+    `reason` is mandatory, keyword-only, and validated at call time - not a
+    convention someone can miss under pressure, a structural one: there is
+    no way to call this function positionally or silently the way the old
+    unqualified `capture_region(x, y, w, h)` could be, from either inside
+    or outside this module. Every call site must say, in its own words,
+    why skipping verification is actually safe here - `capture_screenshot`
+    below is the only caller that should ever need this, plus a small,
+    already-safe class of uses in `mac_control.py` (before/after diff-check
+    regions centered on a point that same call just resolved via AX/vision,
+    inside an app already confirmed frontmost - not independently guessed
+    coordinates). If what's actually wanted is "a screenshot of app X,"
+    that's `capture_screenshot(app_name=X)`, not this.
 
     `screencapture -R<x>,<y>,<w>,<h>` takes its rect in point-space (the same
     coordinate system as clicks and AX positions) and returns the image at
@@ -258,6 +281,13 @@ def capture_region(x: float, y: float, width: float, height: float) -> bytes:
     whole-screen output, which vision-tier coordinate math does have to
     divide by the scale factor).
     """
+    if not reason or not reason.strip():
+        raise ValueError(
+            "capture_region_unverified() requires a real, non-empty `reason` explaining why "
+            "skipping capture_screenshot's on-screen-window verification is actually safe here "
+            "- this is not optional, and there is no default to fall back on."
+        )
+
     left = x - width / 2
     top = y - height / 2
 
@@ -330,7 +360,10 @@ def capture_screenshot(app_name: str | None = None, *, allow_full_display: bool 
     with a visible on-screen window" are not the same fact, and only the
     latter is safe to screenshot - see _real_window_bounds. So: given
     app_name, this only ever captures that app's own verified window region
-    (via capture_region); if that app has no real on-screen window right
+    (via capture_region_unverified, which is where the actual pixels come
+    from - the "unverified" in its name refers to *its own* inputs, not to
+    the coordinates handed to it here, which _real_window_bounds just
+    verified a moment ago); if that app has no real on-screen window right
     now, it refuses rather than silently falling back to a full-display
     capture that could show something unrelated. A full-display capture is
     still available, but only as an explicit, named opt-in.
@@ -339,7 +372,13 @@ def capture_screenshot(app_name: str | None = None, *, allow_full_display: bool 
         bounds = _real_window_bounds(app_name)
         if bounds is not None:
             x, y, width, height = bounds
-            return capture_region(x + width / 2, y + height / 2, width, height)
+            return capture_region_unverified(
+                x + width / 2,
+                y + height / 2,
+                width,
+                height,
+                reason=f"{app_name!r}'s real on-screen window bounds, just verified via _real_window_bounds",
+            )
         if not allow_full_display:
             raise RuntimeError(
                 f"'{app_name}' has no verified on-screen window right now - refusing a "
