@@ -3736,11 +3736,16 @@ means exactly that - it does not and cannot mean confirmed delivery, and
 the tool's own docstring and returned message say so plainly rather than
 implying a stronger guarantee than what's actually true. Tested for real:
 format validation confirmed correct against real phone/email/name/garbage
-inputs, and three real sends to a number the user provided specifically
+inputs, and four real sends to a number the user provided specifically
 for this test (cleared in advance, reaches only them), each confirmed at
 the tool level (validated format, clean AppleScript exit) - real delivery
 confirmation is only checkable by the user looking at their own phone,
-which is outside what this process can verify.
+which is outside what this process can verify, so the user was asked
+directly afterward: all four real test messages were confirmed to have
+actually arrived. The honest verification ceiling documented above is
+still real (this process genuinely cannot check delivery itself, and
+won't silently claim to), but real-world testing across every send this
+session did produce actual delivery, not silent failure.
 
 **Full pipeline, tested end to end, not just unit-level:** a real
 Orchestrator -> Planner -> Action run for all three ("create a calendar
