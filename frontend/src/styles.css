@@ -107,6 +107,20 @@ body {
   padding: 15px 18px 13px;
 }
 
+/* Conversation open: same "full card" shape as the states above,
+   regardless of which data-state is actually active - a stretched pill
+   (wide but still border-radius:999px) would look wrong for idle/
+   listening/thinking with the panel open, so this takes over all three
+   morph properties the same way those states' own rules do. Uses the
+   existing width/radius/padding values verbatim (not new ones) and rides
+   the same transition already declared on .glass, so opening/closing reads
+   as the same kind of morph as every state change already does. */
+.stage[data-transcript="open"] .glass {
+  width: 436px;
+  border-radius: 22px;
+  padding: 15px 18px 13px;
+}
+
 /* ── Per-state content visibility: keep the pills clean, focus the
       approval card, let the working card carry the detail ── */
 
@@ -666,6 +680,74 @@ body {
   border-radius: 3px;
 }
 
+/* ── Conversation panel: hidden until toggled, then appended after
+      everything else the current state already shows. Reuses existing
+      tokens throughout - no new colors, no new fonts, no new spacing
+      scale: the label treatment is .caption's, the user-turn text is
+      .quote's italic style, the Jarvis-turn bubble is the same inset-card
+      language .approval/.outcome already use, and the scrollbar matches
+      .activity's. Distinguishes turns by a subtle background difference
+      (Jarvis turns get the inset bubble, user turns stay plain italic
+      text) rather than left/right bubble alignment, which would be a
+      genuinely new visual pattern in a container this narrow. ── */
+
+.conversation {
+  margin-top: 12px;
+  max-height: 170px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: none;
+  user-select: text;
+  -webkit-app-region: no-drag;
+}
+
+.conversation::-webkit-scrollbar {
+  width: 6px;
+}
+
+.conversation::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+
+.conversationEmpty {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.turn {
+  flex: none;
+}
+
+.turnLabel {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 2px;
+}
+
+.turnText {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-primary);
+}
+
+.turnUser .turnText {
+  font-style: italic;
+  color: var(--text-secondary);
+}
+
+.turnJarvis {
+  padding: 6px 10px;
+  background: var(--inset-bg);
+  border: 1px solid var(--inset-border);
+  border-radius: 10px;
+}
+
 /* ── Window controls: hover-revealed minimize/close, trailing the header row ── */
 
 .controls {
@@ -709,6 +791,14 @@ body {
 }
 
 .winBtn:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: var(--text-primary);
+}
+
+/* Toggle buttons (currently just the conversation icon) stay visibly "on"
+   while active, not just on hover - same background .winBtn:hover already
+   uses, just not conditional on the pointer being over it. */
+.winBtn[aria-pressed="true"] {
   background: rgba(255, 255, 255, 0.14);
   color: var(--text-primary);
 }

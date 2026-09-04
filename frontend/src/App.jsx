@@ -42,9 +42,25 @@ export default function App() {
   const [failedGoals, setFailedGoals] = useState([]); // goals whose tools didn't verify
   const [cancelledGoal, setCancelledGoal] = useState(""); // the step the user rejected
 
+  // Full session conversation history - hidden by default (see the toggle
+  // button below), accumulated for as long as the app stays open. Every
+  // turn is real, already-flowing data reused as-is, not a new capture
+  // mechanism: user turns come from the same `transcript` event the single
+  // "Heard" block already renders, Jarvis turns come from the same `speak`
+  // event that drives real TTS (already trimmed for speech and already
+  // carrying the personality-flavor layer where it applies - see
+  // agent_server.py). Deliberately never cleared by beginCapture's
+  // per-command reset below - it's meant to accumulate across the whole
+  // session, not reset per command. No cross-session persistence - a fresh
+  // launch is a fresh JS environment, so this is empty again with no code
+  // needed to make that true.
+  const [conversation, setConversation] = useState([]); // [{role: "user"|"jarvis", text}]
+  const [transcriptOpen, setTranscriptOpen] = useState(false);
+
   const recorderRef = useRef(null);
   const clientRef = useRef(null);
   const autoStopRef = useRef(null); // { timers, done } for a wake-word capture
+  const conversationRef = useRef(null); // scrolled to bottom on new turns, see below
 
   // Trailing-silence auto-stop for the wake-word path (the hotkey stays a
   // manual toggle). RMS threshold and windows tuned for a quiet room; a
@@ -70,6 +86,7 @@ export default function App() {
             break;
           case "transcript":
             setTranscript(msg.text);
+            setConversation((prev) => [...prev, { role: "user", text: msg.text }]);
             log(`transcript: "${msg.text}"`);
             break;
           case "plan":
@@ -149,9 +166,12 @@ export default function App() {
             // flavor and any trimming-for-speech both applied there, see
             // agent_server.py) - this just relays it to Electron main,
             // which is the only process that can actually spawn `say`.
+            // Also the exact text that becomes this turn's conversation
+            // entry - real spoken content, not a separate summary of it.
             if (msg.text) {
               log(`speaking: "${msg.text}"`);
               window.jarvis.speak(msg.text);
+              setConversation((prev) => [...prev, { role: "jarvis", text: msg.text }]);
             }
             break;
           default:
@@ -310,6 +330,15 @@ export default function App() {
     return off;
   }, []);
 
+  // Keep the conversation panel scrolled to the newest turn - only matters
+  // while it's actually open and rendered (conversationRef is null while
+  // closed, since the panel isn't in the DOM at all then).
+  useEffect(() => {
+    if (transcriptOpen && conversationRef.current) {
+      conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+    }
+  }, [conversation, transcriptOpen]);
+
   const decide = useCallback((approved) => {
     clientRef.current.send({ type: "approval_response", approved });
     setPendingApproval(null);
@@ -337,7 +366,13 @@ export default function App() {
   const wakewordStatus = !wakeWord.available ? "unavailable" : state === "listening" ? "paused" : "listening";
 
   return (
-    <div className="stage" data-state={state} data-wakeword={wakewordStatus} data-speaking={speaking}>
+    <div
+      className="stage"
+      data-state={state}
+      data-wakeword={wakewordStatus}
+      data-speaking={speaking}
+      data-transcript={transcriptOpen ? "open" : "closed"}
+    >
       <div className="glass">
         {/* Frameless windows draw no OS titlebar. The drag region is the
             `.header` row only (see styles.css), NOT the whole glass: a
@@ -367,6 +402,22 @@ export default function App() {
           />
           <span className="conn" data-conn={connection} title={`backend: ${connection}`} />
           <div className="controls">
+            <button
+              className="winBtn"
+              onClick={() => setTranscriptOpen((v) => !v)}
+              aria-pressed={transcriptOpen}
+              title={transcriptOpen ? "Hide conversation" : "Show conversation"}
+            >
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path
+                  d="M3 3h10a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H7l-3 3v-3H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"
+                  stroke="currentColor"
+                  strokeWidth="1.3"
+                  strokeLinejoin="round"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
             <button className="winBtn" onClick={() => window.jarvis.minimize()} title="Minimize">
               &#8211;
             </button>
@@ -456,6 +507,27 @@ export default function App() {
           )}
 
           {activity.length > 0 && <pre className="activity">{activity.join("\n")}</pre>}
+
+          {/* Hidden by default (see the toggle button in the header) - an
+              extra block appended after everything else this state already
+              shows, not a replacement for the single "Heard" quote above.
+              Works the same way in every state since visibility here is
+              driven purely by transcriptOpen, not data-state - idle/
+              listening just show this with nothing else above it. */}
+          {transcriptOpen && (
+            <div className="conversation" ref={conversationRef}>
+              {conversation.length === 0 ? (
+                <div className="conversationEmpty">Nothing said yet this session.</div>
+              ) : (
+                conversation.map((turn, i) => (
+                  <div key={i} className={`turn turn${turn.role === "user" ? "User" : "Jarvis"}`}>
+                    <div className="turnLabel">{turn.role === "user" ? "You" : "Jarvis"}</div>
+                    <div className="turnText">{turn.text}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
