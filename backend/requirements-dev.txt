@@ -1,0 +1,8 @@
+# Test-only dependencies - never needed to actually run Jarvis, local or
+# Cloud Run, so kept out of requirements.txt/requirements-cloudrun.txt the
+# same way those two already separate "runtime" from "this platform's
+# subset". Install alongside requirements.txt: pip install -r
+# requirements.txt -r requirements-dev.txt (see tests/README.md).
+
+pytest==9.1.1
+pytest-asyncio==1.4.0
