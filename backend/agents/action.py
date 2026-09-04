@@ -15,6 +15,7 @@ from tools.mac_control import (
     click_ui_tool,
     create_reminder_tool,
     open_app_tool,
+    play_spotify_track_tool,
     type_in_field_tool,
 )
 from .verifier_callbacks import log_tool_result_callback
@@ -36,6 +37,15 @@ action_agent = LlmAgent(
         "- open_app: use this when the milestone is about an application "
         "being launched/open/in the foreground (e.g. 'Spotify is open and "
         "in the foreground'). Extract just the app name, e.g. 'Spotify'.\n"
+        "- play_spotify_track: use this whenever the milestone is about a "
+        "specific song, track, or artist playing in Spotify (e.g. 'Billie "
+        "Jean by Michael Jackson is playing in Spotify', 'lofi beats are "
+        "playing'). Pass the whole natural query as `query` (e.g. 'Billie "
+        "Jean by Michael Jackson'). This resolves the track via the Spotify "
+        "API and plays it directly - it launches Spotify itself, so you do "
+        "NOT need open_app first, and you must NOT use type_in_field or "
+        "click_ui to search Spotify or click a result. It is verified "
+        "against Spotify's real player state.\n"
         "- click_ui: use this when the milestone is about clicking something "
         "inside the app that's already open (e.g. 'the first search result "
         "is selected'). You must pass expected_app_name - the app this "
@@ -93,6 +103,7 @@ action_agent = LlmAgent(
     ),
     tools=[
         open_app_tool,
+        play_spotify_track_tool,
         click_ui_tool,
         type_in_field_tool,
         create_reminder_tool,
