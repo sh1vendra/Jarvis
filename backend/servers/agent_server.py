@@ -25,6 +25,20 @@ convenience: `browser/bridge.py`'s asyncio.Events are only awaitable from
 the loop that created them, and the Action agent's browser tools await
 them from inside this server's request handling.
 
+Also owns wake-word ("Hey Jarvis") detection - see `voice/wakeword.py` for
+why that lives here rather than in Electron's main process the way the
+earlier Porcupine attempt did (`frontend/electron/wakeword.cjs`, kept but
+no longer wired in - openWakeWord has no Node binding, so detection has to
+run wherever Python already runs). The consequence: the wake-word trigger
+can't use Electron's IPC (`jarvis:hotkey`) - it travels over this same
+WebSocket instead (`wakeword_detected` below), and the renderer calls the
+exact same `beginCapture(source)` convergence point the hotkey already
+uses. `_set_mic_active()` is the mic-handoff choke point - every renderer
+mic acquisition/release (hotkey- or wake-word-triggered, doesn't matter)
+reports through `mic_state`, and the wake-word listener is fully paused/
+resumed accordingly, so the two never contend for the microphone. Started
+only outside Cloud Run (see `_main()`) - no microphone exists there.
+
 Protocol (JSON, one message per WebSocket frame):
 
   client -> server
@@ -33,6 +47,12 @@ Protocol (JSON, one message per WebSocket frame):
      "pcm_base64": str}          raw little-endian int16 mono PCM
     {"type": "text", "text": str}   typed command, for testing without a mic
     {"type": "approval_response", "approved": bool}
+    {"type": "mic_state", "active": bool}   the renderer just acquired
+                                  (true) or released (false) the
+                                  microphone for a command capture,
+                                  regardless of trigger source - pauses/
+                                  resumes the backend's own wake-word mic
+                                  capture so the two never contend
     {"type": "cancel"}
 
   server -> client
@@ -56,6 +76,14 @@ Protocol (JSON, one message per WebSocket frame):
     {"type": "reply", "text": str}        conversational, no plan produced
     {"type": "approval_required", "milestone": {...}}
     {"type": "approval_result", "approved": bool}
+    {"type": "wakeword_status", "available": bool, "reason": str | None}
+                                  sent once, right after connect - whether
+                                  the backend's "Hey Jarvis" listener is
+                                  actually running (e.g. False if
+                                  openwakeword/sounddevice aren't installed)
+    {"type": "wakeword_detected"}   "Hey Jarvis" heard - the renderer should
+                                  start listening exactly as if the hotkey
+                                  had just been pressed
     {"type": "error", "message": str}
 """
 
@@ -81,6 +109,7 @@ from agents.planner import MilestonePlan  # noqa: E402
 from main import APP_NAME, USER_ID, run_action, run_command, summarize_plan  # noqa: E402
 from memory import store as memory_store  # noqa: E402
 from voice.stt import TranscriptionError, transcribe_audio  # noqa: E402
+from voice.wakeword import WakeWordListener  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +132,91 @@ _CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
 # well past any plausible push-to-talk clip. (Measured, not guessed - see
 # planning.md.)
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
+# -- Wake word ("Hey Jarvis") - module-level, not per-connection, since -----
+# detection runs continuously regardless of which/whether a client is
+# connected at a given moment. See voice/wakeword.py for the listener
+# itself; everything here is just wiring it to the WebSocket protocol.
+_connected_sessions: set["ClientSession"] = set()
+_wakeword_listener: Optional[WakeWordListener] = None
+_wakeword_available = False
+_wakeword_reason: Optional[str] = None
+_mic_active = False  # true whenever ANY connected renderer currently holds the mic
+_WAKEWORD_MIC_ACK_TIMEOUT = 3.0  # seconds to wait for a mic_state ack before un-pausing anyway
+
+
+async def _broadcast(payload: Dict[str, Any]) -> None:
+    for session in list(_connected_sessions):
+        await session.send(payload)
+
+
+def _set_mic_active(active: bool) -> None:
+    """The one place mic ownership actually changes hands. Called both from
+    `mic_state` messages (every renderer capture, hotkey- or wake-word-
+    triggered) and from disconnect cleanup - the wake-word listener is
+    fully paused/resumed here, never left to infer state on its own."""
+    global _mic_active
+    _mic_active = active
+    if _wakeword_listener is None:
+        return
+    if active:
+        logger.info("agent server: renderer acquired the mic - pausing wake word")
+        _wakeword_listener.pause()
+    else:
+        logger.info("agent server: renderer released the mic - resuming wake word")
+        _wakeword_listener.resume()
+
+
+def _on_wakeword_detected(score: float, loop: asyncio.AbstractEventLoop) -> None:
+    """Runs on the wake-word listener's own background thread (see
+    voice/wakeword.py) - NOT the asyncio event loop, so this must hop back
+    onto the loop via run_coroutine_threadsafe rather than touching
+    websockets/asyncio state directly.
+
+    Pauses the listener immediately, before even scheduling the broadcast -
+    mirrors wakeword.cjs's startListening(), which calls
+    wakeWord.pauseCapture() before sending the IPC trigger, for the same
+    reason: close the mic-contention window as early as possible rather
+    than waiting for the renderer's own acknowledgment to arrive.
+    """
+    logger.info("agent server: wake word detected (score=%.3f)", score)
+    if _wakeword_listener is not None:
+        _wakeword_listener.pause()
+    asyncio.run_coroutine_threadsafe(_handle_wakeword_detected(), loop)
+
+
+async def _handle_wakeword_detected() -> None:
+    await _broadcast({"type": "wakeword_detected"})
+    # Safety net: if the renderer never confirms it actually acquired the
+    # mic (disconnected, permission denied, crashed before reporting),
+    # don't leave wake word paused forever - same "always recoverable"
+    # standard the rest of this pipeline holds itself to. A mic_state
+    # ack that DID arrive in time makes this a no-op (the real capture is
+    # legitimately still using the mic); resume() then happens normally
+    # when that capture's own mic_state(active=False) arrives.
+    await asyncio.sleep(_WAKEWORD_MIC_ACK_TIMEOUT)
+    if not _mic_active and _wakeword_listener is not None:
+        logger.info("agent server: no mic_state ack after wake word detection - resuming wake word")
+        _wakeword_listener.resume()
+
+
+def start_wakeword_listener() -> None:
+    """Starts the backend's "Hey Jarvis" listener. Call only outside Cloud
+    Run (see `_main()`) - there is no microphone in that container, and
+    voice/wakeword.py's own guarded imports mean this degrades to a clear
+    "unavailable" rather than crashing even if called somewhere it
+    shouldn't be, but it should never actually be reached there."""
+    global _wakeword_listener, _wakeword_available, _wakeword_reason
+    loop = asyncio.get_running_loop()
+    listener = WakeWordListener(on_detected=lambda score: _on_wakeword_detected(score, loop))
+    started = listener.start()
+    _wakeword_listener = listener if started else None
+    _wakeword_available = started
+    _wakeword_reason = None if started else listener.unavailable_reason
+    if started:
+        logger.info("agent server: wake word listening for \"Hey Jarvis\"")
+    else:
+        logger.info("agent server: wake word unavailable - %s (hotkey still works)", _wakeword_reason)
 
 
 class ClientSession:
@@ -293,6 +407,8 @@ async def _transcribe(session: ClientSession, data: Dict[str, Any]) -> Optional[
 async def agent_handler(websocket):
     logger.info("agent server: UI client connected")
     session = ClientSession(websocket)
+    _connected_sessions.add(session)
+    await session.send({"type": "wakeword_status", "available": _wakeword_available, "reason": _wakeword_reason})
 
     try:
         async for raw in websocket:
@@ -319,6 +435,10 @@ async def agent_handler(websocket):
             if msg_type == "cancel":
                 session.cancel_pending()
                 await session.send({"type": "state", "state": "idle", "reason": "cancelled"})
+                continue
+
+            if msg_type == "mic_state":
+                _set_mic_active(bool(data.get("active")))
                 continue
 
             if msg_type in ("audio", "text"):
@@ -353,6 +473,12 @@ async def agent_handler(websocket):
         logger.info("agent server: UI client disconnected (%s)", exc)
     finally:
         session.cancel_pending()
+        _connected_sessions.discard(session)
+        # A client that disconnects mid-capture must not leave wake word
+        # paused forever - same reasoning as _handle_wakeword_detected's
+        # timeout, just for the "the connection itself died" case.
+        if not _connected_sessions:
+            _set_mic_active(False)
 
 
 _HEALTH_BODY = '{"status": "ok", "service": "jarvis-agent"}\n'
@@ -393,9 +519,16 @@ async def _main() -> None:
     one event loop - required so the Action agent's browser tools can await
     the bridge's asyncio.Events. Both task references are held in locals that
     stay alive for the process lifetime; see planning.md's gc entry for why
-    a discarded task reference silently dies."""
+    a discarded task reference silently dies.
+
+    Also where wake-word listening starts - deliberately only reached from
+    the non-Cloud-Run branch of `__main__` below, never from `serve_forever`
+    directly (that's what Cloud Run's branch calls). There is no
+    microphone in that container; see planning.md for why this needed
+    explicit verification, not just "it's gated so it's fine"."""
     from servers.browser_bridge_server import serve_forever as serve_bridge
 
+    start_wakeword_listener()
     bridge_task = asyncio.create_task(serve_bridge())
     agent_task = asyncio.create_task(serve_forever())
     await asyncio.gather(bridge_task, agent_task)
