@@ -2368,3 +2368,65 @@ WebSocket, checking computed DOM state):
   names the step that was refused, memory `success=False`.
 - A real reminder -> `state: done`, green orb, no failure card, memory
   `success=True`, reminder actually created. No regression.
+
+---
+
+## Conversational clarification + autonomous research-and-book: scoped, deliberately deferred, not started
+
+**This is a note of intent, not a build record.** No code exists for any of
+this. It's captured here because it's a real, sizeable feature the project
+is committed to eventually, and it needs its own dedicated session with an
+explicit, signed-off scope before any code gets written - not squeezed in
+alongside other work the way smaller fixes have been. Comparable in size to
+the browser bridge.
+
+**The goal:** when a command is genuinely underspecified (e.g. "book me a
+flight to New York"), the Orchestrator/Planner should recognize the
+ambiguity and ask real clarifying questions back to the user through
+voice/UI (departure city, date, one-way vs round-trip) *before* generating
+a plan - not guess, and not fail outright. Beyond that, an autonomous
+"research and book" capability: search, compare, and act on the result with
+real money and real personal/payment information involved.
+
+**Four open questions this session left explicitly unresolved, to be
+settled before any scoping plan is proposed:**
+
+1. **Ambiguous vs. has-a-default.** How does the system tell "genuinely
+   needs a human answer" apart from "the memory/preferences system (Tier 1,
+   `memory/store.py`) already has a reasonable default, just proceed"?
+   `default_flight_destination` is exactly this today, checked by
+   `relevant_preferences()` before the Planner runs - the new logic has to
+   decide when a *missing* preference is still fine to proceed without
+   (assume something sensible) versus blocking on a real question.
+
+2. **The multi-turn loop, architecturally.** Every agent interaction built
+   so far (`InMemoryRunner`, `session_service.create_session()`) is
+   single-shot: one command in, one plan or one reply out. Clarification
+   needs a real back-and-forth *before* the Planner commits to a plan -
+   question out, wait for a real spoken/typed answer, resume with that
+   context. Whether that's a new ADK agent state, a loop in `main.py`/
+   `agent_server.py` around the existing session, or something else is
+   undecided.
+
+3. **"Search multiple sites, compare, pick the best" is a real research
+   task, not a lookup.** Two live options, not yet chosen between: build a
+   dedicated comparison tool on top of the existing browser bridge (multi-
+   site scraping, real comparison logic), or treat one site's own results
+   (Kayak's own sort/filter) as "the comparison" and skip building
+   comparison logic entirely. Very different scope and effort; needs a
+   deliberate choice, not a default.
+
+4. **The booking step is real money and real personal/payment data.** The
+   existing approval gate (`requires_approval`, held at the orchestration
+   level - see the plan-approval-pause entries above) was designed for
+   "don't submit a search without asking." Spending real money is a
+   materially bigger consequence and likely needs its own safety layer on
+   top: at minimum, showing the user exactly what will be booked and for
+   how much *before* the existing gate even triggers, quite possibly more
+   (payment info source, cancellation/undo story, a harder confirmation
+   than the current click/Enter).
+
+**What we didn't do:** no code, no new agent, no new tool, no schema
+changes, nothing wired into `main.py` or `agent_server.py`. The four
+questions above are exactly what a scoping session needs to resolve before
+writing anything - deliberately left open rather than guessed at here.
