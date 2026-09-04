@@ -3399,3 +3399,121 @@ shape exists somewhere subtler, it wasn't found today.
   region regardless of tier) -> verified via Spotify's real player state,
   completed successfully, no exceptions, no behavior change from before
   this refactor.
+
+## A real pytest suite: verification philosophy first, not generic coverage
+
+`backend/tests/` - 92 real, runnable tests (85 unit, 7 integration; see
+`backend/tests/README.md` for the full breakdown and how to run either).
+Portfolio-worthy was the explicit goal, and the way that got interpreted
+concretely: prioritize by what this project's actual build history proved
+was fragile or load-bearing, not by what's easiest to reach with a mock.
+Every test either exercises this project's own real decision logic
+directly, or is honestly marked as needing the real environment because
+faking it would test nothing real - never a shortcut in between.
+
+**The unit/integration boundary was drawn on what's actually true, not
+convenience.** Three real examples where that judgment call mattered:
+
+- The Reminders duplicate-milestone regression (an explicit, named
+  priority) turned out to only be testable for real as an integration
+  test, for a reason worth stating precisely: the actual fix was a change
+  to the *Planner's own prompt* (`agents/planner.py`'s "MILESTONE
+  GRANULARITY" instruction), not to deterministic code. A unit test
+  mocking the LLM's response would only prove the mock returns what it
+  was told to - it would stay green even if the prompt regressed, which
+  is the exact failure mode a regression test exists to catch. The only
+  test that means anything here calls the real Planner
+  (`test_planner_reminder_regression.py`) and checks what it actually
+  produces - a real, small Gemini cost per run, in exchange for a test
+  that can't be faked into passing.
+- `click_ui`'s outcome verification (`_verify_click_outcome`) has three
+  layers - a deterministic state-check decision, a pixel-diff gate, and a
+  vision-model tiebreaker. The first two are pure/near-pure logic and are
+  tested directly and thoroughly (real synthesized PNG bytes for the
+  pixel-diff math, an injected fake app in `_APP_PLAYER_STATE_CHECKS` for
+  the state-check branch, including the real Free-tier-ad retry logic).
+  The vision tiebreaker was deliberately left untested at the unit level -
+  faking a Gemini vision judgment convincingly enough to mean anything
+  would require so much mocking of "what does this image actually show"
+  that the test would stop testing real behavior, per the explicit
+  standard for this suite. That path is exercised for real instead by
+  every integration test that drives a real `click_ui` call end to end.
+- ADK's own event machinery is mocked at one specific seam
+  (`tests/fakes.py`: plain `SimpleNamespace` objects shaped like real
+  events, not real `google.adk` classes) rather than either mocking
+  deeper (which would mean re-implementing real event semantics, testing
+  nothing) or not mocking at all (which would mean every verification-
+  logic test needs a real Gemini call). This is the boundary that makes
+  `test_run_action.py`/`test_run_plan.py` - the tests for this project's
+  single most load-bearing piece of logic - fast, deterministic, and
+  still real tests of *this project's own code*, not of ADK.
+
+**Two real things this suite's own build process found, not invented as
+theoretical case studies:**
+
+- Writing `test_run_plan.py`'s approval-gate tests, a first draft asserted
+  a rejected/pending milestone would be the *only* state sent before
+  `approval_required`. Real behavior (confirmed by running it, not
+  assumed) is that `_run_plan` sends `{"state": "doing"}` unconditionally
+  as soon as it starts, before it ever looks at the first milestone's
+  `requires_approval` flag - so a plan that pauses for approval on its
+  very first milestone still shows "doing" first. This is real, existing,
+  intentional-looking behavior, not a bug - the test's assumption was
+  wrong, not the code, so the test was corrected rather than the app
+  changed to match a wrong expectation. Recorded here because "the test
+  was wrong, not the code" is itself a real, honest outcome worth being
+  explicit about, not quietly edited away.
+- `test_wakeword_real_detection.py` failed for real, twice, the first
+  times it ran - not because of a bug in `voice/wakeword.py`, but because
+  something outside this project (unidentified - not Jarvis, not this
+  suite) intermittently mutes/zeros this development machine's system
+  output during a session. A muted Mac plays real `afplay` audio nowhere,
+  so the real microphone hears nothing and detection correctly never
+  fires. Chased down properly rather than just retried until it happened
+  to pass: confirmed via `osascript "get volume settings"` both times,
+  fixed by checking that precondition explicitly at the top of each real-
+  audio test (`_require_unmuted_output()`) and skipping with the real
+  reason instead of failing confusingly. This also explained a genuinely
+  concerning-looking native crash (`libc++abi: recursive_mutex lock
+  failed`) seen once when the whole integration suite ran together - it
+  only ever appeared alongside the muted-audio failure, consistent with a
+  PortAudio stream that never received real audio hitting an edge case in
+  its own teardown path after an abnormal (assertion-failure) exit; it
+  did not recur once the precondition check made that path unreachable.
+  Documented plainly rather than silently working around it, per the
+  explicit "tell me plainly" standard - this is a real environment
+  quirk on this specific machine, not a Jarvis bug, but it was real
+  enough to change what the test does.
+
+**Coverage prioritized by what this project's own history proved
+mattered**, mapped to the seven areas asked for: verification logic
+itself (`test_run_action.py`, `test_run_plan.py`,
+`test_click_verification.py`) tests the honest bool derivation and the
+failed/cancelled state propagation directly, including the exact "last
+tool wins, not any tool" and "no tool call is an honest non-completion"
+cases; the Reminders regression (`test_planner_reminder_regression.py`,
+integration); memory (`test_memory_store.py`) covers honest success/
+failure logging, the real relevant-vs-leaking preference control case
+(the same one proven manually earlier in this project, now automated),
+and persistence across a simulated process restart (a real second module
+reload against the same tmp DB file, not the same connection staying
+alive); the approval gate (`test_run_plan.py`) proves `run_action` is
+never called before a real decision arrives and that rejection produces
+`cancelled` with zero execution; Spotify ambiguity
+(`test_spotify_ambiguity.py`) runs the deterministic check against the
+real candidate data this project actually read back from Spotify during
+its own investigation, not invented examples; the
+`capture_region_unverified` safety fix
+(`test_capture_region_safety.py`) proves the exact old call shape now
+raises before capturing anything; and wake-word/TTS mic contention
+(`test_wakeword_listener.py`, `test_mic_tts_dual_flag.py`,
+`test_wakeword_real_detection.py`) covers both the state-machine logic
+(fast, mocked) and real hardware detection (integration), with the dual-
+flag "only resume once BOTH clear" regression tested in both directions
+explicitly.
+
+**Run for real, not assumed:** the full suite (`make test-all` /
+`pytest tests/unit tests/integration -m ""`) passes cleanly - 92 passed,
+confirmed with a clean run immediately after explicitly unmuting system
+output, not cherry-picked from a run that happened to work. `make test`
+alone (the fast suite) runs in ~1.5 seconds.
