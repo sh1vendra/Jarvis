@@ -161,10 +161,18 @@ async def run_command(
     return None
 
 
-async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milestone, on_event=None) -> None:
+async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milestone, on_event=None) -> bool:
     """Sends one milestone (goal + success_signal) to the Action agent and
     prints the tool call it makes plus the tool's own success/failure
     result.
+
+    Returns True only if the milestone's *last* tool call reported
+    `success: true` - i.e. the tools that actually ran confirmed the
+    outcome. A milestone whose last tool reported `success: false`, or that
+    called no tool at all, returns False. This is the honest per-milestone
+    signal the pipeline uses to decide whether the whole run succeeded (see
+    planning.md's "honest failure state" entry) - never the agent's own
+    prose summary.
 
     success_signal is included alongside goal (not just goal alone) so the
     Action agent has a concrete, observable description to draw on when it
@@ -187,6 +195,8 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
         {"type": "milestone_start", "step_number": milestone.step_number, "goal": milestone.goal},
     )
 
+    tool_successes: list[bool | None] = []
+
     async for event in runner.run_async(
         user_id=USER_ID,
         session_id=session_id,
@@ -203,15 +213,17 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
                 if getattr(part, "function_response", None):
                     print(f"[{event.author}] tool result: {part.function_response.response}")
                     response = part.function_response.response
+                    # The tool's own success field - never the agent's summary
+                    # of it. Same "don't trust the self-report" principle the
+                    # rest of this project runs on.
+                    success = response.get("success") if isinstance(response, dict) else None
+                    tool_successes.append(bool(success) if success is not None else None)
                     await _emit(
                         on_event,
                         {
                             "type": "tool_result",
                             "tool": part.function_response.name,
-                            # The tool's own success field - never the agent's
-                            # summary of it. Same "don't trust the self-report"
-                            # principle the rest of this project runs on.
-                            "success": bool(response.get("success")) if isinstance(response, dict) else None,
+                            "success": bool(success) if success is not None else None,
                             "message": str(response.get("message", "")) if isinstance(response, dict) else str(response),
                         },
                     )
@@ -219,10 +231,19 @@ async def run_action(runner: InMemoryRunner, session_id: str, milestone: Milesto
                     print(f"[{event.author}] {part.text.strip()}")
                     await _emit(on_event, {"type": "agent_text", "text": part.text.strip()})
 
+    milestone_ok = bool(tool_successes) and tool_successes[-1] is True
+    print(f"[milestone {milestone.step_number}] outcome: {'OK' if milestone_ok else 'FAILED'} "
+          f"(tool successes: {tool_successes})")
     await _emit(
         on_event,
-        {"type": "milestone_done", "step_number": milestone.step_number, "goal": milestone.goal},
+        {
+            "type": "milestone_done",
+            "step_number": milestone.step_number,
+            "goal": milestone.goal,
+            "success": milestone_ok,
+        },
     )
+    return milestone_ok
 
 
 async def run_milestones_until_approval(
@@ -243,9 +264,11 @@ async def run_milestones_until_approval(
     execution, which is exactly the kind of self-reported gate this
     project has repeatedly found unreliable elsewhere (see planning.md).
 
-    Returns the paused Milestone, or None if every milestone ran without
-    hitting an approval gate.
+    Returns `(paused_milestone, all_ok)` - `paused_milestone` is the first
+    requires_approval milestone reached (None if the whole list ran), and
+    `all_ok` is False if any milestone that actually ran reported failure.
     """
+    all_ok = True
     for milestone in milestones:
         if milestone.requires_approval:
             print(f"\n{'!' * 60}")
@@ -253,30 +276,36 @@ async def run_milestones_until_approval(
             print(f"(success_signal: {milestone.success_signal!r})")
             print("Execution paused here - this milestone was NOT run.")
             print("!" * 60)
-            return milestone
-        await run_action(action_runner, session_id, milestone)
-    return None
+            return milestone, all_ok
+        ok = await run_action(action_runner, session_id, milestone)
+        all_ok = all_ok and ok
+    return None, all_ok
 
 
 async def run_plan_with_approval_gate(
     action_runner: InMemoryRunner, session_id: str, milestones: list[Milestone]
-) -> None:
+) -> str:
     """Run a whole plan through the Action agent, pausing at every
     requires_approval milestone. Each pause waits on a real Enter press
-    standing in for the user clicking "approve" in the (not-yet-built)
-    modal - so the gate visibly holds, then visibly resumes, rather than
-    being auto-approved. The ADK session is unchanged across the pause, so
-    the Action agent keeps full context from the milestones that already
-    ran."""
+    standing in for the user clicking "approve" in the overlay's approval
+    card. The ADK session is unchanged across the pause, so the Action agent
+    keeps full context from the milestones that already ran.
+
+    Returns "completed" if every milestone that ran reported success,
+    "failed" if any of them didn't (the CLI has no reject path - Enter
+    always approves)."""
     remaining = list(milestones)
+    all_ok = True
     while remaining:
-        pending = await run_milestones_until_approval(action_runner, session_id, remaining)
+        pending, ran_ok = await run_milestones_until_approval(action_runner, session_id, remaining)
+        all_ok = all_ok and ran_ok
         if pending is None:
-            return
+            break
         input("\n[APPROVAL GATE] Paused. Press Enter to simulate the user approving this step...")
         print(f"[TEST] Simulated approval granted for: {pending.goal!r}")
-        await run_action(action_runner, session_id, pending)
+        all_ok = (await run_action(action_runner, session_id, pending)) and all_ok
         remaining = remaining[remaining.index(pending) + 1:]
+    return "completed" if all_ok else "failed"
 
 
 async def run_voice_command(
@@ -356,15 +385,17 @@ async def run_spoken_command(name: str, *, device: int | None) -> None:
 
     action_runner = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
     action_session = await action_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-    success = False
+    outcome = "failed"
     try:
-        await run_plan_with_approval_gate(action_runner, action_session.id, plan.milestones)
-        success = True
+        outcome = await run_plan_with_approval_gate(action_runner, action_session.id, plan.milestones)
     finally:
         # Tier 1 memory write: every real task command that runs gets a
-        # command_history row, pass or fail (see memory/store.py).
+        # command_history row, and `success` reflects whether the Action
+        # agent's own tools actually confirmed the outcome - not just "the
+        # pipeline didn't crash" (see memory/store.py, planning.md).
+        success = outcome == "completed"
         memory_store.log_command(transcript, summarize_plan(plan), success)
-        print(f"\n[MEMORY] logged command (transcript={transcript!r}, success={success})")
+        print(f"\n[MEMORY] logged command (transcript={transcript!r}, outcome={outcome}, success={success})")
 
 
 async def run_voice_session(only: str | None = None, *, device: int | None = None) -> None:
@@ -412,8 +443,8 @@ async def run_typed_regression() -> None:
     if spotify_plan is not None:
         action_runner = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
         action_session = await action_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-        await run_plan_with_approval_gate(action_runner, action_session.id, spotify_plan.milestones)
-        memory_store.log_command("open Spotify and play Billie Jean by Michael Jackson", summarize_plan(spotify_plan), True)
+        outcome = await run_plan_with_approval_gate(action_runner, action_session.id, spotify_plan.milestones)
+        memory_store.log_command("open Spotify and play Billie Jean by Michael Jackson", summarize_plan(spotify_plan), outcome == "completed")
 
     # Reminder, full chain.
     session3 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
@@ -423,8 +454,8 @@ async def run_typed_regression() -> None:
     if reminder_plan is not None:
         action_runner2 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
         action_session2 = await action_runner2.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-        await run_plan_with_approval_gate(action_runner2, action_session2.id, reminder_plan.milestones)
-        memory_store.log_command("set a reminder to call mom tomorrow at 5pm", summarize_plan(reminder_plan), True)
+        outcome = await run_plan_with_approval_gate(action_runner2, action_session2.id, reminder_plan.milestones)
+        memory_store.log_command("set a reminder to call mom tomorrow at 5pm", summarize_plan(reminder_plan), outcome == "completed")
 
     # Kayak, full chain including the approval-gate pause. Jarvis opens
     # Chrome and navigates to Kayak itself now (first milestone,
@@ -437,8 +468,8 @@ async def run_typed_regression() -> None:
     if kayak_plan is not None:
         action_runner3 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
         action_session3 = await action_runner3.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-        await run_plan_with_approval_gate(action_runner3, action_session3.id, kayak_plan.milestones)
-        memory_store.log_command("open Kayak and search for a flight to New York", summarize_plan(kayak_plan), True)
+        outcome = await run_plan_with_approval_gate(action_runner3, action_session3.id, kayak_plan.milestones)
+        memory_store.log_command("open Kayak and search for a flight to New York", summarize_plan(kayak_plan), outcome == "completed")
 
 
 def _parse_args(argv: list[str]) -> dict:

@@ -146,14 +146,21 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
     police its own execution. The only change from the CLI version is what
     the pause waits on: a client message instead of a keypress.
 
-    Returns "completed" or "rejected" so the caller can record the outcome
-    in command_history.
+    Returns one of:
+      "completed" - every milestone that ran reported its tools succeeded
+      "rejected"  - the user rejected an approval gate
+      "failed"    - a milestone ran but its tools reported failure
+
+    so the caller can record the honest outcome in command_history and the
+    UI can show an honest terminal state - not a silent "done" over a run
+    where nothing actually worked (see planning.md).
     """
     action_runner = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
     action_session = await action_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
 
     await session.send({"type": "state", "state": "doing"})
 
+    failed_goals: list[str] = []
     for milestone in plan.milestones:
         if milestone.requires_approval:
             logger.info("agent server: awaiting real approval for %r", milestone.goal)
@@ -171,12 +178,17 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
             await session.send({"type": "approval_result", "approved": approved})
             if not approved:
                 logger.info("agent server: user REJECTED %r - not executing it", milestone.goal)
-                await session.send(
-                    {"type": "state", "state": "done", "reason": "rejected", "goal": milestone.goal}
-                )
+                await session.send({"type": "state", "state": "cancelled", "goal": milestone.goal})
                 return "rejected"
 
-        await run_action(action_runner, action_session.id, milestone, on_event=session.send)
+        ok = await run_action(action_runner, action_session.id, milestone, on_event=session.send)
+        if not ok:
+            failed_goals.append(milestone.goal)
+
+    if failed_goals:
+        logger.info("agent server: run FAILED - milestones did not verify: %s", failed_goals)
+        await session.send({"type": "state", "state": "failed", "failed_goals": failed_goals})
+        return "failed"
 
     await session.send({"type": "state", "state": "done", "reason": "completed"})
     return "completed"
@@ -216,9 +228,12 @@ async def _handle_command(session: ClientSession, text: str) -> None:
     except Exception as exc:  # noqa: BLE001 - surface the real failure to the UI
         logger.exception("agent server: command failed")
         await session.send({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
-        await session.send({"type": "state", "state": "done", "reason": "error"})
+        await session.send({"type": "state", "state": "failed", "reason": "error"})
     finally:
         if plan_summary is not None:
+            # success reflects the real execution outcome ("completed"), not
+            # "the pipeline didn't crash" - a run where the Action agent's
+            # own tools failed logs as success=False.
             memory_store.log_command(text, plan_summary, success)
             logger.info("agent server: command logged to memory (success=%s)", success)
 
