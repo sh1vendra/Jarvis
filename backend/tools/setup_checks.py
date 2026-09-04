@@ -144,17 +144,28 @@ def check_screen_recording() -> dict:
 # A `tell application "X"` command launches X if it isn't already running
 # (confirmed directly, repeatedly, elsewhere in this project) - for a
 # background helper like System Events that has no visible window, that's
-# a non-issue, but for a real GUI app (Reminders, Spotify, Google Chrome)
-# it would mean this setup screen silently popping open apps the user
-# never asked for, just to run a permission check. So: System Events is
-# always probed directly; Reminders/Spotify/Chrome are only probed if
-# NSWorkspace shows them already running (a real check requiring no
-# permission at all - confirmed directly) - otherwise this honestly
-# reports "not running, will be confirmed when you actually use it"
-# rather than forcing a launch or guessing.
+# a non-issue, but for a real GUI app (Reminders, Spotify, Google Chrome,
+# Calendar, Notes, Messages) it would mean this setup screen silently
+# popping open apps the user never asked for, just to run a permission
+# check. So: System Events is always probed directly; every real GUI app
+# below is only probed if NSWorkspace shows it already running (a real
+# check requiring no permission at all - confirmed directly, including
+# that "Calendar"/"Notes"/"Messages" are exactly the localizedName values
+# NSWorkspace reports for each) - otherwise this honestly reports "not
+# running, will be confirmed when you actually use it" rather than forcing
+# a launch or guessing.
+#
+# Calendar, Notes, and Messages were added here alongside the Calendar/
+# Notes/Messages tools themselves (native_apps.py) - each needs its own
+# separate Automation grant the first time Jarvis actually uses it, the
+# same TCC-per-target-app model already covered by Reminders/Spotify/
+# Chrome above, confirmed directly rather than assumed to carry over.
 _AUTOMATION_TARGETS = [
     ("automation_system_events", "Automation - System Events", "System Events", True),
     ("automation_reminders", "Automation - Reminders", "Reminders", False),
+    ("automation_calendar", "Automation - Calendar", "Calendar", False),
+    ("automation_notes", "Automation - Notes", "Notes", False),
+    ("automation_messages", "Automation - Messages", "Messages", False),
     ("automation_spotify", "Automation - Spotify", "Spotify", False),
     ("automation_chrome", "Automation - Google Chrome", "Google Chrome", False),
 ]
