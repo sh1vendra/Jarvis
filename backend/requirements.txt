@@ -9,3 +9,5 @@ Pillow
 websockets
 SpeechRecognition
 sounddevice
+openwakeword
+onnxruntime

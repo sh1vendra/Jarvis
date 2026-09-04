@@ -6,8 +6,14 @@
 #   - pyobjc-framework-* : macOS Accessibility/Quartz bindings. Don't exist
 #     on Linux; tools/mac_control.py and tools/perception.py guard their
 #     imports and raise a clear error if the Mac-only functions are called.
-#   - sounddevice        : microphone capture (voice/capture.py), CLI-only,
-#     not in the agent server's import chain.
+#   - sounddevice, openwakeword, onnxruntime : microphone capture and
+#     wake-word detection (voice/capture.py, voice/wakeword.py). There is
+#     no microphone in this container - voice/wakeword.py's own guarded
+#     imports mean agent_server.py still imports cleanly without these
+#     installed (confirmed directly by building and running this exact
+#     image - see planning.md), it just reports wake word unavailable,
+#     and start_wakeword_listener() is never even called on this path
+#     (only reached from _main(), which the Cloud Run branch skips).
 #
 # Pinned to the versions running locally so the container is reproducible.
 
