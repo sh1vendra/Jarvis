@@ -480,6 +480,19 @@ export default function App() {
     setPendingApproval(null);
   }, []);
 
+  // Real cancel - the WS message and the backend-side handling for it
+  // (ClientSession.cancel_pending -> Task.cancel()) already existed; this
+  // is the missing UI affordance that actually calls it. Deliberately
+  // doesn't flip local state itself - the backend's own
+  // `{"type": "state", "state": "idle", "reason": "cancelled"}` reply
+  // (already handled by the existing "state" case above) is what moves the
+  // UI back to idle, so this button reports what the backend actually did,
+  // not what the click optimistically assumed.
+  const cancelRun = useCallback(() => {
+    clientRef.current.send({ type: "cancel" });
+    log("cancel requested by user");
+  }, [log]);
+
   // Enter approves, Escape rejects - a real keypress, same as a real click.
   useEffect(() => {
     if (!pendingApproval) return;
@@ -794,6 +807,22 @@ export default function App() {
                 </li>
               ))}
             </ol>
+          )}
+
+          {state === "doing" && (
+            // Only during "doing" - a real, potentially wrong, multi-step
+            // run is actually in progress. Not shown during "approving":
+            // that state already has its own real stop affordance (Reject),
+            // and a second, differently-worded button for the same
+            // decision would just be confusing. Sends the same real
+            // `{"type": "cancel"}` message the backend has always accepted
+            // (see agent_server.py) - this button is what was missing, not
+            // new backend wiring.
+            <div className="doingActions">
+              <button className="btn btnReject" onClick={cancelRun}>
+                Cancel
+              </button>
+            </div>
           )}
 
           {pendingApproval && (

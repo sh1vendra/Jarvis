@@ -617,6 +617,18 @@ body {
   -webkit-app-region: no-drag;
 }
 
+/* Same row shape as .approvalActions - a single real stop affordance
+   during "doing" specifically (see App.jsx's cancelRun). Not merged into
+   .approvalActions itself: that class's name is specifically about an
+   approval decision, and this button appears in a different state
+   entirely (never both at once), so a shared class would say something
+   about it that isn't true. */
+.doingActions {
+  display: flex;
+  margin-top: 12px;
+  -webkit-app-region: no-drag;
+}
+
 .btn {
   flex: 1;
   display: inline-flex;
