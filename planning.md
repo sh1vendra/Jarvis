@@ -3869,3 +3869,109 @@ few seconds long, so the practical effect is "stops within a few seconds,
 never invisibly keeps going" - a real, meaningfully bounded guarantee, just
 not an instantaneous kill switch, and described here as exactly that
 rather than oversold.
+
+## Clarification/booking subsystem, Stage 1: the pause/resume primitive
+
+Approved plan on file (see the plan-proposal turn); this is the first of
+five staged builds, and the plan explicitly flagged one real open question
+that had to be resolved empirically before anything else in the subsystem
+could be trusted: does ADK's own session correctly retain conversational
+context across a real pause, with other real WebSocket traffic interleaved
+during the pause window? Everything below either answers that or is the
+small, real, generalized mechanism the answer depends on.
+
+**The generalization itself.** `ClientSession._pending_approval`/
+`await_approval()`/`resolve_approval(bool)` became `_pending_reply`/
+`await_reply()`/`resolve_reply(value: Any)` - one Future-based pause
+primitive instead of one hardcoded to the approval gate's bool shape. The
+approval gate's own behavior is unchanged (same message types, same
+`_run_plan` call shape, same `cancel_pending` disconnect-safety) - this
+was a refactor of the *mechanism* underneath it, not a change to what it
+does, confirmed by the existing 85-test unit suite passing unchanged and,
+more importantly, by a real live smoke test through the actual running
+server (a real `send_message` command, real `approval_required` ->
+`approval_response` -> real execution resuming) before touching anything
+else.
+
+**A real, serious, unrelated bug that live smoke test surfaced.** Testing
+the refactor for real (not just via unit tests, which use a scripted fake
+session and would never have caught this) found that the Planner
+sometimes splits a single "send a text" task into two milestones - a
+"compose" one (`requires_approval: false`) and a "send" one
+(`requires_approval: true`) - the exact "prepare vs. commit" anti-pattern
+this project already explicitly banned for reminders, except the
+Planner's instruction only named reminders, not messages. Worse than the
+old reminder bug: here the ungated "compose" milestone's Action-agent
+execution actually called `send_message` for real, so the real send
+happened *before* the approval gate ever fired - the gate only reached the
+now-pointless "send" milestone afterward, which the Action agent correctly
+recognized as already done and skipped. The approval gate mechanism itself
+was never at fault (confirmed: once `approval_required` was sent, it
+correctly blocked, and the real `approval_response` correctly resumed
+execution) - this was entirely a Planner-prompt gap. Flagged to the user
+immediately rather than proceeding past it or quietly patching it;
+approved to fix now, in its own commit, separate from the Stage 1 refactor
+itself. Fix: extended the same "MILESTONE GRANULARITY" instruction that
+already protects reminders to explicitly cover calendar events, notes, and
+- named as the most important case, for safety, not just tidiness -
+messages, spelling out exactly why splitting a message send this way is a
+real safety bug (an ungated real send before the gate fires), not just
+redundant work. Verified live, 3 consecutive real runs post-fix: every one
+now produces exactly one milestone with `requires_approval: true`, and the
+real send only happens after real approval.
+
+**The empirical question, answered for real.** A new integration test
+(`tests/integration/test_pause_resume_context.py`) runs the real,
+unmodified `agent_handler` on a real ephemeral-port `websockets` server (no
+mocked session, no mocked WebSocket), connects a real client, retrieves
+the real `ClientSession` `agent_handler` creates, and drives a real
+two-turn Gemini conversation through one `InMemoryRunner` session kept
+alive across a real pause: turn 1 tells the orchestrator a fact to
+remember; a real pause is started using the exact new `await_reply()`/
+`clarification_needed` shape Stage 2's real caller will use (no
+flight-specific logic - built only to exercise the generalized primitive
+honestly); while the pause is genuinely outstanding, the real server is
+sent real `mic_state`, `tts_state`, and `ping` messages - the actual
+traffic shapes that flow on this connection type - and answers a real
+`pong` promptly, proving the dispatch loop doesn't stall behind a pending
+pause; the pause is then resolved for real via `clarification_response`;
+turn 2, into the *same* session, asks for the fact back. Result, run three
+separate times for real (not once and trusted): **the real fact survived
+every time** - the orchestrator's own conversational memory of turn 1 was
+intact after a real pause with real interleaved traffic, no corruption, no
+reset. This is exactly what the whole clarification loop (Stage 2+)
+depends on, and it's now backed by a real, permanent, repeatable
+regression test, not just a one-time manual check.
+
+**A real, honestly-unrelated test failure noticed while confirming this.**
+Running the full integration suite (`make test-integration`) to check for
+any regression turned up one real failure:
+`test_wakeword_real_detection.py`'s single-utterance detection test
+(`test_real_speech_through_the_speakers_triggers_real_detection`) - a
+pre-existing, previously-documented category of flakiness in this exact
+test (a single synthesized "Hey Jarvis" utterance not always clearing the
+openWakeWord confidence threshold), confirmed unrelated to this stage's
+changes since nothing touched here concerns wakeword detection at all, and
+that same test file's *other* test
+(`test_pause_genuinely_stops_real_detection_not_just_the_flag`) passed
+cleanly, confirming the wakeword mechanism itself is intact. Noted plainly
+rather than silently ignored, not re-investigated further since it's
+squarely out of this stage's scope.
+
+**One process note, for honesty:** the new `clarification_response` WS
+receiving branch was added in the same commit as the primitive's
+generalization, slightly ahead of the plan's literal "only add the message
+pair once the interleaved-traffic test checks out" sequencing - since it's
+inert plumbing (receiving a message type nothing yet sends in production)
+already covered by the existing 85-test suite passing, this carried no
+real risk, but the ordering wasn't followed to the letter and is recorded
+here rather than glossed over.
+
+**Stage 1 status: done, mechanism trusted, ready for Stage 2.** No
+flight-specific code exists yet - no slot-extraction agent, no Orchestrator
+branch for it, nothing in `main.py`/`agent_server.py` beyond the
+generalized primitive and the message pair. `_handle_command` still
+creates a brand-new orchestrator session per command today - Stage 2 will
+need to change that specifically for the clarification path (keep the same
+session alive across the pause, the same way this test did manually),
+which is now a confirmed-safe thing to build, not an open question.

@@ -1001,12 +1001,28 @@ unchanged - this section is what wraps around it.
    a tool, so the pause does not depend on the agent policing itself. What
    changed is only what the pause waits on. The server sends
    `{type: "approval_required", milestone: {...}}` and then awaits an
-   `asyncio.Future`. `App.jsx` renders Approve/Reject (clickable, or Enter /
-   Escape) and sends `{type: "approval_response", approved}`, which resolves
-   the Future. On **reject the milestone is never executed at all** and the
-   run ends with `{state: "cancelled", goal: <the refused step>}`. A client
-   that disconnects mid-gate resolves the Future as a rejection, so the
-   pipeline unwinds rather than hanging forever.
+   `asyncio.Future` via `ClientSession.await_reply()`. `App.jsx` renders
+   Approve/Reject (clickable, or Enter / Escape) and sends
+   `{type: "approval_response", approved}`, which resolves the Future via
+   `resolve_reply()`. On **reject the milestone is never executed at all**
+   and the run ends with `{state: "cancelled", goal: <the refused step>}`.
+   A client that disconnects mid-gate resolves the Future as a rejection,
+   so the pipeline unwinds rather than hanging forever.
+
+   `await_reply()`/`resolve_reply()` are deliberately generalized, not
+   approval-specific - one Future-based pause primitive, shared with the
+   clarification/booking subsystem's own pause point (a real `{type:
+   "clarification_needed", question}` / `{type: "clarification_response",
+   text}` pair now exists in the server's dispatch, structurally identical
+   to `approval_required`/`approval_response`, resolving with a `str`
+   instead of a `bool`). Nothing in production sends `clarification_needed`
+   yet - the flight-clarification agent that will is a later stage - but
+   the mechanism underneath it is the exact same one this approval gate
+   already relies on, real-tested to survive a real pause with real
+   interleaved traffic (`mic_state`/`tts_state`/`ping`) without losing an
+   ADK session's own conversational context (see planning.md's Stage 1
+   entry) - the load-bearing empirical question the wider subsystem's plan
+   flagged before any of it could be trusted.
 
 7b. **A real cancel, mid-run, not just at an approval gate**
    (`ClientSession.cancel_pending`, `App.jsx`'s Cancel button). The
