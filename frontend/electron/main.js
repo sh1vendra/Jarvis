@@ -18,6 +18,7 @@
 // makes the Electron binary behave as plain Node - see the `dev:electron`
 // script in package.json.
 import { app, BrowserWindow, globalShortcut, ipcMain, screen, systemPreferences } from "electron";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,6 +27,23 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const HOTKEY = "CommandOrControl+Shift+Space";
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || "http://localhost:5173";
+
+// Speech output: macOS's built-in `say`, no npm package, no API key, no
+// network call - the same local-first shape as everything else in this
+// project. Runs here (Electron main), not the Python backend, even though
+// `say` is just as callable via subprocess from Python (mac_control.py
+// already runs osascript/screencapture that way) - verified this was the
+// better split before building it, not assumed: the backend's own
+// command-handling code (agent_server.py's _handle_command/_run_plan) is
+// shared, unguarded, Cloud-Run-reachable code, so speaking from there would
+// need an explicit Mac-only guard threaded through several scattered exit
+// points. Electron main is structurally never part of the Cloud Run
+// deployment at all - nothing to guard, the code simply doesn't exist
+// there - and it's already the process that owns renderer-facing UI status
+// (recording, and now speaking), so there's no risk of the "is Jarvis
+// speaking" signal drifting from what's actually playing. See planning.md.
+const TTS_VOICE = "Daniel"; // en-GB, confirmed installed on this machine (`say -v '?'`)
+let ttsProcess = null; // the currently-playing `say` child process, or null
 
 const WINDOW_WIDTH = 460;
 const WINDOW_HEIGHT = 340;
@@ -185,6 +203,55 @@ function sendToRenderer(channel, payload) {
   }
 }
 
+// Speaks `text` via `say -v Daniel`, real subprocess (child_process.spawn -
+// confirmed directly this does not block Node's event loop: a spawned
+// `say` call returns control in ~2ms and the loop keeps ticking normally
+// for the several seconds actual playback takes). Reports the real process
+// lifecycle to the renderer as `jarvis:speaking-status` so its "speaking"
+// state can never drift from what's actually playing - true the instant
+// the process starts, false only once it actually closes (naturally
+// finished OR killed), never inferred from an estimated duration.
+function speak(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return;
+  // Interrupt any speech already in progress rather than queueing/talking
+  // over it - also matters for the hotkey specifically: pressing it while
+  // Jarvis is still talking should not let Jarvis's own voice bleed into
+  // the new recording that's about to start. (Wake word can't hit this
+  // race at all - the backend keeps its mic paused for as long as
+  // tts_state reports speaking=true, so a wake-word capture can never
+  // start mid-speech in the first place; see agent_server.py.)
+  stopSpeaking();
+  console.log(`[main] speaking: ${JSON.stringify(trimmed)}`);
+  const proc = spawn("say", ["-v", TTS_VOICE, trimmed]);
+  ttsProcess = proc;
+  sendToRenderer("jarvis:speaking-status", { speaking: true });
+
+  const finish = () => {
+    if (ttsProcess === proc) {
+      ttsProcess = null;
+      sendToRenderer("jarvis:speaking-status", { speaking: false });
+    }
+  };
+  proc.on("close", finish);
+  proc.on("error", (err) => {
+    console.error("[main] say failed:", err.message);
+    finish();
+  });
+}
+
+/** Interrupts in-progress speech, if any - a real process kill (confirmed
+ * directly: SIGTERM stops `say`'s own audio playback immediately, it does
+ * not hand off to some separate daemon that keeps playing after the CLI
+ * process dies), not just abandoning the reference. */
+function stopSpeaking() {
+  if (ttsProcess) {
+    ttsProcess.kill();
+    // The 'close' handler above fires from this and clears ttsProcess /
+    // sends speaking:false - no need to duplicate that here.
+  }
+}
+
 // The hotkey's own start/stop bookkeeping. Wake word ("Hey Jarvis") is a
 // second, independent trigger, but it no longer funnels through here - it
 // lives on the Python backend now (voice/wakeword.py) and reaches the
@@ -196,6 +263,7 @@ function sendToRenderer(channel, payload) {
 function startListening(source) {
   if (isRecording) return;
   isRecording = true;
+  stopSpeaking(); // see speak()'s comment - avoid Jarvis's own voice bleeding into the new capture
   console.log(`[main] START recording (via ${source})`);
   sendToRenderer("jarvis:hotkey", { action: "start", source });
 }
@@ -288,7 +356,15 @@ ipcMain.on("jarvis:log", (_event, message) => {
   console.log(`[renderer] ${message}`);
 });
 
+// The renderer relays the backend's `{"type": "speak", "text": ...}`
+// WebSocket message straight here - it arrives in the renderer (that's
+// where the WebSocket connection lives) but only main can spawn `say`.
+ipcMain.on("jarvis:speak", (_event, text) => {
+  speak(text);
+});
+
 app.on("will-quit", () => {
+  stopSpeaking(); // don't leave audio playing after the app itself has quit
   globalShortcut.unregisterAll();
 });
 

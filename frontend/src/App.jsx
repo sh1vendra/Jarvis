@@ -38,6 +38,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [captureInfo, setCaptureInfo] = useState(null);
   const [wakeWord, setWakeWord] = useState({ available: false, reason: "" });
+  const [speaking, setSpeaking] = useState(false); // true exactly while `say` is actually playing (see main.js)
   const [failedGoals, setFailedGoals] = useState([]); // goals whose tools didn't verify
   const [cancelledGoal, setCancelledGoal] = useState(""); // the step the user rejected
 
@@ -142,6 +143,16 @@ export default function App() {
             // indistinguishable from a hotkey-triggered one.
             log('wake word: "Hey Jarvis" detected');
             beginCapture("wakeword");
+            break;
+          case "speak":
+            // The backend already decided the final text (personality
+            // flavor and any trimming-for-speech both applied there, see
+            // agent_server.py) - this just relays it to Electron main,
+            // which is the only process that can actually spawn `say`.
+            if (msg.text) {
+              log(`speaking: "${msg.text}"`);
+              window.jarvis.speak(msg.text);
+            }
             break;
           default:
             break;
@@ -283,6 +294,22 @@ export default function App() {
     return off;
   }, [beginCapture, stopAndSend]);
 
+  // ── Speaking status: real `say` process lifecycle, reported by main.js ──
+  // Relayed straight to the backend as `tts_state` so it can pause the
+  // wake-word listener while audio is actually playing through the
+  // speakers - otherwise Jarvis's own voice risks being picked up by its
+  // own wake-word mic and false-triggering or confusing detection. `speaking`
+  // itself is also kept as real component state for the UI - not yet given
+  // its own visual treatment (that's the queued Dynamic-Island-style work),
+  // but genuinely tracked and available now rather than only inferred.
+  useEffect(() => {
+    const off = window.jarvis.onSpeakingStatus(({ speaking: isSpeaking }) => {
+      setSpeaking(Boolean(isSpeaking));
+      clientRef.current.send({ type: "tts_state", speaking: Boolean(isSpeaking) });
+    });
+    return off;
+  }, []);
+
   const decide = useCallback((approved) => {
     clientRef.current.send({ type: "approval_response", approved });
     setPendingApproval(null);
@@ -310,7 +337,7 @@ export default function App() {
   const wakewordStatus = !wakeWord.available ? "unavailable" : state === "listening" ? "paused" : "listening";
 
   return (
-    <div className="stage" data-state={state} data-wakeword={wakewordStatus}>
+    <div className="stage" data-state={state} data-wakeword={wakewordStatus} data-speaking={speaking}>
       <div className="glass">
         {/* Frameless windows draw no OS titlebar. The drag region is the
             `.header` row only (see styles.css), NOT the whole glass: a
