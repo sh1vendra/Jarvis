@@ -60,6 +60,47 @@ def _require_macos() -> None:
         )
 
 
+def _parse_datetime(date_str: str, time_str: str) -> tuple[datetime | None, str | None]:
+    """Parses a natural-language or ISO date+time pair via dateparser - the
+    one shared date/time understanding every tool that needs a real datetime
+    from user-facing text reuses (create_reminder here, create_calendar_event
+    in native_apps.py), so phrasing is understood identically everywhere
+    instead of being reimplemented per tool. dateparser understands both
+    natural language ("tomorrow", "5pm") and ISO-style input, so callers
+    don't need fragile string matching for every phrasing the Planner/Action
+    agent might produce.
+
+    Returns (parsed_datetime, None) on success, or (None, error_message) if
+    dateparser couldn't make sense of the input.
+    """
+    parsed = dateparser.parse(f"{date_str} {time_str}")
+    if parsed is None:
+        return None, f"Could not understand date/time: {date_str!r} {time_str!r}"
+    return parsed, None
+
+
+def _applescript_date_lines(var_name: str, dt: datetime) -> str:
+    """Emits the AppleScript lines that build a `date` object representing
+    dt into var_name - the standard idiom every tool needing an exact
+    AppleScript date/time shares (create_reminder here, create_calendar_event
+    in native_apps.py): AppleScript has no native way to construct an
+    arbitrary date from numbers in one call, so the idiom is to grab
+    `(current date)` (today, right now) and then overwrite its `year`/
+    `month`/`day`/`hours`/`minutes`/`seconds` properties one at a time until
+    it represents the date/time actually wanted. Seconds are always zeroed -
+    nothing in this codebase works at sub-minute precision.
+    """
+    return (
+        f"set {var_name} to (current date)\n"
+        f"    set year of {var_name} to {dt.year}\n"
+        f"    set month of {var_name} to {dt.month}\n"
+        f"    set day of {var_name} to {dt.day}\n"
+        f"    set hours of {var_name} to {dt.hour}\n"
+        f"    set minutes of {var_name} to {dt.minute}\n"
+        f"    set seconds of {var_name} to 0\n"
+    )
+
+
 def _build_applescript(task: str, due_date: datetime, list_name: str) -> str:
     """Builds the AppleScript source that creates one reminder in a specific
     named list, creating that list first if it doesn't already exist.
@@ -72,11 +113,6 @@ def _build_applescript(task: str, due_date: datetime, list_name: str) -> str:
       is AppleScript's existence check - there's no get-or-create helper, so
       we ask "does this named object exist" before creating it, same idea as
       `if not os.path.exists(...): os.makedirs(...)`.
-    - AppleScript has no native way to construct an arbitrary date from
-      numbers in one call, so the idiom is: grab `(current date)` (today,
-      right now) and then overwrite its `year`/`month`/`day`/`hours`/
-      `minutes`/`seconds` properties one at a time until it represents the
-      date/time we actually want.
     - `list "X"` refers to a specific named list by name, as opposed to
       `default list` (whichever list is the user's default, usually
       "Reminders") - we target a specific list explicitly so automated/test
@@ -96,19 +132,40 @@ tell application "Reminders"
     if not (exists list "{safe_list_name}") then
         make new list with properties {{name:"{safe_list_name}"}}
     end if
-    set dueDate to (current date)
-    set year of dueDate to {due_date.year}
-    set month of dueDate to {due_date.month}
-    set day of dueDate to {due_date.day}
-    set hours of dueDate to {due_date.hour}
-    set minutes of dueDate to {due_date.minute}
-    set seconds of dueDate to 0
+    {_applescript_date_lines("dueDate", due_date)}
     tell list "{safe_list_name}"
         make new reminder with properties {{name:"{safe_task}", due date:dueDate}}
     end tell
 end tell
 return "ok"
 '''
+
+
+def _verify_reminder_exists(task: str, due_date: datetime, list_name: str) -> bool:
+    """Real read-back: queries Reminders' own live object model for a
+    reminder matching both name and due date, via a fresh `osascript`
+    process - the same "ask again independently" pattern
+    _frontmost_app_name() already uses elsewhere in this module - rather
+    than trusting the creation script's own successful exit code as proof
+    the reminder actually persisted.
+    """
+    safe_task = task.replace('"', '""')
+    safe_list_name = list_name.replace('"', '""')
+    script = f'''
+tell application "Reminders"
+    {_applescript_date_lines("dueDate", due_date)}
+    tell list "{safe_list_name}"
+        return count of (every reminder whose name is "{safe_task}" and due date is dueDate)
+    end tell
+end tell
+'''
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0:
+        return False
+    try:
+        return int(result.stdout.strip()) >= 1
+    except ValueError:
+        return False
 
 
 def create_reminder(task: str, due_date: str, due_time: str, list_name: str = "Jarvis Test") -> dict:
@@ -124,21 +181,16 @@ def create_reminder(task: str, due_date: str, due_time: str, list_name: str = "J
 
     Returns:
         A dict with:
-            success: bool, whether the reminder was actually created
+            success: bool, True only if the reminder was independently
+                confirmed to exist by querying Reminders back afterward -
+                not just that the creation command didn't error
             message: human-readable summary of what happened
             error: the raw error string if something went wrong, else None
     """
-    # dateparser understands both natural language ("tomorrow", "5pm") and
-    # ISO-style input, so we don't hand-roll fragile string matching for
-    # every phrasing the Planner/Action agent might produce.
     _require_macos()
-    parsed = dateparser.parse(f"{due_date} {due_time}")
+    parsed, err = _parse_datetime(due_date, due_time)
     if parsed is None:
-        return {
-            "success": False,
-            "message": f"Could not understand date/time: {due_date!r} {due_time!r}",
-            "error": "date_parse_failed",
-        }
+        return {"success": False, "message": err, "error": "date_parse_failed"}
 
     script = _build_applescript(task, parsed, list_name)
 
@@ -176,9 +228,26 @@ def create_reminder(task: str, due_date: str, due_time: str, list_name: str = "J
             "error": stderr,
         }
 
+    # Don't report success just because the creation script's own exit code
+    # was clean - independently query Reminders back to confirm the
+    # reminder actually persisted, the same standard every tool in this
+    # module is held to elsewhere (click_ui, type_in_field, open_app).
+    if not _verify_reminder_exists(task, parsed, list_name):
+        return {
+            "success": False,
+            "message": (
+                f"osascript reported no error creating '{task}' but it could not be found on "
+                f"read-back in list '{list_name}' - treating this as not actually created."
+            ),
+            "error": "verify_failed",
+        }
+
     return {
         "success": True,
-        "message": f"Created reminder '{task}' due {parsed.strftime('%Y-%m-%d %H:%M')} in list '{list_name}'.",
+        "message": (
+            f"Created reminder '{task}' due {parsed.strftime('%Y-%m-%d %H:%M')} in list "
+            f"'{list_name}', confirmed by reading it back."
+        ),
         "error": None,
     }
 
