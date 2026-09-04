@@ -139,10 +139,13 @@ milestone reads "the destination Austin, Texas is entered".
 
 ## 4. Action agent's tool selection and execution loop
 
-`agents/action.py` defines `action_agent`, given nine tools -
+`agents/action.py` defines `action_agent`, given twelve tools -
 `open_app_tool`, `search_spotify_candidates_tool`, `click_ui_tool`,
 `type_in_field_tool`, `create_reminder_tool` (native macOS control, from
-`tools/mac_control.py`) plus `navigate_to_url_tool`, `find_web_element_tool`,
+`tools/mac_control.py`), `create_calendar_event_tool`, `create_note_tool`,
+`send_message_tool` (native macOS control, from `tools/native_apps.py` -
+same AppleScript-then-verify pattern as `create_reminder_tool`, see
+section 7) plus `navigate_to_url_tool`, `find_web_element_tool`,
 `click_web_element_tool`, `type_in_web_field_tool` (browser control, from
 `tools/browser_tools.py`, see section 8). It receives one milestone goal
 per turn (driven by
@@ -196,7 +199,16 @@ instruction now treats `ambiguous` as a hard rule to check first:
 -> `click_ui` (requires `expected_app_name`); "text entered" ->
 `type_in_field` (same requirement); "reminder exists" -> `create_reminder`
 (extracts `task`/`due_date`/`due_time` as plain text, no manual date
-computation by the model);
+computation by the model); "calendar event exists" -> `create_calendar_event`
+(extracts `title`/`event_date`/`event_time`, same plain-text-only-no-manual-
+computation rule, plus `duration_minutes` only if actually mentioned);
+"note exists" -> `create_note` (extracts `content`, `title` only if the
+user actually gave one); "text/message sent to someone" -> `send_message`
+**only** with an exact phone number or email as `recipient` - the
+instruction explicitly tells the agent not to guess a number for a bare
+name ("text mom") and to ask for the exact contact instead, and this
+milestone will only ever already be `requires_approval=true` by the time
+the agent sees it (see section 7's `send_message` entry for why);
 "browser is open at a website" (e.g. "Google Chrome is open with
 www.kayak.com loaded") -> `navigate_to_url`, with the agent turning a site
 name into a URL itself (Kayak -> `https://www.kayak.com`) - this is always
@@ -451,6 +463,45 @@ action with no inspectable in-between state, so there is nothing for a
 second milestone to represent. See `planning.md`'s "reminder created twice"
 entry. Verified: 3 consecutive real runs, each producing exactly one entry
 (queried from Reminders.app, not read off the tool's own success report).
+`create_reminder` now also independently queries Reminders back after
+creating (matching on name + due date) before reporting success - added
+after finding it previously only trusted the creation script's own clean
+exit code, no different from every other tool's read-back-then-report
+standard (see planning.md).
+
+**Calendar, Notes, Messages (`tools/native_apps.py`) - the same pattern,
+generalized.** `create_calendar_event(title, event_date, event_time,
+duration_minutes=60, calendar_name="Jarvis Test")` and
+`create_note(content, title=None, account="iCloud", folder="Jarvis Test")`
+are structurally identical to `create_reminder`: reuse
+`_parse_datetime`/`_applescript_date_lines` from `mac_control.py` where a
+date is involved, build a get-or-create-then-create AppleScript, run it,
+then independently query the app back (Calendar: an event matching title
++ both dates; Notes: the note's own rendered `plaintext` actually
+containing the given content, not just a title match) before reporting
+success. Both default into a dedicated "Jarvis Test" destination (a
+calendar, a Notes folder) created automatically the first time it's
+needed - same isolation reasoning as Reminders' "Jarvis Test" list, this
+machine's real calendars/folders (Home/Work/synced; a work folder and the
+default Notes folder) confirmed none of them sensible defaults for test
+data.
+
+`send_message(recipient, text)` shares the same AppleScript-then-run shape
+but is genuinely different downstream: it is the plan's own
+`requires_approval=true` milestone (the Planner's existing consequential-
+action rule already covers "sending a message" unchanged - confirmed via a
+real Orchestrator -> Planner run), so `_run_plan` (section 10) pauses at
+it exactly like Kayak's final submit step before the Action agent ever
+calls it - the second real demonstration of that same gate, not a new one.
+Recipient resolution is deliberately narrow (exact phone number or exact
+email only, never a name - there is no reliable way to resolve an
+ambiguous contact name found), and verification is honestly weaker than
+every other tool here: Messages' AppleScript dictionary exposes no way to
+read a chat's message content back, and the one API that could
+(`~/Library/Messages/chat.db` directly) needs Full Disk Access, deliberately
+not taken on (see planning.md). `success: true` here means "recipient
+passed strict format validation and the AppleScript send completed with no
+error" - never confirmed real delivery.
 
 ## 8. Browser control path
 
@@ -772,7 +823,9 @@ unchanged - this section is what wraps around it.
      through `preload.cjs`'s `getMicPermissionStatus`) - the real current
      macOS TCC state, not "was a prompt ever shown."
    - **Backend** (`google_api_key`, `accessibility`, `screen_recording`,
-     four `automation_*` checks, `chrome_extension`) - real checks in
+     seven `automation_*` checks - System Events, Reminders, Calendar,
+     Notes, Messages, Spotify, Google Chrome, one per real per-app
+     Automation grant - `chrome_extension`) - real checks in
      `backend/tools/setup_checks.py`, run on request. The renderer sends
      `{"type": "run_setup_checks"}` once the socket reaches `connected`
      (and again on demand - the screen's "Recheck" button); the server

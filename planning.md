@@ -3624,3 +3624,142 @@ the persistent indicator, the deep links, both directions of the
 `GOOGLE_API_KEY` degraded scenario - was exercised against the real
 running app (real backend, real Electron process, real screenshots of the
 real window) before being called done, not assumed from reading the code.
+
+## Three new native-app tools: Calendar, Notes, Messages
+
+Flagged as the highest cheap-value addition given the existing
+architecture: `create_reminder` already proved a real, reusable pattern
+(parse the request, build a small AppleScript, run it via `osascript`,
+independently confirm the change actually persisted) three times over
+(Reminders, Calendar, Notes below share it directly), so generalizing it
+to three more native apps is roughly a day's work per app rather than a
+new architecture. `create_calendar_event` and `create_note` follow it
+exactly. `send_message` follows the same shape for building/running the
+AppleScript, but is genuinely different in two ways that shaped real,
+deliberate scope decisions rather than being built to the same standard
+by default - both covered below.
+
+**A real correction found along the way, worth stating plainly rather than
+folded in quietly:** this task's request described `create_reminder` as
+already "verified by querying the event back afterward" - re-reading the
+function to build the same pattern for Calendar found that it wasn't:
+`create_reminder` only ever trusted the creation script's own clean exit
+code, with no independent read-back at all. Since the new tools were about
+to be held to a stronger standard, leaving `create_reminder` weaker would
+be an inconsistent double standard for no real reason - so it was brought
+up to the same bar in its own commit before any of the three new tools
+were written: a second, independent `osascript` query, after creation,
+asking Reminders' own live object model directly for a reminder matching
+both name and due date, rather than trusting the write statement not
+raising as proof of anything.
+
+**Calendar destination - a deliberate choice, not the default:** this
+machine's real calendars are `Home`, `Work`, a Google-synced one, and a
+few subscribed read-only ones (Holidays, Siri Suggestions) - confirmed
+directly, none of them a sensible place to write automated/test events.
+Same reasoning as Reminders' "Jarvis Test" list: `create_calendar_event`
+defaults to a dedicated "Jarvis Test" calendar, created automatically the
+first time it's needed, so test events never pollute a real calendar.
+Notes gets the same treatment - a dedicated "Jarvis Test" folder in the
+default (iCloud) account, confirmed this machine's real Notes folders are
+a work folder and the account's own default "Notes" folder, neither a
+sensible default either.
+
+**Verification, confirmed real for each, not assumed:**
+- `create_calendar_event`: a second `osascript` query after creation,
+  reconstructing the same start/end `date` objects and asking Calendar for
+  an event matching title AND both dates - the exact same "ask again
+  independently" idiom `create_reminder` now uses.
+- `create_note`: Notes derives a note's *displayed* name from its body's
+  first line when no explicit `name` is given (confirmed directly) -
+  `create_note` always sets `name` explicitly instead of relying on that,
+  so the title is deterministic either way. Verification reads the note's
+  own rendered `plaintext` property (Notes' computed plain-text view of
+  its HTML body, confirmed directly to work) and checks the actual content
+  string is present - stronger than a title-only match, since a stale note
+  with a coincidentally matching title would fail on content. Note body is
+  real HTML, not plain text - confirmed directly this matters: an
+  unescaped `<`/`&` in the user's own note content would otherwise be
+  interpreted as markup rather than shown literally, so content is
+  HTML-escaped before being embedded.
+- Both were tested for real, several times each (3-4 runs), including the
+  title-derivation path and an HTML-special-characters case for notes -
+  all independently confirmed via a separate, un-mocked query afterward,
+  then cleaned up.
+
+**`send_message`: the deliberately different one.** Marked
+`requires_approval=true` by the Planner whenever a milestone resolves to
+it (`agents/planner.py`'s existing "sends something to other people ...
+e.g. ... sending a message" rule already covered this correctly, unchanged
+- confirmed directly via a real Orchestrator -> Planner call for "text
++1... saying hi", which produced exactly one milestone with
+`requires_approval: true`). This is deliberately the second real
+demonstration of the same approval gate Kayak's final search-submit step
+already proved, not a special case invented for it - the existing
+`_run_plan` pause-for-approval logic needed zero new code to cover this,
+since the gate was already generic.
+
+Recipient resolution was scoped narrowly and deliberately, not guessed at:
+`recipient` must be an exact phone number or exact email - never a name.
+Confirmed directly before deciding this: real existing chats on this
+machine use exactly that shape (e.g. `+15126659036`), and there is no
+reliable public API this project found for resolving an ambiguous name to
+one specific real contact with confidence. Guessing wrong here sends a
+real message to the wrong real person, so "text mom" is refused with a
+clear message asking for the exact number/email, rather than attempting
+any fuzzy lookup.
+
+**Verification for `send_message` is honestly weaker than the other three
+tools in this project, by design, not by oversight - confirmed directly,
+not assumed:**
+- `exists buddy "not-a-real-recipient"` returns `true` - there is no
+  proactive way to validate a recipient before sending.
+- `send ... to buddy "not-a-real-recipient"` also returns success with no
+  error at all - Messages' AppleScript layer gives no signal whether a
+  send actually reached anyone real.
+- A `chat`'s own AppleScript `properties` are only `id`/`account`/`name`/
+  `class` - confirmed directly there is no way to read message content
+  back through Messages' scripting dictionary at all.
+- The one stronger option - reading `~/Library/Messages/chat.db` directly
+  - would work in principle, but requires Full Disk Access; confirmed
+  directly this process is currently blocked from even opening that file
+  (`unable to open database file`, a real TCC denial, not an empty
+  result). Full Disk Access is a far broader, more sensitive grant than
+  anything else this project asks for (every file on the Mac, not just
+  Messages) - raised to the user explicitly as a real trade-off rather
+  than decided silently, and the answer was to ship without it.
+
+So `send_message`'s scope is: strict recipient format validation (the only
+real defense against a silent no-op, since nothing else catches it) plus
+checking the AppleScript command completed without error. `success: True`
+means exactly that - it does not and cannot mean confirmed delivery, and
+the tool's own docstring and returned message say so plainly rather than
+implying a stronger guarantee than what's actually true. Tested for real:
+format validation confirmed correct against real phone/email/name/garbage
+inputs, and three real sends to a number the user provided specifically
+for this test (cleared in advance, reaches only them), each confirmed at
+the tool level (validated format, clean AppleScript exit) - real delivery
+confirmation is only checkable by the user looking at their own phone,
+which is outside what this process can verify.
+
+**Full pipeline, tested end to end, not just unit-level:** a real
+Orchestrator -> Planner -> Action run for all three ("create a calendar
+event for a team meeting tomorrow at 2pm", "make a note with my grocery
+list", "text +1... saying hi") - the Planner correctly produced one atomic
+milestone per task with the right `requires_approval` value in every case,
+and the Action agent correctly extracted parameters and called the right
+new tool, each independently verified true. All test artifacts (events,
+notes) cleaned up afterward.
+
+**Setup screen updated to match:** Calendar, Notes, and Messages each need
+their own separate Automation grant the first time Jarvis actually uses
+them - the same per-target-app TCC model already covered for Reminders/
+Spotify/Chrome, confirmed directly rather than assumed to carry over.
+Notes wasn't explicitly named in the request that prompted this, but
+needs the identical grant for the identical reason, so it was added
+alongside Calendar/Messages rather than left out for being unmentioned.
+All three gated by the same "only probe if NSWorkspace shows it already
+running" rule the existing checks use (confirmed directly that
+"Calendar"/"Notes"/"Messages" are exactly the `localizedName` values
+NSWorkspace reports for each) - never force-launching an app just to check
+a setting.
