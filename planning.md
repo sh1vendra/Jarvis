@@ -2544,3 +2544,153 @@ keyboard, the only two honest options are:
 
 Neither was built. Per the explicit ask that came with this investigation,
 this is reported for a decision, not decided unilaterally.
+
+## Agentic Spotify result selection, built: Option A, plus a mechanical gap the spec didn't anticipate
+
+The decision on the fork above: **Option A** - reasoning without clicking.
+No keyboard-selection path exists for a specific non-top result (confirmed
+above), and reintroducing vision-guided clicking would reopen the exact
+click-miss risk already proven unreliable. Read the candidates, reason
+about whether the top result is a confident match, and either play it or
+say so honestly - never guess.
+
+**A real gap in the spec surfaced immediately, before any reasoning could
+be built:** the plan assumed "accept the top result and play it via the
+existing AppleScript mechanism, no click needed since it's already the
+top/default result." Tested directly, this doesn't hold:
+- Spacebar after submitting a search resumed the *previous* track, not the
+  new search result - Spotify's search results and its playback queue are
+  different concepts; showing a track in search doesn't load it for `play`.
+- Tab (focus) + Return produced zero state change.
+- Spotify's real AppleScript dictionary (`/Applications/Spotify.app/Contents/Resources/Spotify.sdef`,
+  read directly, not assumed) has no `search` verb at all - only `play`,
+  `pause`, `playpause`, `next/previous track`, and `play track "<uri>"`.
+  That last one is the only way to start a specific track, and it strictly
+  needs a URI - which needs the Web API, which is unconfigured/blocked for
+  this account.
+- Re-walked Spotify's AX tree three independent ways (including a 40-level
+  deep traversal) - 17 total nodes, all window chrome, zero content. A
+  third independent confirmation of the earlier investigation's finding.
+
+So even the "confident, unambiguous, top result" case cannot start playback
+without either a URI (unavailable) or a click. Reported this honestly
+rather than building on the false premise, and the resulting choice (a
+single, deterministic, vision-verified click on the top result only,
+always gated by real player-state verification - never for any other
+position) was made together, not unilaterally.
+
+**What actually got built:**
+- `search_spotify_candidates(query)` (`backend/tools/mac_control.py`) -
+  opens Spotify's search via the same keyboard-shortcut mechanism
+  `type_in_field` already used (no click), types+submits the query, then
+  reads back the visible results via one vision call on a window-scoped
+  screenshot. It never plays anything - its own `success` is hardcoded
+  `False`, specifically so that if it were ever mistaken for a milestone's
+  final/deciding tool call, the honest failure-state machinery
+  (`run_action`'s "last tool's success" rule) would correctly treat that
+  as *not completed* rather than a false positive.
+- **Confident-match path:** the Action agent calls `click_ui` for "the top
+  search result," which routes to `click_ui`'s existing
+  `_APP_TOP_RESULT_OFFSET` fixed-offset click (already built and verified
+  reliable in an earlier session, just not previously reachable from a
+  read-then-decide flow) - verified afterward via `_spotify_player_state()`,
+  the same real-state check already in place.
+- **Ambiguous path:** the Action agent calls no further tool and answers in
+  plain text instead - either naming the real candidates and asking, or
+  stating which one it's about to play and why. Because no tool ran after
+  the read step, the milestone's honest "last tool succeeded" signal is
+  naturally `False` - this reuses the *existing* failed-state machinery
+  (no new WebSocket message type, no new UI state) to represent "asked for
+  clarification instead of guessing," exactly the "should not require a
+  new subsystem" constraint this was scoped under. `run_action` now
+  returns `(milestone_ok, last_agent_text)` instead of a bare bool so that
+  text - the actual clarifying question - reaches `agent_server.py`'s
+  `failed_goals` (now `{goal, message}` instead of a bare goal string) and
+  from there the UI's outcome card, instead of being silently dropped.
+  Also fixed in the same pass: `agent_text` events were emitted by the
+  backend all along but had no case in the frontend's message switch -
+  they were reaching nowhere. Now logged to the activity feed.
+
+**Reasoning correctness needed a second real fix, found by testing, not
+assumed:** the first working version of the instruction told the Action
+agent (in prose) to treat same-title/different-artist as ambiguous. Tested
+directly against the real "Mad World" case (Gary Jules top, Tears For
+Fears one row down) - the small, fast model this project uses for the
+Action agent (`gemini-flash-lite-latest`) accepted the top result anyway,
+twice, despite the explicit instruction. This is the same class of problem
+this project has hit before and already has a house style for (see the
+pixel-diff-before-vision and tool-result-before-agent-prose entries
+elsewhere in this file): don't trust a small model's judgment for
+something a deterministic check can decide instead. Added
+`_detect_spotify_ambiguity()` - normalizes titles, groups candidates by
+matching normalized title, flags a conflict when two-plus different
+artists share one and the user's own query doesn't already name one of
+them (comma-split, since an artist field like "Gary Jules, Michael
+Andrews" needs the query to match "Gary Jules" as a substring of the
+*component*, not the joined string - a real bug caught in the same test
+pass, fixed before commit). The tool result now carries `ambiguous`/
+`ambiguity_reason` as hard, computed fields; the instruction was rewritten
+to check `ambiguous` first as a rule, not a factor to weigh against the
+model's own read of the ranking. Re-tested: correctly asked ("There are
+multiple versions of 'Mad World' on Spotify, notably by Gary Jules and
+Sickick. Which one would you like me to play?") without playing anything.
+
+**A second, unrelated false-positive found live during the clean-case
+test, and fixed in the same pass:** testing "Bohemian Rhapsody by Queen"
+(chosen as the unambiguous case), the click was reported verified -
+`player_state` really did go paused -> playing - but the actual track
+playing was `"CHRISTUS Health"` with an empty artist and a
+`spotify:ad:...` URI: a real Spotify Free-tier ad, inserted by Spotify
+itself on the play action, not a wrong click. The existing
+`_spotify_playback_changed`/`_verify_click_outcome` check only ever asked
+"did playback state change," which an ad satisfies exactly as well as the
+real track - a real, pre-existing gap this test caught, not something this
+feature introduced. Fixed: `_spotify_player_state()` now also reads the
+current track's own Spotify URI (`spotify url of current track`); a
+`spotify:ad:...` prefix is unambiguous ad detection. `_verify_click_outcome`
+now retries briefly (5x, 1s apart) if the state right after a click is an
+ad, giving a normal short pre-roll ad room to clear before judging, rather
+than either a false "verified" or a false "click missed." Confirmed for
+real: on the actual run that hit an ad, the ad cleared within the retry
+window and the real track (`spotify:track:1BvDpRRJj7aYJfYUrxyH5N`,
+"Bohemian Rhapsody" / "Queen") was what ended up verified.
+
+**`capture_screenshot` hardening**, done as its own fix (`backend/tools/perception.py`):
+now takes `app_name` and scopes the capture to that app's real, verified
+on-screen window bounds via `_real_window_bounds()` (`CGWindowListCopyWindowInfo`
+- ground truth from the window server, not the Accessibility API, which
+can be empty/wrong the way `get_ui_tree` already is for Spotify - see
+above). Refuses a full-display capture unless `allow_full_display=True` is
+passed explicitly, with the reason spelled out in the error message. This
+is the general fix for the real privacy incident from the investigation
+above (a full-display capture, taken while Spotify happened to have no
+on-screen window, caught the IDE and this conversation instead) - not
+cosmetic, a real bug with a real, demonstrated consequence. Both existing
+`capture_screenshot()` callers (`_locate_via_vision_zoom`,
+`locate_and_click_via_grid_search`) now pass their `app_name` and handle
+the "no verified window" `RuntimeError` by degrading to "could not locate"
+rather than crashing.
+
+**Both real test cases, run end-to-end through the actual Action agent
+(real Gemini calls, real Spotify, real clicks), not simulated:**
+- Ambiguous ("Mad World," no artist specified): correctly detected the
+  conflict, asked a clarifying question, called no tool to play anything,
+  milestone honestly reported not completed.
+- Clean ("Bohemian Rhapsody by Queen"): correctly found no conflict, played
+  the top result via the verified fixed-offset click, confirmed via real
+  (non-ad) player state and URI, milestone reported done - no unnecessary
+  question asked.
+
+`play_spotify_track`/`play_spotify_track_tool` (Web-API-based) are left in
+`mac_control.py` but no longer wired into `action_agent`'s tools - real,
+working code, just not reachable while there's no configured Spotify
+Web API credential for this account. Worth re-wiring as a faster primary
+path if that ever changes.
+
+Not done in this pass, left as real limitations: `play_spotify_track`'s
+own verification loop has the same ad-blind-spot `_verify_click_outcome`
+had, unfixed, since that path is currently unreachable from the agent;
+Spotify's own top-result ranking is still the only thing ever offered for
+the "confident" case - Jarvis still cannot play a specific non-top result
+by voice ("play the second one") without reintroducing the click-accuracy
+risk this whole investigation exists to avoid.

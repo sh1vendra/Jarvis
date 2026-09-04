@@ -140,7 +140,7 @@ milestone reads "the destination Austin, Texas is entered".
 ## 4. Action agent's tool selection and execution loop
 
 `agents/action.py` defines `action_agent`, given nine tools -
-`open_app_tool`, `play_spotify_track_tool`, `click_ui_tool`,
+`open_app_tool`, `search_spotify_candidates_tool`, `click_ui_tool`,
 `type_in_field_tool`, `create_reminder_tool` (native macOS control, from
 `tools/mac_control.py`) plus `navigate_to_url_tool`, `find_web_element_tool`,
 `click_web_element_tool`, `type_in_web_field_tool` (browser control, from
@@ -155,15 +155,44 @@ being told again.
 
 The instruction maps milestone shape to tool choice: "app open/foreground"
 -> `open_app`; **"a specific song/track/artist is playing in Spotify"
--> `play_spotify_track(query)`** - resolves the query to a `spotify:` URI
-via the Spotify Web API, plays it with AppleScript `play track`, verifies
-against Spotify's real `player state`. This *replaces* the old
-`type_in_field` + `click_ui` search-and-click path (documented at ~1/3
-reliability, and it failed the regression test); the instruction explicitly
-forbids `click_ui`/`type_in_field` for Spotify search, and the Planner
-makes it a single milestone (the tool launches Spotify itself). Needs
-`SPOTIFY_CLIENT_ID`/`SPOTIFY_CLIENT_SECRET`; without them the tool returns a
-clear failure and the run ends `failed` (section 10). "something clicked"
+-> `search_spotify_candidates(query)` then reason, then act.** This
+replaced `play_spotify_track` (Web-API-based - still defined in
+`mac_control.py`, just no longer wired into the agent's tools, since this
+account has no configured `SPOTIFY_CLIENT_ID`/`SECRET` and the Web API is
+blocked for it), which itself had replaced the original `type_in_field` +
+`click_ui` search-and-click path (documented at ~1/3 reliability, and it
+failed the regression test). `search_spotify_candidates` opens Spotify's
+search via the same keyboard-shortcut mechanism `type_in_field` uses for
+it (no click), types+submits the query, and reads back the visible results
+via one vision call on a window-scoped screenshot - it never plays
+anything, and its own `success` is hardcoded `False` so it can never be
+mistaken for milestone completion on its own. Its result also carries a
+*deterministic* `ambiguous`/`ambiguity_reason` pair - true when two or
+more visible candidates share a matching (normalized) title under
+different artists and the query didn't already name one of them - computed
+in Python (`_detect_spotify_ambiguity`), not left to the model's own
+judgment: tested directly, the small/fast model this project uses for the
+Action agent (`gemini-flash-lite-latest`) missed this exact case twice even
+with an explicit prompt instruction to check for it (see planning.md). The
+instruction now treats `ambiguous` as a hard rule to check first:
+- **`ambiguous: true`** -> the agent calls no further tool at all; it just
+  answers in text, naming the real candidates and asking which one was
+  meant (or stating which it's about to play, if reasonably confident).
+  With no tool call after the read step, `run_action`'s "last tool's
+  success" rule naturally makes this milestone report as not completed -
+  reusing the existing failed-state machinery to represent "asked instead
+  of guessing," rather than adding a new subsystem.
+- **`ambiguous: false`** -> the agent still reasons over each candidate's
+  `kind` (Spotify's own Live/Remix/Music Video badge, when shown) before
+  acting, then calls `click_ui` for "the top search result" - a phrase
+  that must include "top"/"first" plus "result"/"track"/"song" to route
+  into `click_ui`'s existing `_APP_TOP_RESULT_OFFSET` fixed-offset click
+  (a known, pre-verified position, not a fresh vision guess), verified
+  afterward via `_spotify_player_state()`. There is still no way to select
+  or play any result other than the top one - a genuinely ambiguous case
+  with no good top candidate has no third option but to ask.
+
+"something clicked"
 -> `click_ui` (requires `expected_app_name`); "text entered" ->
 `type_in_field` (same requirement); "reminder exists" -> `create_reminder`
 (extracts `task`/`due_date`/`due_time` as plain text, no manual date
@@ -200,9 +229,15 @@ and `type_in_field`:
    returned directly - no LLM call.
 
 2. **Tier 2 - vision fallback**, only reached if tier 1 finds nothing above
-   threshold. `_locate_via_vision_zoom(target_description)` (also in
-   `mac_control.py`) is an iterative crop-and-zoom search: it takes a full
-   screenshot (`perception.capture_screenshot`), asks Gemini vision
+   threshold. `_locate_via_vision_zoom(target_description, app_name)` (also
+   in `mac_control.py`) is an iterative crop-and-zoom search: it takes a
+   screenshot of just `app_name`'s own real, verified on-screen window
+   (`perception.capture_screenshot(app_name=app_name)`, scoped via
+   `CGWindowListCopyWindowInfo` ground truth - never the whole display
+   unless a caller explicitly opts into `allow_full_display=True`, which
+   nothing in this codebase currently does; see planning.md's "a real
+   privacy incident" entry for why this is scoped by default rather than
+   full-screen), asks Gemini vision
    (`_ask_vision_for_coordinates_in_image`) for the target's coordinates,
    then crops tightly around that guess (`_crop_image`) and asks again on
    the smaller image - up to `_MAX_ZOOM_ITERATIONS = 2` times, shrinking the
@@ -361,6 +396,17 @@ verifies it in two tiers:
   strictly more reliable than any vision-based check when available -
   confirmed directly: a real click on Spotify's play control resolved via
   `paused` -> `playing` with no vision call made at all.
+  Before trusting that transition, `_verify_click_outcome` also checks
+  `_spotify_state_is_ad(after_player_state)` - Spotify's Free tier can
+  insert an ad on a play action, which makes `player_state` transition to
+  `"playing"` exactly the same way a real track does (confirmed live: a
+  click meant to start "Bohemian Rhapsody" briefly played an ad with
+  `track_name` "CHRISTUS Health" and a `spotify:ad:...` URI, which the
+  plain playback-changed check alone would have called verified). If the
+  state right after a click is an ad, it retries briefly (up to 5x, 1s
+  apart) before judging, giving a normal short pre-roll ad room to clear;
+  confirmed live, the ad cleared within that window and the real requested
+  track was what ended up verified.
 - **Tier B - pixel-diff-then-vision-tiebreaker** (same base pattern as
   `_verify_text_entered`), used when no state check is registered, the
   outcome doesn't concern what the registered check covers, or the state
@@ -786,10 +832,17 @@ unchanged - this section is what wraps around it.
    `milestone_done` (now carrying `success`), `agent_text`, `reply`.
    `tool_result` carries the **tool's own `success` field**, never the
    agent's summary of it - the same "don't trust the self-report" rule the
-   rest of the system runs on. `run_action` returns a bool per milestone
-   (True only if its *last* tool reported `success: true`); the plan loop
-   aggregates those, and any failed milestone makes the run's outcome
-   `failed` rather than `completed`.
+   rest of the system runs on. `run_action` returns `(milestone_ok,
+   last_agent_text)` per milestone - `milestone_ok` True only if its *last*
+   tool reported `success: true`, `last_agent_text` the agent's own final
+   reply text if it has one (e.g. a clarifying question asked instead of
+   guessing at an ambiguous Spotify result - see planning.md). The plan
+   loop aggregates `milestone_ok`, and any failed milestone makes the run's
+   outcome `failed` rather than `completed`; `last_agent_text` rides along
+   into `failed_goals` (below) so the *reason* a milestone didn't complete
+   is visible, not just that it didn't. `App.jsx` previously had no case
+   for `agent_text` at all - that text reached the client but was silently
+   dropped; it's now logged to the activity feed.
 
    The pipeline runs as a separate `asyncio.Task`, not awaited inline in the
    message loop. Inline, the handler would stop reading messages while the
@@ -812,10 +865,14 @@ unchanged - this section is what wraps around it.
 
 8. **Terminal states - four, not two** (`agent_server._run_plan` /
    `_handle_command`). `done` (`reason: completed`) means *every* milestone's
-   tools verified. `failed` (`{state: "failed", failed_goals: [...]}`) means
-   a milestone ran but its tools reported `success: false` - it is never
-   silently shown as `done` (that was a real integrity bug the regression
-   test caught; see planning.md). `cancelled` is a rejected approval gate.
+   tools verified. `failed` (`{state: "failed", failed_goals: [{goal,
+   message}, ...]}`) means a milestone ran but its tools reported `success:
+   false` - it is never silently shown as `done` (that was a real integrity
+   bug the regression test caught; see planning.md). `message` is that
+   milestone's `last_agent_text` (may be empty) - carrying, for example, the
+   actual clarifying question Jarvis asked about an ambiguous Spotify
+   result, not just the abstract goal that didn't verify. `cancelled` is a
+   rejected approval gate.
    An uncaught exception also lands in `failed` now, not a separate silent
    state. `command_history.success` (section 11) is written from this
    outcome - `success == "completed"` - so a run whose tools failed logs
