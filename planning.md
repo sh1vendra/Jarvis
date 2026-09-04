@@ -2846,3 +2846,147 @@ tested by an agent is whether *this specific person's real voice, in their
 real room, through their real microphone* actually triggers it reliably -
 that's a genuinely different question from "does the mechanism work," and
 is explicitly left for direct confirmation.
+
+## Real speech output: macOS `say` (Daniel), a light personality layer, and why it runs in Electron
+
+Locked decisions restated (decided earlier, built this session): voice is
+macOS's built-in `say -v Daniel` (en-GB) - zero cost, zero latency, zero new
+API keys, same local-first shape as the AppleScript control layer and the
+new wake-word listener. Personality flavor ("Very well.", "Right away.")
+is a light, reversible layer applied only in the speech path, prepended to
+action confirmations only - never errors, never questions, never
+failed/cancelled.
+
+**Confirmed before building, not assumed:** `say -v '?'` lists Daniel
+already installed on this machine - no System Settings download needed.
+`man say` documents no built-in interrupt flag, so cancellation has to be a
+real process kill - confirmed directly: backgrounding `say` and sending it
+a plain `kill` (SIGTERM) stops the audio immediately, the same way from
+Node's `child_process` (`proc.kill()` closed the process in ~14ms with
+`signal=SIGTERM`) - `say` owns the CoreAudio playback session itself, it
+doesn't hand off to some separate daemon that would keep playing after the
+CLI process dies. Also confirmed `child_process.spawn("say", [...])` does
+not block Node's event loop: `spawn()` returned control in ~2ms and a
+parallel `setInterval` kept firing normally for the several seconds real
+playback took, with a `close` event firing reliably (`code=0`) once speech
+genuinely finished - the mechanism this feature's "is Jarvis speaking"
+signal is built on.
+
+**Architecture - verified, not just the first idea taken:** `say` is just
+as reachable via `subprocess` from Python as from Node (`mac_control.py`
+already runs `osascript`/`screencapture` that way), so "the backend calls
+`say` directly" was a real alternative, not a strawman. Rejected for two
+concrete reasons, not just "match what was proposed": (1)
+`agent_server.py`'s command-handling code (`_handle_command`/`_run_plan`)
+is shared, unguarded, Cloud-Run-reachable code with several scattered
+terminal-state exit points - speaking from there would need an explicit
+Mac-only guard threaded through each one, whereas Electron main is
+*structurally* never part of the Cloud Run deployment at all, nothing to
+guard, the code simply isn't there. (2) The queued "speaking" UI indicator
+needs to reflect *real* playback state, not an estimated duration - Electron
+main is already the one process that owns renderer-facing UI status
+(recording state today), so it can report the real subprocess's own
+lifecycle with zero risk of drift between "what's actually playing" and
+"what the UI shows." So: backend decides final text (flavor + trimming
+already applied) -> sends `{"type": "speak", "text": ...}` over the
+existing WebSocket -> renderer relays it to Electron main via
+`window.jarvis.speak()` (only main can spawn a subprocess, the renderer is
+sandboxed) -> main runs `say -v Daniel`, tracks the real child process, and
+reports `jarvis:speaking-status` back to the renderer via IPC -> the
+renderer relays that real status back to the backend as `{"type":
+"tts_state", "speaking": bool}`.
+
+**What Jarvis actually says, and the concise-vs-transcript split**
+(`agent_server.py`'s `_speak_text_for_*` functions): deliberately separate
+from every other text this pipeline already produces (`agent_text`,
+`reply`, a failed milestone's `message`) - those are written for a
+transcript a person *reads*; this is written for a person to *hear*, and
+reading a full multi-milestone plan or a technical tool-failure string
+aloud is a wall of text, not a spoken confirmation. `done` (a real plan
+completed) does NOT read the plan back milestone-by-milestone - it picks
+from a small rotating set of short confirmations (`"Right away. All
+done."`, `"Very well, that's complete."`, `"Done - all set."`, `"Consider
+it done."`) so repeated commands don't sound identically canned every
+time; the visual plan/transcript already shows the detail. Conversational
+replies (no plan - "2 plus 2 is 4.") are spoken verbatim with NO flavor -
+already short, already the direct answer, and a flavor prefix in front of
+a direct answer reads as a non sequitur rather than an acknowledgment.
+`failed` prefers the Action agent's own message when it has one - often
+the single most important thing to say out loud, e.g. a clarifying
+question it asked instead of guessing at an ambiguous Spotify result (see
+that entry above) - real content someone needs to hear and respond to, not
+boilerplate; falls back to a generic line only when there's nothing better.
+`cancelled` and the uncaught-exception path both get short, neutral,
+un-flavored lines. This is also the ONLY place flavor is allowed to exist -
+never in the Orchestrator/Planner/Action agents' own prompts or reasoning,
+so it can be changed, toned down, or turned off entirely without touching
+anything that affects what Jarvis actually *does*.
+
+**Mic-vs-speaker feedback - a real concern, handled with the same
+mechanism already proven for mic handoff, but not the same single flag:**
+if Jarvis is talking through the speakers while its own wake-word listener
+is still listening through the mic, it can hear itself and false-trigger
+or confuse detection. `_sync_wakeword_pause_state()` replaces the earlier
+single `_set_mic_active` with two independent flags (`_mic_active` from
+`mic_state`, `_tts_speaking` from `tts_state`) OR'd together - deliberately
+not one flag doing double duty, because a naive "TTS ends -> just
+resume()" would incorrectly resume wake word if a new mic capture happened
+to still be active at that exact moment (or vice versa). Verified for
+real, not just reasoned about: a live test sent `tts_state(speaking=true)`
+then `mic_state(active=false)` while speech was still genuinely playing -
+the server's own logs show it correctly staying paused through that
+(`wake word: pausing` fired again, a no-op since already paused) and only
+actually reopening the microphone once `tts_state(speaking=false)` arrived
+afterward (`wake word: resuming... input stream opened - microphone
+acquired`). Also added, for the same underlying reason but a different
+race: `main.js`'s `startListening()` (the hotkey path) now interrupts any
+in-progress speech before sending its trigger, so Jarvis's own voice can't
+bleed into a hotkey-started recording. Wake word doesn't need the
+equivalent - its own mic stays paused for as long as `tts_state` reports
+speaking, so a wake-word capture structurally cannot start mid-speech in
+the first place.
+
+**Tested for real, end to end, not simulated:**
+- A real Reminders command ("create a reminder to call mom...") run
+  through the actual server, with a test client standing in for
+  Electron main *exactly* as main.js does (spawns a real `say -v Daniel`
+  child process on receiving `speak`, reports real `tts_state` on its
+  actual lifecycle) - completed, sent `{"type": "speak", "text": "Consider
+  it done."}` (one of the rotating confirmations, correctly concise, not a
+  restatement of the plan), and a real `say` process spoke it aloud through
+  this machine's speakers before closing cleanly.
+- A real failed run (a Spotify click failed because another app had
+  stolen the foreground - a real, different failure mode than the
+  ambiguity case, still a valid test of this exact path) spoke the Action
+  agent's own real message verbatim - confirmed no personality flavor
+  phrase present.
+- Direct verification that none of `_speak_text_for_conversational`,
+  `_speak_text_for_failed`, `_speak_text_for_cancelled`, or
+  `_speak_text_for_error` can ever produce the flavor phrases, by
+  construction (they don't reference the flavor list at all) and confirmed
+  by running them and asserting none of the flavor words appear.
+- Cloud Run: rebuilt and ran the real Docker image with this code included
+  - clean startup, health check answered, and (unlike wake word, which
+    needs an explicit dependency guard) the `_speak_text_for_*` functions
+  are pure Python with zero Mac-specific dependency, confirmed by calling
+  them successfully inside that exact container - there was nothing to
+  guard in the first place, a real, structural consequence of keeping all
+  the OS-level side effect (running `say`) in Electron, which the Cloud Run
+  deployment never includes at all.
+
+**A real, honest limitation of `say` worth naming, not glossed over:** it
+has no native way to pause and resume mid-utterance, only stop
+(kill) and restart from the beginning - fine for this feature's actual
+need (interrupt cleanly on a new capture/speak request), but means there
+is no "pause the response, let me interrupt, then continue where it left
+off" behavior available if that's ever wanted later; it would have to be
+built as stop-and-restart, or replaced with a different synthesis path
+entirely.
+
+**What's left, deliberately, for a real human:** confirming *how it
+actually sounds* - Daniel's voice quality, pacing, whether the phrasing
+feels natural rather than robotic in practice - is a subjective judgment
+call this pass can't make; everything mechanical (does it speak, does it
+say the right thing, does it avoid flavor where it shouldn't, does it
+avoid the mic-feedback problem, does it stay off Cloud Run) was verified
+for real above.

@@ -816,13 +816,15 @@ unchanged - this section is what wraps around it.
    listener correctly self-resume after 3s in the server's own logs.
 
 2. **Bridge.** `electron/preload.cjs` exposes a small `window.jarvis` -
-   `onHotkey`, `reportRecordingState`, `log`, `minimize`, `closeWindow` -
-   and nothing else: no `ipcRenderer`, no node APIs. `onWakeWordStatus` was
-   removed along with the rest of the Porcupine IPC wiring - wake-word
-   status now arrives as a WebSocket message (`wakeword_status`, sent once
-   per connection) instead. Audio does **not** travel over IPC either way;
-   the renderer holds its own WebSocket straight to Python, so captured
-   audio never detours through the main process.
+   `onHotkey`, `speak`, `onSpeakingStatus`, `reportRecordingState`, `log`,
+   `minimize`, `closeWindow` - and nothing else: no `ipcRenderer`, no node
+   APIs. `onWakeWordStatus` was removed along with the rest of the
+   Porcupine IPC wiring - wake-word status now arrives as a WebSocket
+   message (`wakeword_status`, sent once per connection) instead. `speak`/
+   `onSpeakingStatus` are the new speech-output bridge - see section 9.
+   Audio does **not** travel over IPC either way; the renderer holds its
+   own WebSocket straight to Python, so captured audio never detours
+   through the main process.
 
 3. **Capture** (`src/audio/recorder.js`). `getUserMedia` -> `AudioContext` ->
    an `AudioWorkletNode` running a `pcm-collector` processor loaded from an
@@ -919,7 +921,54 @@ unchanged - this section is what wraps around it.
    outcome - `success == "completed"` - so a run whose tools failed logs
    `success=False`.
 
-9. **UI state** (`src/App.jsx` + `src/styles.css`). A state machine -
+9. **Speech output** - real audio, once a genuine terminal state is
+   reached, not mid-process. Right after each of the four terminal-state
+   sends above, `agent_server.py` also sends `{"type": "speak", "text":
+   ...}` - text already finalized for a listener rather than a reader
+   (`_speak_text_for_done_plan`/`_conversational`/`_failed`/`_cancelled`/
+   `_error`; see planning.md for the concise-vs-transcript reasoning and
+   the personality-flavor rules). This is NOT the same text as
+   `agent_text`/`reply`/a failed milestone's `message` - those are written
+   for the transcript a person reads, this is written to be heard, and
+   deliberately does not read back a full multi-milestone plan.
+
+   `App.jsx` relays `speak` straight to Electron main via
+   `window.jarvis.speak(text)` - the renderer holds the WebSocket, but only
+   main can spawn a subprocess (sandboxed, no `nodeIntegration`). `main.js`
+   spawns a real `say -v Daniel` child process (confirmed non-blocking:
+   `spawn()` returns in ~2ms, Node's event loop keeps running through the
+   several seconds of actual playback) and reports its real lifecycle back
+   via `jarvis:speaking-status` IPC (`speaking: true` the instant the
+   process starts, `false` only once it actually closes - never an
+   estimated duration). `App.jsx` relays that real status back to the
+   backend as `{"type": "tts_state", "speaking": bool}`.
+
+   This closes a real feedback loop: `agent_server.py`'s
+   `_sync_wakeword_pause_state()` pauses the wake-word listener whenever
+   EITHER a renderer capture holds the mic (`mic_state`) OR the renderer is
+   playing speech (`tts_state`) - so Jarvis's own voice, through the
+   speakers, can never reach its own wake-word mic and false-trigger or
+   confuse detection. Two independent flags OR'd together, not one flag
+   reused, so an overlap (speech still finishing right as a new capture
+   starts) can't cause either signal to incorrectly resume too early -
+   verified live: `tts_state(speaking=true)` then `mic_state(active=false)`
+   while speech was still genuinely playing left the listener correctly
+   paused, only actually resuming once `tts_state(speaking=false)` arrived.
+   Separately, `main.js`'s hotkey path now interrupts any in-progress
+   speech (`stopSpeaking()`) before starting a new recording, so Jarvis's
+   own voice can't bleed into a hotkey-started capture the way it
+   structurally cannot for a wake-word one (whose mic stays paused for as
+   long as TTS is speaking).
+
+   Runs only where Electron runs - never Cloud Run, and unlike wake word
+   this needed no explicit dependency guard at all: the backend's
+   `_speak_text_for_*` functions are pure Python with zero Mac-specific
+   dependency (confirmed by calling them inside the real Cloud Run image -
+   see planning.md), so there was nothing to guard; the actual OS-level
+   side effect (running `say`) lives entirely in Electron, which the Cloud
+   Run deployment never includes.
+
+10. **UI state** (`src/App.jsx` + `src/styles.css`). A state machine -
    `idle`, `listening`, `thinking`, `doing`, `approving`, `done`, `failed`,
    `cancelled` - driven entirely by server messages after the audio is
    sent. `failed` paints a red orb and a "Jarvis couldn't complete this"
