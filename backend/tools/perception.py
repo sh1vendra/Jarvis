@@ -16,14 +16,16 @@ import time
 
 try:
     import ApplicationServices as AS
+    import Quartz
 except ImportError:
     # Not macOS. The whole agent -> tools import chain is pulled in by the
     # Cloud Run deployment of the agent server (backend/servers/agent_server.py),
     # which only runs the Gemini-facing pipeline - it never has a screen and
     # never calls anything in this module. A clean import is all that's needed
-    # there; every function below that touches AS raises a clear error if it
-    # is somehow reached off a Mac.
+    # there; every function below that touches AS/Quartz raises a clear error
+    # if it is somehow reached off a Mac.
     AS = None
+    Quartz = None
 
 
 def _require_accessibility_api() -> None:
@@ -275,19 +277,93 @@ def capture_region(x: float, y: float, width: float, height: float) -> bytes:
         os.remove(path)
 
 
-def capture_screenshot() -> bytes:
-    """Captures the whole screen via the `screencapture` CLI and returns the
-    PNG bytes. `-x` suppresses the shutter sound, which matters here since
-    this can run many times per session with no user watching for it.
+def _real_window_bounds(app_name: str) -> tuple[float, float, float, float] | None:
+    """Ground-truth on-screen window bounds for app_name, via the window
+    server (CGWindowListCopyWindowInfo) rather than the Accessibility API.
 
-    `screencapture` writes its output by replacing the destination path
-    (rename-over-target), not by writing into an already-open file
-    descriptor - so we create the temp path, close our handle to it *before*
-    calling screencapture, then reopen by path afterward to read the bytes
-    it actually wrote. Keeping the original fd open and reading from it
-    would silently return 0 bytes (a stale fd pointing at the old, empty,
-    now-unlinked inode).
+    This distinction is real, not redundant with get_frontmost_window_frame:
+    AX reports what an app *claims* about its window (and can be empty or
+    wrong - see get_ui_tree's docstring), while this asks the window server
+    what's actually composited on screen right now. It's also how a real
+    privacy bug got caught during testing: "frontmost app" (keyboard focus,
+    what AX/System Events report) and "app with a visible on-screen window"
+    can diverge - a relaunched app can hold keyboard focus with literally no
+    window open. Trusting the former for scoping a screenshot in that state
+    captured whatever window actually *was* on screen instead (in that
+    incident: the IDE and this conversation). Returns None - not a guess,
+    not a stale fallback - when app_name has no real on-screen window.
+
+    Windows come back front-to-back ordered (Apple's documented behavior for
+    kCGWindowListOptionOnScreenOnly), so the first bounds matching app_name's
+    owner name is that app's frontmost on-screen window.
     """
+    if Quartz is None:
+        return None
+    window_list = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
+        Quartz.kCGNullWindowID,
+    )
+    for window in window_list:
+        if window.get("kCGWindowOwnerName") != app_name:
+            continue
+        bounds = window.get("kCGWindowBounds")
+        if not bounds:
+            continue
+        width, height = bounds.get("Width", 0), bounds.get("Height", 0)
+        if width <= 0 or height <= 0:
+            continue
+        return (bounds["X"], bounds["Y"], width, height)
+    return None
+
+
+def capture_screenshot(app_name: str | None = None, *, allow_full_display: bool = False) -> bytes:
+    """Captures a screenshot, scoped by default to app_name's real, verified
+    on-screen window - never the whole display unless allow_full_display is
+    explicitly passed, with a genuine reason to need it.
+
+    This scoping is the fix for a real, demonstrated privacy bug, not a
+    theoretical hardening: an earlier full-display capture, taken while
+    Spotify (the intended target) happened to have no on-screen window,
+    caught whatever *was* actually in front instead - in that case, the IDE
+    and this very conversation, including real project IDs and chat text.
+    "Frontmost app" (what open_app/type_in_field's guards check) and "app
+    with a visible on-screen window" are not the same fact, and only the
+    latter is safe to screenshot - see _real_window_bounds. So: given
+    app_name, this only ever captures that app's own verified window region
+    (via capture_region); if that app has no real on-screen window right
+    now, it refuses rather than silently falling back to a full-display
+    capture that could show something unrelated. A full-display capture is
+    still available, but only as an explicit, named opt-in.
+    """
+    if app_name is not None:
+        bounds = _real_window_bounds(app_name)
+        if bounds is not None:
+            x, y, width, height = bounds
+            return capture_region(x + width / 2, y + height / 2, width, height)
+        if not allow_full_display:
+            raise RuntimeError(
+                f"'{app_name}' has no verified on-screen window right now - refusing a "
+                "full-display capture (it could show unrelated windows/content instead). "
+                "Pass allow_full_display=True only with a real reason to need the whole screen."
+            )
+    elif not allow_full_display:
+        raise RuntimeError(
+            "capture_screenshot() needs either app_name (preferred - scopes the capture to "
+            "that app's own verified window) or allow_full_display=True with a genuine reason. "
+            "This guard exists because an unscoped capture once caught unrelated, sensitive "
+            "on-screen content instead of the intended app - see planning.md."
+        )
+
+    # `-x` suppresses the shutter sound, which matters here since this can
+    # run many times per session with no user watching for it.
+    #
+    # screencapture writes its output by replacing the destination path
+    # (rename-over-target), not by writing into an already-open file
+    # descriptor - so we create the temp path, close our handle to it
+    # *before* calling screencapture, then reopen by path afterward to read
+    # the bytes it actually wrote. Keeping the original fd open and reading
+    # from it would silently return 0 bytes (a stale fd pointing at the old,
+    # empty, now-unlinked inode).
     fd, path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     try:
