@@ -135,7 +135,7 @@ if _backend_dir not in sys.path:
 from agents.action import action_agent  # noqa: E402
 from agents.orchestrator import orchestrator_agent  # noqa: E402
 from agents.planner import MilestonePlan  # noqa: E402
-from main import APP_NAME, USER_ID, run_action, run_command, summarize_plan  # noqa: E402
+from main import APP_NAME, USER_ID, run_action, run_command_with_clarification, summarize_plan  # noqa: E402
 from memory import store as memory_store  # noqa: E402
 from tools import setup_checks  # noqa: E402
 from voice.stt import TranscriptionError, transcribe_audio  # noqa: E402
@@ -474,6 +474,24 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
     return "completed"
 
 
+async def _ask_clarification_via_ws(session: ClientSession, question: str) -> str:
+    """The real, WS-based clarifying-question pause - uses the exact
+    generalized primitive Stage 1 built and confirmed (three real runs,
+    see planning.md and tests/integration/test_pause_resume_context.py)
+    survives real interleaved traffic without losing anything: send
+    `clarification_needed`, block on `await_reply()`, resume once a real
+    `clarification_response` resolves it. A disconnect/cancel mid-pause
+    resolves the Future with `False` (see ClientSession.cancel_pending) -
+    `str(answer or "")` turns that into an honest empty answer rather than
+    crashing, though the task cancellation right behind it makes this
+    mostly moot in practice.
+    """
+    future = session.await_reply()
+    await session.send({"type": "clarification_needed", "question": question})
+    answer = await future
+    return str(answer or "")
+
+
 async def _handle_command(session: ClientSession, text: str) -> None:
     """One full command: Orchestrator -> Planner -> (approval gate) -> Action.
 
@@ -502,7 +520,13 @@ async def _handle_command(session: ClientSession, text: str) -> None:
         orch_session = await orchestrator_runner.session_service.create_session(
             app_name=APP_NAME, user_id=USER_ID
         )
-        plan = await run_command(orchestrator_runner, orch_session.id, text, on_event=_on_event)
+        plan = await run_command_with_clarification(
+            orchestrator_runner,
+            orch_session.id,
+            text,
+            lambda question: _ask_clarification_via_ws(session, question),
+            on_event=_on_event,
+        )
 
         if plan is None:
             # Conversational input the Orchestrator answered itself - the
