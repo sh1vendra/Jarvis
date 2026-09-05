@@ -9,6 +9,8 @@ from tools.browser_tools import (
     click_web_element_tool,
     find_web_element_tool,
     navigate_to_url_tool,
+    select_kayak_airport_tool,
+    select_kayak_departure_date_tool,
     type_in_web_field_tool,
 )
 from tools.mac_control import (
@@ -166,15 +168,29 @@ action_agent = LlmAgent(
         "yourself; always look it up first.\n"
         "- click_web_element: clicks the element with the given ref_id. "
         "Verified automatically by the tool via a fresh page snapshot - "
-        "you don't need to pass an expected outcome. For a milestone about "
-        "setting a DATE on a calendar widget: clicking a day cell often "
-        "only previews that date - real, live testing found the actual "
-        "search still rejected as invalid afterward. Look for and click a "
-        "separate confirm/apply control (e.g. 'Select this date', 'Apply', "
-        "'Done') if the calendar shows one, before considering the date "
-        "set - don't stop at the day-cell click alone.\n"
+        "you don't need to pass an expected outcome.\n"
         "- type_in_web_field: types text into the field with the given "
         "ref_id. Also self-verifying.\n"
+        "- select_kayak_airport: use this INSTEAD of find_web_element + "
+        "type_in_web_field for a milestone about setting Kayak's origin or "
+        "destination (e.g. 'the origin is set to Austin', 'the destination "
+        "is set to New York'). Takes field ('origin' or 'destination') and "
+        "query (the city/airport name). Real, live testing found typing "
+        "alone lands the text in the field but Kayak's own backend still "
+        "rejects the search - the field has to show a real, resolved "
+        "airport, not just typed text. This tool handles the whole real "
+        "interaction (open the field, type, find the real suggestion "
+        "Kayak shows, click it, verify a resolved airport code is shown "
+        "afterward) as one reliable step - don't try to reconstruct this "
+        "sequence yourself with the generic web tools.\n"
+        "- select_kayak_departure_date: use this INSTEAD of find_web_element "
+        "+ click_web_element for a milestone about setting Kayak's "
+        "departure date (e.g. 'the departure date is set to September "
+        "16th'). Takes query - just pass the milestone's own date "
+        "description through, it only needs a day number in it somewhere. "
+        "Opens the calendar, clicks the matching day cell, and verifies "
+        "the date field's real value afterward - one reliable step, same "
+        "reasoning as select_kayak_airport.\n"
         "- read_kayak_flight_results: use this when the milestone is about "
         "reading back / presenting the flight results after a Kayak search "
         "has already been submitted (e.g. 'the top flight results are read "
@@ -198,6 +214,8 @@ action_agent = LlmAgent(
         open_app_tool,
         search_spotify_candidates_tool,
         read_kayak_flight_results_tool,
+        select_kayak_airport_tool,
+        select_kayak_departure_date_tool,
         click_ui_tool,
         type_in_field_tool,
         create_reminder_tool,

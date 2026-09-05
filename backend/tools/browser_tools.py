@@ -431,7 +431,346 @@ async def type_in_web_field(ref_id: str, text: str) -> dict:
     }
 
 
+# --- select_kayak_airport: a deterministic composite for a real gap -------
+#
+# Real, live testing (see planning.md's Stage 3 entry) found Kayak's
+# origin/destination fields are not a small inline autocomplete -
+# type_in_web_field genuinely, verifiably lands the typed text in the
+# field, but Kayak's own backend still rejects the search ("Please enter a
+# 'To' airport") because typed free text was never resolved to a real
+# airport. The field opens a full takeover suggestion panel, and the real
+# suggestion rows are ordinary `div`/`button` elements carrying the full,
+# descriptive location text and a real airport code in parens - e.g.
+# "John F Kennedy Intl, New York, United States, (JFK)" - confirmed
+# directly from real captured snapshots, not assumed. The Action agent's
+# own case-by-case find_web_element guessing found these rows
+# inconsistently (right sometimes, missed other times) because there's no
+# way to know the right query phrasing in advance; this function doesn't
+# guess a phrasing at all - it types the query, then scans the resulting
+# real snapshot directly for a row whose own text names the query and
+# carries a real airport code, which is a fact about the data, not a
+# phrasing gamble.
+
+_AIRPORT_CODE_PATTERN = re.compile(r"\([A-Z]{3}\)")
+
+_KAYAK_FIELD_LABELS = {
+    "origin": ["Origin location", "Where from?", "Leaving from", "From?"],
+    "destination": ["Destination location", "Where to?", "To?"],
+}
+
+
+async def select_kayak_airport(field: str, query: str) -> dict:
+    """Sets Kayak's origin or destination field to a real, resolved airport
+    - not just typed text - by opening the field, typing `query`, finding
+    the real suggestion row Kayak's own panel shows for it (matched by a
+    real airport code in parens, e.g. "(AUS)"), and clicking that row.
+
+    Args:
+        field: "origin" or "destination".
+        query: A city or airport name to search for, e.g. "Austin" or
+            "New York".
+
+    Returns:
+        A dict with:
+            success: bool - True only if a real suggestion was found,
+                clicked, and the field verifiably shows a resolved airport
+                afterward (not just the raw typed text)
+            message: human-readable summary
+            resolved: the exact suggestion text that was clicked (e.g.
+                "Austin Bergstrom, Austin, Texas, United States, (AUS)"),
+                or None if nothing was resolved
+            error: raw error string if something went wrong, else None
+    """
+    field = field.strip().lower()
+    if field not in _KAYAK_FIELD_LABELS:
+        return {
+            "success": False,
+            "message": f"field must be 'origin' or 'destination', got {field!r}.",
+            "resolved": None,
+            "error": "bad_field",
+        }
+
+    labels = _KAYAK_FIELD_LABELS[field]
+    query_lower = query.strip().lower()
+
+    # Step 1: find the field. It may already be a real <input> (if a prior
+    # interaction revealed one) or still a collapsed button - which, when
+    # already correctly set (the common case for origin, defaulted from
+    # Kayak's own geolocation), shows its full resolved value as text
+    # ("Austin Bergstrom, Austin, Texas, United States, (AUS)") rather than
+    # a generic placeholder label, so none of the placeholder-style labels
+    # below match it at all - confirmed live, not assumed. Fall back to the
+    # first visible element carrying a real airport code (origin's value
+    # display is the first such element in Kayak's real document order).
+    ref_id = None
+    for label in labels:
+        found = find_web_element(label)
+        if found["success"]:
+            ref_id = found["ref_id"]
+            break
+    if ref_id is None and field == "origin":
+        # This fallback only ever makes sense for origin: it's the FIRST
+        # airport-code-carrying element in document order, so applying it
+        # to "destination" too would - and, confirmed live, actually did -
+        # grab origin's own value display instead of ever touching the
+        # real destination field.
+        snapshot = browser_store.get_snapshot()
+        if snapshot is not None:
+            for el in snapshot.elements:
+                if el.visible and _AIRPORT_CODE_PATTERN.search(el.text or ""):
+                    ref_id = el.ref_id
+                    break
+    if ref_id is None:
+        return {
+            "success": False,
+            "message": f"Could not find the Kayak {field} field at all.",
+            "resolved": None,
+            "error": "field_not_found",
+        }
+
+    element = browser_store.get_element(ref_id)
+
+    # Exact-match short-circuit, same convention type_in_web_field already
+    # uses: if the field's own current text already names the query and
+    # carries a real airport code, it's already resolved - nothing to type,
+    # nothing to click, and no dispatched action to falsely blame if this
+    # is called again idempotently.
+    if element is not None and _AIRPORT_CODE_PATTERN.search(element.text or "") and query_lower in (element.text or "").lower():
+        return {
+            "success": True,
+            "message": f"The {field} already shows {element.text!r} - already resolved, nothing to change.",
+            "resolved": element.text,
+            "error": None,
+        }
+
+    if element is not None and element.tag != "input":
+        clicked = await click_web_element(ref_id)
+        if not clicked["success"]:
+            return {
+                "success": False,
+                "message": f"Could not open the {field} field: {clicked['message']}",
+                "resolved": None,
+                "error": "open_failed",
+            }
+        ref_id = None
+        for label in labels:
+            found = find_web_element(label)
+            if found["success"]:
+                candidate = browser_store.get_element(found["ref_id"])
+                if candidate is not None and candidate.tag == "input":
+                    ref_id = found["ref_id"]
+                    break
+        if ref_id is None:
+            # None of the known aria-labels matched the revealed field -
+            # confirmed live this happens on a real, if less common,
+            # interaction path. Fall back to any visible, real combobox
+            # input, since there's normally only one freshly-opened field
+            # of this shape on the page at a time.
+            snapshot = browser_store.get_snapshot()
+            if snapshot is not None:
+                for el in snapshot.elements:
+                    if el.visible and el.tag == "input" and el.role == "combobox":
+                        ref_id = el.ref_id
+                        break
+        if ref_id is None:
+            return {
+                "success": False,
+                "message": f"Opened the {field} field but could not find its real input afterward.",
+                "resolved": None,
+                "error": "input_not_found_after_open",
+            }
+
+    # Step 2: type the query into the real input.
+    typed = await type_in_web_field(ref_id, query)
+    if not typed["success"]:
+        return {
+            "success": False,
+            "message": f"Could not type into the {field} field: {typed['message']}",
+            "resolved": None,
+            "error": "type_failed",
+        }
+
+    # Step 3: scan the fresh snapshot directly for a real suggestion row -
+    # not another find_web_element guess. A real row names the query and
+    # carries a real airport code.
+    snapshot = browser_store.get_snapshot()
+    best: ElementRef | None = None
+    if snapshot is not None:
+        for el in snapshot.elements:
+            text = el.text or ""
+            if not el.visible or not _AIRPORT_CODE_PATTERN.search(text):
+                continue
+            if query_lower in text.lower():
+                best = el
+                break
+
+    if best is None:
+        return {
+            "success": False,
+            "message": f"Typed {query!r} into the {field} field but no matching airport suggestion appeared.",
+            "resolved": None,
+            "error": "no_suggestion_found",
+        }
+
+    clicked_suggestion = await click_web_element(best.ref_id)
+    if not clicked_suggestion["success"]:
+        return {
+            "success": False,
+            "message": (
+                f"Found a matching suggestion ({best.text!r}) for the {field} field but could not click it: "
+                f"{clicked_suggestion['message']}"
+            ),
+            "resolved": None,
+            "error": "suggestion_click_failed",
+        }
+
+    # Step 4: verify - the field's real value must show a resolved airport
+    # afterward, not just the raw typed text. This is the exact gap a live
+    # test found: type_in_web_field's own generation-based verification
+    # confirmed text landed, but Kayak's backend still rejected the search
+    # because nothing was ever actually resolved.
+    final_snapshot = browser_store.get_snapshot()
+    final_element = browser_store.get_element(ref_id, final_snapshot.session_id) if final_snapshot else None
+    final_value = (final_element.value if final_element else "") or ""
+    if not _AIRPORT_CODE_PATTERN.search(final_value) and not _AIRPORT_CODE_PATTERN.search(best.text or ""):
+        return {
+            "success": False,
+            "message": (
+                f"Clicked {best.text!r} but the {field} field doesn't show a resolved airport afterward "
+                f"(value={final_value!r})."
+            ),
+            "resolved": None,
+            "error": "not_resolved",
+        }
+
+    return {
+        "success": True,
+        "message": f"The {field} is set to {best.text!r} - a real, resolved airport, not just typed text.",
+        "resolved": best.text,
+        "error": None,
+    }
+
+
+# --- select_kayak_departure_date: the calendar's real interaction ---------
+#
+# Investigated directly rather than assumed (see planning.md's Stage 3
+# entry): a real, live test found no separate "Select this date" confirm
+# control anywhere in the DOM once a one-way trip's calendar is open - the
+# field genuinely just needs one real day-cell click, confirmed by reading
+# the date field's own text back afterward ("Wed 9/16"). The earlier
+# "Select this date" sighting was very likely round-trip-mode-specific (two
+# dates needed) and wasn't re-investigated this session - this function is
+# scoped to the one-way case that's actually proven to work.
+#
+# The calendar renders several months at once, so the SAME day number
+# (e.g. "16") appears multiple times, once per visible month, with no
+# month name in the cell's own text - confirmed directly from a real
+# snapshot dump. Rather than disambiguate months (fragile without deeper
+# DOM context), this takes the first (nearest, soonest) matching day cell
+# in document order - the same choice a real live run already made
+# successfully when this was previously done by hand-guessed queries.
+
+_DAY_NUMBER_PATTERN = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\b")
+
+
+async def select_kayak_departure_date(query: str) -> dict:
+    """Sets Kayak's departure date by opening the date field and clicking
+    the real calendar day cell matching the day number found in `query`.
+
+    Args:
+        query: A description containing a day number, e.g. "September 16"
+            or "the 16th" - the exact phrasing doesn't matter, only that a
+            1-2 digit day number appears in it.
+
+    Returns:
+        A dict with:
+            success: bool - True only if a real day cell was clicked and
+                the date field's value afterward contains that day number
+            message: human-readable summary
+            resolved: the date field's real text after clicking (e.g.
+                "Wed 9/16"), or None if nothing was resolved
+            error: raw error string if something went wrong, else None
+    """
+    day_match = _DAY_NUMBER_PATTERN.search(query)
+    if day_match is None:
+        return {
+            "success": False,
+            "message": f"Could not find a day number in {query!r}.",
+            "resolved": None,
+            "error": "no_day_number",
+        }
+    day_text = str(int(day_match.group(1)))  # normalize "06" -> "6"
+
+    ref_id = None
+    for label in ("Departure date", "Select dates"):
+        found = find_web_element(label)
+        if found["success"]:
+            ref_id = found["ref_id"]
+            break
+    if ref_id is None:
+        return {
+            "success": False,
+            "message": "Could not find Kayak's departure date field at all.",
+            "resolved": None,
+            "error": "field_not_found",
+        }
+
+    clicked_field = await click_web_element(ref_id)
+    if not clicked_field["success"]:
+        return {
+            "success": False,
+            "message": f"Could not open the calendar: {clicked_field['message']}",
+            "resolved": None,
+            "error": "open_failed",
+        }
+
+    snapshot = browser_store.get_snapshot()
+    day_cell: ElementRef | None = None
+    if snapshot is not None:
+        for el in snapshot.elements:
+            if el.visible and (el.text or "").strip() == day_text:
+                day_cell = el
+                break
+
+    if day_cell is None:
+        return {
+            "success": False,
+            "message": f"Opened the calendar but found no visible day cell for {day_text!r}.",
+            "resolved": None,
+            "error": "day_cell_not_found",
+        }
+
+    clicked_day = await click_web_element(day_cell.ref_id)
+    if not clicked_day["success"]:
+        return {
+            "success": False,
+            "message": f"Found day {day_text!r} but could not click it: {clicked_day['message']}",
+            "resolved": None,
+            "error": "day_click_failed",
+        }
+
+    final_snapshot = browser_store.get_snapshot()
+    final_element = browser_store.get_element(ref_id, final_snapshot.session_id) if final_snapshot else None
+    final_value = (final_element.text if final_element else "") or ""
+    if day_text not in final_value:
+        return {
+            "success": False,
+            "message": f"Clicked day {day_text!r} but the date field now shows {final_value!r}, not confirmed.",
+            "resolved": None,
+            "error": "not_resolved",
+        }
+
+    return {
+        "success": True,
+        "message": f"The departure date is set to {final_value!r}.",
+        "resolved": final_value,
+        "error": None,
+    }
+
+
 navigate_to_url_tool = FunctionTool(navigate_to_url)
 find_web_element_tool = FunctionTool(find_web_element)
 click_web_element_tool = FunctionTool(click_web_element)
 type_in_web_field_tool = FunctionTool(type_in_web_field)
+select_kayak_airport_tool = FunctionTool(select_kayak_airport)
+select_kayak_departure_date_tool = FunctionTool(select_kayak_departure_date)
