@@ -4115,3 +4115,203 @@ and the real WebSocket server both now go through the same clarification-
 aware entry point - confirmed neither silently regressed by re-running the
 full 96-test unit suite and the 3 real integration scenarios above clean,
 twice.
+
+## Clarification/booking subsystem, Stage 3: reading Kayak's real results, and four real bugs found getting there
+
+**The deliverable itself: `read_kayak_flight_results`, built exactly on the
+`search_spotify_candidates` pattern.** A new, read-only tool
+(`tools/mac_control.py`) that takes no arguments, requires Google Chrome to
+already be frontmost (refuses otherwise, same `_frontmost_app_name` guard
+used everywhere else), captures a screenshot of Chrome's real window, and
+asks Gemini vision to read back the top 3 visible flight results as
+structured data: `airline`, `price`, `depart_time`, `arrive_time`,
+`duration`, `stops`, `badge` (Kayak's own "Best"/"Cheapest"/"Cheapest
+nonstop" labels, when shown). `success` is hardcoded `False`, identically
+to `search_spotify_candidates` and for the identical reason: this is a
+read step, never a completion signal, so it can never be mistaken for "the
+task is done" even as a milestone's last tool call.
+
+**Vision reliability: no prompt iteration needed, unlike the concern raised
+going in.** Tested directly against a real, live Kayak results screenshot
+(Austin -> JFK, one-way) - 3/3 runs came back with every field exactly
+correct for all three visible cards, including correctly reading the third
+card's airline name off its logo when that card was partially cut off at
+the screenshot's bottom edge. This is a real difference from
+`search_spotify_candidates`'s own history (which needed a real fix for a
+same-title/different-artist false-negative, plus an ad-detection fix) -
+Kayak's result cards are larger, text-explicit, and don't carry the kind
+of ambiguity (cover vs. original, live vs. studio) Spotify's search does,
+so the same read-before-you-act shape didn't need the same hardening this
+time. Reported honestly either way, per the standing instruction: it
+turned out reliable, not fragile.
+
+**The real pause-and-pick, using Stage 1/2's primitive, not a new one.**
+`main.run_action` now returns a 3-tuple - `(milestone_ok, last_agent_text,
+flight_candidates)` - the third element populated only when a
+`read_kayak_flight_results` call in that milestone actually read
+candidates back (`read_ok: true`). This is a deliberate, narrow hook: it
+does not widen `run_action`'s honest-completion logic to somehow treat a
+read-only tool as "done," and it does not rely on keyword-matching the
+milestone's own goal text (fragile - see this project's own paraphrasing
+fixes elsewhere). Once a plan finishes running, `run_plan_with_approval_gate`
+(CLI) and `agent_server._run_plan` (real WS server) both check for real
+`flight_candidates` and, if present, pause AGAIN - a real question naming
+every candidate, sent via the *exact* `clarification_needed`/
+`clarification_response` pair and `ClientSession.await_reply()` Stage 1
+built and Stage 2 already uses for the flight-slot loop - and wait for a
+real answer before reporting the run `completed`, rather than reporting it
+`failed` just because the read-only milestone's own `success` is
+(deliberately) always `False`. `main._match_flight_pick` interprets the
+answer deterministically - a bare position number, an ordinal word
+("second"), or an airline-name substring - never a second LLM guess;
+falls back to just relaying the raw answer if nothing matches. There is no
+booking step yet (Stage 5), so the pick is only acknowledged, not acted on.
+
+**Four real bugs found running this live, all fixed, none of them
+speculative:**
+
+1. **`find_web_element`'s substring matching let a single-character label
+   win by coincidence.** A live run had `find_web_element("Search button")`
+   confidently return Kayak's own account-avatar button (`el.text == "s"`,
+   the signed-in user's initial) instead of the real Search button - "s" is
+   trivially a substring of almost any query. Fixed: the substring branch
+   in `tools/browser_tools.py`'s `_match_score` now requires both the
+   query and the candidate field to be at least 3 characters long. Doesn't
+   fully solve the general shape of this problem - a genuinely longer
+   decorative string that happens to contain a real whole word from the
+   query (e.g. a heading containing the word "from") can still
+   out-substring-match the real field, confirmed live and left as a named,
+   open limitation - but it fixes the concrete, observed, and much more
+   dangerous case (a wrong single-letter match).
+2. **`run_action`'s "last tool wins" rule trusted a lookup tool's own
+   success as proof of completion.** A live run had the Action agent
+   exhaust several `find_web_element` attempts trying to locate Kayak's
+   origin field, eventually matching an unrelated "swap origin and
+   destination" button, and then simply stopping - no `type_in_web_field`
+   call ever happened, yet the milestone reported `success: true`, because
+   the *last* tool called (`find_web_element`) had itself reported
+   `success: true` (it found *something*). `find_web_element`'s own
+   success has never meant "the milestone's goal was reached" - only "this
+   lookup found a match" - but nothing previously protected `run_action`
+   from treating it as the deciding call when it happened to be last.
+   Fixed: `main._LOOKUP_ONLY_TOOLS` (currently just `find_web_element`) is
+   excluded when deriving a milestone's honest `success` - the deciding
+   tool call is now the last one NOT in that set, so a milestone that ends
+   on a bare lookup is never considered complete on that basis alone.
+3. **`agent_server._ask_clarification_via_ws` sent its own
+   `clarification_needed`, duplicating the one `run_command_with_
+   clarification` already sends via `on_event`.** Reproduced on every
+   single flight command tested this session: the client received two
+   `clarification_needed` messages (the first, from `on_event`, carrying
+   the real `missing` field; the second, from this function, not), and a
+   real second answer to the second one found nothing pending to resolve
+   (`resolve_reply` correctly returned `False`, logged as "No clarification
+   is currently pending"). The underlying pause/Future itself was never
+   broken - only ever one real one existed - this was a redundant, wrong
+   *send*. Fixed by removing the second send; the function now only
+   awaits the reply, as its caller already notified the client.
+4. **The Planner was combining an entire multi-field flight-search form
+   into one milestone.** A live run had the Action agent spend its whole
+   turn trying (and failing) to locate the origin field, and simply never
+   attempt destination, trip type, or date in the same milestone - all
+   silently left unset. The existing "web form filled but not submitted"
+   granularity exception already covered filled-vs-submitted as two
+   states; it didn't yet push the model to split *each field* the same
+   way. Fixed: `agents/planner.py`'s instruction now explicitly calls for
+   one milestone per field on a multi-field web form (origin, destination,
+   trip type, date, each independently inspectable), skipping a milestone
+   entirely for a field that's already correct. Verified live,
+   immediately: the very next real Kayak plan produced five separate field
+   milestones plus a submit step, and the run that had previously stalled
+   on origin alone got all the way to a real, verified submitted search.
+
+**A fifth, real, generalizable issue found and given a smaller, instruction-
+level fix rather than a code fix: Kayak's date picker needs an explicit
+confirm click.** Twice, live, the Action agent clicked a real calendar day
+cell (verified via a real newer snapshot) and considered the date set - but
+the actual submitted search came back with Kayak's own validation error,
+"Please enter a valid 'Depart date'." A screenshot at the error moment
+showed why: a "Select this date" button was still sitting, unclicked, at
+the bottom of the open calendar. `find_web_element("Select this date")`
+- tried with the exact, visible button text - found nothing in the
+current page snapshot either time, a separate, unexplained real gap (the
+button is visibly on screen; whether that's a stale snapshot or a
+selector gap in `content_script.js` wasn't run down further this session).
+Given clicking a day cell only *previews* a date on this kind of widget -
+a UI pattern common well beyond Kayak - `agents/action.py`'s
+`click_web_element` guidance now tells the Action agent to look for and
+click a separate confirm/apply control after selecting a calendar day,
+rather than stopping at the day-cell click. Not independently re-verified
+live after this fix (see below) - a real, disclosed gap, not a claimed fix.
+
+**A sixth real finding, fixed:** another app (Brave Browser) genuinely
+stole the foreground between milestones during live testing, on its own,
+not from any deliberate test interference - `read_kayak_flight_results`'s
+frontmost guard correctly refused rather than capturing the wrong app, but
+the Action agent's own recovery (calling `navigate_to_url` again) made
+things worse, reloading Kayak's homepage and destroying the very results
+it needed to read. Fixed at the tool itself, not the agent's judgment:
+`read_kayak_flight_results` now tries one real `open_app("Google Chrome")`
+re-activation - a pure foreground-and-nothing-else, no URL, no reload,
+same call `search_spotify_candidates` already makes for Spotify - before
+giving up, so a stray focus change doesn't cost the whole milestone.
+
+**The full read-and-pick mechanism, verified end to end for real, through
+the actual production WS server (not a standalone script):** with a real
+Kayak results page loaded (Austin -> JFK, one-way, Sep 16 - 66 real
+results, Delta/JetBlue/American among them), a real command through
+`agent_server.py`'s live `ws://127.0.0.1:8766` produced a plan, called the
+real `read_kayak_flight_results` tool, and got back all 3 real candidates
+- exactly matching the standalone vision test above, field for field. The
+Action agent's own reply relayed them in readable form, asking which one
+the user wanted. `run_action` correctly surfaced the real candidates;
+`_run_plan` correctly did NOT add this milestone to `failed_goals` despite
+its own `success: false`; a real `clarification_needed` went out over the
+socket naming all three flights; a real answer came back as
+`clarification_response`; and the run's final state was `{"state": "done",
+"reason": "completed"}` - not `failed`, which is exactly the bug this
+stage's whole pause-and-pick mechanism exists to fix. This is the complete,
+real proof the mechanism works, from a real Chrome tab through the real
+WebSocket protocol to a real terminal state.
+
+**Also found and NOT chased further, named honestly instead:** typing a
+destination into Kayak's field and having the DOM value change (`type_in_
+web_field`'s own real verification) is not the same as Kayak accepting it
+as a resolved airport - a live run's search was rejected with "Please
+enter a 'To' airport" despite `type_in_web_field` correctly, genuinely
+verifying the field's value was `'New York'`. Kayak's real destination
+autocomplete opens a full takeover panel (screenshotted directly - a rich
+list of specific airports: "New York, NY - All Airports (NYC)", "John F
+Kennedy Intl (JFK)", etc.), and `find_web_element` was never able to
+resolve a real suggestion row out of it across roughly a dozen different
+phrasings tried live, by contrast with the *origin* field's own suggestion
+(a `div, role=button` labeled with the full airport name) which resolved
+and clicked cleanly on the first real attempt. This is a genuinely
+different, harder problem than Stage 3's own scope (reading already-
+produced results) - selecting a specific row out of a rich takeover panel,
+not a small autocomplete - and is left as a known, disclosed limitation
+of the current search-submission path, not solved here. **What this means
+concretely:** a fully hands-off, no-human-touch flight search (specific
+destination and date both correctly resolved by Kayak, submitted with no
+validation error) was not achieved this session through the live agent
+chain alone - real flight results were only reached with the destination/
+date confirmed by a real person completing the last mile of the form by
+hand once. This is an honest limitation of the *search-submission*
+mechanics one step upstream of Stage 3's own deliverable, not of
+`read_kayak_flight_results` itself, which was tested directly against a
+real, valid Kayak results page (Austin -> JFK, one-way) and read every
+visible field correctly, 3/3.
+
+**Status: the read-and-pick half of the subsystem is done and real,
+verified through the actual production WS server end to end.** Still not
+built: any booking-page/payment-field safety layer (Stage 5) - a pick is
+acknowledged, never acted on, and nothing here comes anywhere near a real
+purchase. Still unreliable, honestly: getting Kayak's own search form
+(specifically the destination suggestion panel and the date-picker confirm
+step) filled correctly through pure automation, with no human touching the
+page - a real, disclosed limitation one step upstream of this stage's own
+scope, not patched over here. `tests/unit/test_run_action.py` and
+`tests/unit/test_run_plan.py` both gained real, dedicated coverage for the
+new candidate-surfacing and pause-and-pick behavior; the full existing
+suite (106 unit, all integration bar the one pre-existing, documented
+speaker/mic flake) still passes clean.

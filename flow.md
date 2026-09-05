@@ -135,6 +135,50 @@ and `agent_server.py`'s real "text"/"audio" handling now call
 genuinely underspecified flight request gets a real question in both the
 CLI and the live product, not just the WS path.
 
+**Flight results - read and pick (Stage 3).** Once a flight-search plan's
+final two milestones run - submit the search (`requires_approval=true`),
+then read the top results (a new `read_kayak_flight_results` milestone,
+`agents/planner.py`'s instruction now adds this automatically after the
+submit step) - a real, second pause happens, structurally identical to the
+flight-slot clarification loop above, just triggered by real data instead
+of a missing slot:
+
+1. `read_kayak_flight_results` (`tools/mac_control.py`) takes no
+   arguments, requires Chrome to be frontmost (self-healing via one
+   `open_app("Google Chrome")` re-activation if something else stole
+   focus - never a fresh navigation, which would destroy the very results
+   page it's trying to read), screenshots Chrome's real window, and asks
+   Gemini vision to read the top 3 result cards back as structured data
+   (`airline`/`price`/`depart_time`/`arrive_time`/`duration`/`stops`/
+   `badge`). `success` is hardcoded `False`, same convention as
+   `search_spotify_candidates` (section 4) - a read-only step is never a
+   completion signal.
+2. `main.run_action` now returns a 3-tuple - `(milestone_ok,
+   last_agent_text, flight_candidates)` - the third element populated only
+   when a `read_kayak_flight_results` call in that milestone actually read
+   candidates back. This is the one new piece of plumbing Stage 3 needed:
+   a way for the orchestration layer (not the Action agent, not a keyword
+   match on the milestone's own goal text) to know a real pick is needed.
+3. Once the whole plan finishes, `run_plan_with_approval_gate` (CLI) and
+   `agent_server._run_plan` (the real WS server) both check for real
+   `flight_candidates` and, if present, pause again - a real question
+   naming every candidate (`main.build_flight_pick_question`), sent via
+   the exact same `clarification_needed`/`clarification_response` pair and
+   `ClientSession.await_reply()` the flight-slot loop already uses (no new
+   message type) - and wait for a real answer before reporting the run
+   `completed`, instead of `failed` just because the read-only milestone's
+   own success is always `False`. `main._match_flight_pick` interprets the
+   answer deterministically (a position number, an ordinal word, or an
+   airline-name substring) - never a second LLM guess.
+
+There is no booking step yet (Stage 5) - the pick is acknowledged, not
+acted on. See planning.md's Stage 3 entry for the real bugs this surfaced
+along the way (a `find_web_element` substring-matching false-positive, a
+lookup-tool-as-completion-signal bug in `run_action`, a duplicate
+`clarification_needed` send, a Planner multi-field-milestone gap, and
+Kayak's own date-picker/destination-panel automation limits, left
+disclosed rather than fully solved).
+
 ## 3. Planner's milestone generation
 
 `agents/planner.py` defines two Pydantic models:
@@ -167,6 +211,19 @@ milestone triggered its own `create_reminder` call (section 7). The
 routine local item (reminder, note, calendar event) is explicitly *never*
 approval-worthy - only actions that spend money, contact other people, or
 submit to an external site are.
+
+The same rule was extended the other direction for a **multi-field web
+form** (Stage 3): a live test found the Action agent exhausting its whole
+turn trying to locate one stubborn field (Kayak's origin) and never even
+attempting the others in the same milestone, silently leaving them unset
+while the milestone still reported its own outcome. The instruction now
+calls for one milestone per field on a form like this (origin, destination,
+trip type, date, each independently inspectable), skipping a milestone
+entirely for a field that's already correct. A Kayak flight-search plan
+also gets one more milestone automatically, right after the submit-search
+step: reading back the top results (`read_kayak_flight_results`,
+`requires_approval=false`) - see section 2's "Flight results - read and
+pick" entry.
 
 **Memory read (Tier 1, see section 11).** Before the Planner ever runs,
 `run_command` calls `memory.store.relevant_preferences(text)`. If a stored
