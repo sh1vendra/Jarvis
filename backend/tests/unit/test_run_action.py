@@ -144,6 +144,57 @@ async def test_last_agent_text_captures_the_final_reply_not_the_first():
 
 
 @pytest.mark.asyncio
+async def test_a_lookup_only_tool_as_the_last_call_is_not_treated_as_completion():
+    """The real bug this pins down: find_web_element's own success only
+    means "found some matching element" - never "the milestone's goal was
+    reached." A real live run gave up on typing after repeatedly failing
+    to locate a field, with its very last tool call a find_web_element
+    that happened to match an unrelated element (Kayak's own "swap origin
+    and destination" button) - and the old "last tool wins" rule reported
+    the whole milestone done, even though no type_in_web_field call ever
+    happened. See planning.md's Stage 3 entry for the real run."""
+    events = [
+        tool_call_event("action_agent", "find_web_element", {"description": "the origin input field"}),
+        tool_result_event(
+            "action_agent",
+            "find_web_element",
+            {"success": False, "message": "No element matching 'the origin input field' found.", "ref_id": None},
+        ),
+        tool_call_event("action_agent", "find_web_element", {"description": "origin"}),
+        tool_result_event(
+            "action_agent",
+            "find_web_element",
+            {"success": True, "message": "Found element matching 'origin': 'Swap origin and destination locations'.", "ref_id": "jw_9"},
+        ),
+    ]
+    ok, _text = await _run(events)
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_a_real_action_after_a_failed_lookup_still_counts():
+    """The exclusion only skips find_web_element as the *deciding* call -
+    it must not blind run_action to a real action tool that follows and
+    genuinely succeeds."""
+    events = [
+        tool_call_event("action_agent", "find_web_element", {"description": "destination"}),
+        tool_result_event(
+            "action_agent",
+            "find_web_element",
+            {"success": True, "message": "Found element matching 'destination'.", "ref_id": "jw_21"},
+        ),
+        tool_call_event("action_agent", "type_in_web_field", {"ref_id": "jw_21", "text": "New York"}),
+        tool_result_event(
+            "action_agent",
+            "type_in_web_field",
+            {"success": True, "message": "Typed 'New York' into jw_21.", "generation": 2},
+        ),
+    ]
+    ok, _text = await _run(events)
+    assert ok is True
+
+
+@pytest.mark.asyncio
 async def test_no_events_at_all_is_an_honest_non_completion():
     """A degenerate case worth pinning down explicitly: if the agent run
     produces nothing at all, that must not default to success."""

@@ -47,6 +47,21 @@ USER_ID = "test_user"
 # planning.md's "browser bridge gc bug" entry).
 _browser_bridge_task = None
 
+# Tools whose own `success: true` means only "this lookup found a match" -
+# never "the milestone's goal was accomplished." Every other tool wired
+# into the Action agent either performs a real, verifiable action
+# (click_ui, type_in_field, click_web_element, ...) or is deliberately
+# hardcoded to report success: False when it's read-only by design
+# (search_spotify_candidates, read_kayak_flight_results) specifically so it
+# can never be mistaken for a milestone's deciding call. find_web_element
+# has no such self-correction - a real, live test found run_action's "last
+# tool wins" rule taking find_web_element's own success (it found *some*
+# element - once, a "swap origin/destination" button, not a real field) as
+# proof a "flight search parameters are entered" milestone was done, when
+# no type_in_web_field call had happened at all. See planning.md's Stage 3
+# entry for the real run that surfaced this.
+_LOOKUP_ONLY_TOOLS = {"find_web_element"}
+
 
 async def _emit(on_event, payload: dict) -> None:
     """Forwards a structured pipeline event to an optional async consumer.
@@ -417,12 +432,20 @@ async def run_action(
     result.
 
     Returns (milestone_ok, last_agent_text). milestone_ok is True only if
-    the milestone's *last* tool call reported `success: true` - i.e. the
-    tools that actually ran confirmed the outcome. A milestone whose last
-    tool reported `success: false`, or that called no tool at all, is
-    False. This is the honest per-milestone signal the pipeline uses to
-    decide whether the whole run succeeded (see planning.md's "honest
-    failure state" entry) - never the agent's own prose summary.
+    the milestone's last *deciding* tool call reported `success: true` -
+    i.e. the tools that actually ran confirmed the outcome. A milestone
+    whose last deciding tool reported `success: false`, or that called no
+    deciding tool at all, is False. This is the honest per-milestone signal
+    the pipeline uses to decide whether the whole run succeeded (see
+    planning.md's "honest failure state" entry) - never the agent's own
+    prose summary.
+
+    "Deciding" excludes _LOOKUP_ONLY_TOOLS (currently just
+    find_web_element): a lookup tool's own success only means it found a
+    matching element, not that the milestone's goal was reached, so a
+    milestone that ends on one of these (a real, observed case: the agent
+    gave up on typing after only ever calling find_web_element) is never
+    considered complete on that basis.
 
     last_agent_text is the Action agent's own final piece of reply text (if
     any) - e.g. a clarifying question it asked instead of guessing at an
@@ -451,7 +474,7 @@ async def run_action(
         {"type": "milestone_start", "step_number": milestone.step_number, "goal": milestone.goal},
     )
 
-    tool_successes: list[bool | None] = []
+    tool_calls: list[tuple[str, bool | None]] = []
     last_agent_text: str | None = None
 
     async for event in runner.run_async(
@@ -474,7 +497,9 @@ async def run_action(
                     # of it. Same "don't trust the self-report" principle the
                     # rest of this project runs on.
                     success = response.get("success") if isinstance(response, dict) else None
-                    tool_successes.append(bool(success) if success is not None else None)
+                    tool_calls.append(
+                        (part.function_response.name, bool(success) if success is not None else None)
+                    )
                     await _emit(
                         on_event,
                         {
@@ -491,9 +516,10 @@ async def run_action(
                         last_agent_text = stripped
                     await _emit(on_event, {"type": "agent_text", "text": stripped})
 
-    milestone_ok = bool(tool_successes) and tool_successes[-1] is True
+    deciding_successes = [ok for name, ok in tool_calls if name not in _LOOKUP_ONLY_TOOLS]
+    milestone_ok = bool(deciding_successes) and deciding_successes[-1] is True
     print(f"[milestone {milestone.step_number}] outcome: {'OK' if milestone_ok else 'FAILED'} "
-          f"(tool successes: {tool_successes})")
+          f"(tool calls: {tool_calls})")
     await _emit(
         on_event,
         {
