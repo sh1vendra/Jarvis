@@ -81,17 +81,59 @@ share conversation state.
 ## 2. Orchestrator's decision logic
 
 `agents/orchestrator.py` defines `orchestrator_agent`, an ADK `LlmAgent`
-with `sub_agents=[planner_agent]`. Giving it `sub_agents` is what causes ADK
-to automatically attach a `transfer_to_agent` tool - there's no manual
-routing code anywhere; the instruction text tells the model the two cases
-("simple conversational input" vs "a real task") and the model itself
-decides whether to answer directly or call `transfer_to_agent` to hand off
-to `planner_agent`.
+with `sub_agents=[planner_agent, flight_slot_extractor_agent]`. Giving it
+`sub_agents` is what causes ADK to automatically attach a
+`transfer_to_agent` tool - there's no manual routing code anywhere; the
+instruction text tells the model four cases (conversational / a
+capability question / a flight search-or-booking task / any other real
+task) and the model itself decides whether to answer directly or call
+`transfer_to_agent` to hand off to `flight_slot_extractor_agent` or
+`planner_agent`.
 
-`main.run_command()` drives this: it streams every event from
-`runner.run_async(...)`, printing each part's text or `function_call` (the
-transfer call shows up here), and captures the final response along with
-which agent (`event.author`) actually produced it.
+`main.run_command()`/`run_command_with_clarification()` drive this: each
+streams every event from `runner.run_async(...)`, printing each part's
+text or `function_call` (the transfer call shows up here), and captures
+the final response along with which agent (`event.author`) actually
+produced it - `_run_orchestrator_turn()` is the shared helper both
+functions call for this, since the turn-taking is identical and only the
+*interpretation* of the final response differs per caller.
+
+**Flight search/booking - the clarification loop** (`agents/flight_slots.py`,
+`main.py`'s `run_command_with_clarification`). When the Orchestrator
+routes to `flight_slot_extractor_agent` instead of `planner_agent`, the
+real task isn't complete yet - a real, deterministic gap-check
+(`_resolve_flight_slots`) runs before anything reaches the Planner:
+
+1. `flight_slot_extractor_agent` (structured `output_schema=FlightSlots`)
+   reports which of `destination`/`origin`/`depart_date`/`trip_type`/
+   `return_date` the request already states - extraction only, never a
+   judgment about completeness.
+2. Code checks each required slot: stated? use it. Not stated - for
+   `origin`/`destination` only - does a stored preference
+   (`memory_store.get_preference("default_flight_origin"/
+   "default_flight_destination")`) cover it? Use it silently. Still
+   nothing? A real gap.
+3. Any real gaps -> one combined clarifying question (never one per
+   slot), sent as `{"type": "clarification_needed", "question": ...}` and
+   answered via `{"type": "clarification_response", "text": ...}` -
+   structurally identical to the approval gate's own pause (section 7b),
+   using the exact same `ClientSession.await_reply()` primitive. The real
+   answer is combined with the original request and extracted once more
+   (a second, independent `flight_slot_extractor_agent` call - not
+   reliance on any LLM's memory of the first turn; see planning.md for
+   why that was the deliberate choice even though Stage 1 proved session
+   continuity would also have worked).
+4. No gaps remain (or none ever did) - a complete, deterministically
+   assembled task description (explicitly naming Kayak - v1's locked
+   target, confirmed live this must be explicit or the model can pick
+   Google Flights instead) is sent directly to a freshly-built Planner
+   instance, which produces a plan exactly the way it always has.
+
+Both `run_voice_command` (the CLI's real voice demo path, including Kayak)
+and `agent_server.py`'s real "text"/"audio" handling now call
+`run_command_with_clarification` rather than plain `run_command`, so a
+genuinely underspecified flight request gets a real question in both the
+CLI and the live product, not just the WS path.
 
 ## 3. Planner's milestone generation
 
@@ -1013,16 +1055,14 @@ unchanged - this section is what wraps around it.
    approval-specific - one Future-based pause primitive, shared with the
    clarification/booking subsystem's own pause point (a real `{type:
    "clarification_needed", question}` / `{type: "clarification_response",
-   text}` pair now exists in the server's dispatch, structurally identical
-   to `approval_required`/`approval_response`, resolving with a `str`
-   instead of a `bool`). Nothing in production sends `clarification_needed`
-   yet - the flight-clarification agent that will is a later stage - but
-   the mechanism underneath it is the exact same one this approval gate
-   already relies on, real-tested to survive a real pause with real
-   interleaved traffic (`mic_state`/`tts_state`/`ping`) without losing an
-   ADK session's own conversational context (see planning.md's Stage 1
-   entry) - the load-bearing empirical question the wider subsystem's plan
-   flagged before any of it could be trusted.
+   text}` pair exists in the server's dispatch, structurally identical to
+   `approval_required`/`approval_response`, resolving with a `str` instead
+   of a `bool`) - now genuinely used in production by the flight-slot
+   clarification loop (section 2), real-tested to survive a real pause
+   with real interleaved traffic (`mic_state`/`tts_state`/`ping`) without
+   losing an ADK session's own conversational context (see planning.md's
+   Stage 1 entry) - the load-bearing empirical question the wider
+   subsystem's plan flagged before any of it could be trusted.
 
 7b. **A real cancel, mid-run, not just at an approval gate**
    (`ClientSession.cancel_pending`, `App.jsx`'s Cancel button). The

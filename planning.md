@@ -3975,3 +3975,143 @@ creates a brand-new orchestrator session per command today - Stage 2 will
 need to change that specifically for the clarification path (keep the same
 session alive across the pause, the same way this test did manually),
 which is now a confirmed-safe thing to build, not an open question.
+
+## Clarification/booking subsystem, Stage 2: flight-slot extraction and the real clarification loop
+
+**A deliberate simplification of Stage 1's own framing.** Stage 1 proved
+an ADK session survives a real pause with real interleaved traffic - real
+and worth having proven, since it was one of two live design options. But
+building Stage 2, the simpler option turned out to be just as correct:
+the clarification round-trip doesn't need any LLM to *remember* anything
+across turns at all. `flight_slot_extractor_agent` (`agents/flight_slots.py`,
+`output_schema=FlightSlots`) is called once on the original request, and -
+only if a real gap remains after checking stored preferences - called
+again on the original request plus the user's real answer, combined as
+one fresh piece of text. Two independent, stateless extraction calls, not
+one session remembering its own earlier question. This is simpler, avoids
+any risk of an LLM paraphrasing away a detail across turns, and is exactly
+as correct - so it's what actually shipped. Stage 1's pause primitive is
+still very much used (a real `ClientSession.await_reply()` block while the
+real question is outstanding) - it's specifically the *session-continuity*
+half of Stage 1's proof that Stage 2 chose not to lean on, having
+confirmed it was safe to if a later stage ever needs true multi-turn
+memory (e.g. a genuine one-slot-at-a-time back-and-forth, out of v1's
+scope - see below).
+
+**Ambiguity detection, concretely, exactly as answered in the approved
+plan.** `_resolve_flight_slots` (`main.py`) is the one deterministic
+gap-check, never an LLM judgment call: for each of the four always-
+required slots (`destination`, `origin`, `depart_date`, `trip_type`) plus
+the conditionally-required `return_date` (only once `trip_type` resolves
+to `round_trip` - never asked for a one-way trip): stated in the request?
+use it. Not stated? For `origin`/`destination` only - the two slots with a
+real, stable personal default - check `memory_store.get_preference()`
+directly (`default_flight_origin`/`default_flight_destination`); use it
+if present, marked `defaulted` for logging/announcing. Still nothing?
+Real gap, goes in the one combined question. A stated `return_date`
+deterministically implies `trip_type=round_trip` even if the extractor
+didn't separately set it - a real implication, not a guess. One
+refinement worth naming versus the original plan text: rather than
+reusing `relevant_preferences()`'s fuzzy keyword-matching (already proven
+elsewhere, but built for "is *any* preference relevant to this text"),
+this checks the two specific preference keys directly - once the
+Orchestrator has already classified this as a flight task, a stored
+`default_flight_origin`/`default_flight_destination` is unconditionally
+relevant, so the extra fuzzy-match gate would only add a chance of
+missing a real, applicable preference for no benefit.
+
+**The architecture, concretely.** The Orchestrator gained a 4th
+classification branch (`orchestrator.py`) - "a flight search or booking
+task" - transferring to `flight_slot_extractor_agent` instead of straight
+to `planner_agent`, the same `transfer_to_agent` mechanism it already uses
+for every other branch, no new ADK primitive. `run_command_with_clarification`
+(`main.py`) is the new orchestration: if the Orchestrator's final response
+came from `flight_slot_extractor_agent`, run the gap-check; if anything's
+missing, pause for a real answer (`ask_clarification`, a caller-supplied
+async callback - the WS server's real implementation and the CLI demo's
+`input()`-based one are both below), re-extract once, then hand a
+deterministically-assembled, fully-specified task string directly to a
+freshly-built Planner instance - never back through another Orchestrator
+classification pass, since the text is now unambiguous and that would just
+be a redundant Gemini call. Every other outcome (conversational reply, or
+straight to `planner_agent`) behaves exactly like the original
+`run_command`, because `run_command` itself is now a thin wrapper around
+the same two shared helpers (`_run_orchestrator_turn`, `_parse_and_emit_plan`)
+this function also uses - confirmed via the full existing test suite
+passing unchanged.
+
+**A real, serious ADK bug found and fixed along the way, not assumed
+away.** The first live test of the full flow (a fresh `InMemoryRunner`
+built directly around the shared `planner_agent` singleton, to produce
+the real plan once slots resolved) produced nonsense: the run bounced
+across `planner_agent` -> `flight_slot_extractor_agent` ->
+`orchestrator_agent` -> `flight_slot_extractor_agent` and landed on the
+*extractor's* JSON again, never a real plan. Traced to ADK's own source,
+not guessed at: `BaseAgent.__set_parent_agent_for_sub_agents` permanently
+sets `.parent_agent` on every object added to any `sub_agents` list
+(`orchestrator_agent`'s `sub_agents=[planner_agent, flight_slot_extractor_agent]`),
+and once set, a `transfer_to_agent` call from *anywhere* in that same
+tree can retarget execution across it - so reusing the exact same
+`planner_agent` object as the root of a second, separate `InMemoryRunner`
+does not give a clean, isolated run; it still carries the whole tree's
+transfer-graph visibility. Confirmed directly: a fresh `LlmAgent` built
+with identical config but never added to any `sub_agents` list ran in
+true isolation immediately. Fix: `agents/planner.py` and
+`agents/flight_slots.py` each gained a `build_*_agent()` factory
+constructing a genuinely independent instance; the module-level
+singletons (still used for the Orchestrator's own `sub_agents` wiring)
+are untouched, and `main.py`'s standalone re-invocations (the
+re-extraction call, and the final direct Planner call) now build a fresh
+instance each time instead of reusing the shared object. This is a real,
+general gotcha for anyone reusing an ADK agent object both as a sub-agent
+and as a standalone root - worth remembering beyond this one feature.
+
+**A second real bug found live, and fixed: v1's Kayak lock wasn't actually
+enforced.** Once the agent-reuse bug was fixed, a genuinely underspecified
+command with no site named ("book me a flight to Chicago") reached a real
+Chrome session with the extension connected - and the resulting plan
+picked **Google Flights**, not Kayak: the exact site this project already
+found unreliable enough to abandon in favor of Kayak (see the earlier
+"Kayak locked in" entry), now silently reachable again because nothing in
+the deterministically-assembled task text actually named a site.
+`_build_full_flight_task_text` now explicitly states "Search Kayak
+(kayak.com) for this - not Google Flights or any other site" - confirmed
+across 3 consecutive real runs afterward, every one correctly naming
+Kayak. A real, live, running-Chrome test is what caught this; a
+plan-level-only check would not have (the plan JSON alone doesn't reveal
+*which* site the model would have picked without something anchoring it).
+
+**Tested for real, exactly the three scenarios the plan called for, now
+also as a permanent regression test
+(`tests/integration/test_flight_clarification_real.py`) - not one-off
+scratch runs trusted and discarded:**
+
+1. **Genuinely underspecified** ("book me a flight to New York") - asked
+   exactly one real, combined question naming origin/date/trip-type; the
+   real answer resolved the plan afterward, correctly naming Kayak.
+2. **Partially covered by a stored preference** ("book me a flight", with
+   `default_flight_destination` already set) - destination was filled
+   silently (never appeared in the question), only the genuinely missing
+   slots were asked about, and the defaulted value still reached the real
+   final plan.
+3. **Fully specified** ("find flights to Denver next Friday, one way,
+   from Austin") - `ask_clarification` was never called at all (the test
+   asserts on this directly, not just that a plan came out), straight to
+   the real, unchanged Planner.
+
+The deterministic gap-check logic itself has its own fast, dedicated unit
+tests (`tests/unit/test_flight_slots.py`, 11 cases - the always-required
+slots, the conditional `return_date`, preference fill-in vs. a stated
+value always winning, the second-round "only fill what's still missing"
+behavior) - no Gemini calls needed for those, matching this project's own
+unit/integration boundary reasoning throughout.
+
+**Status: the clarification half of the subsystem is done and real.**
+Still not built: the "read Kayak's actual results and let the user pick
+one" step (Stage 3) and the booking-page/payment-field safety layer
+(Stage 5) - nothing past the existing, unchanged approval-gated search
+submit exists yet. The CLI demo (`main.py`'s voice/typed regression paths)
+and the real WebSocket server both now go through the same clarification-
+aware entry point - confirmed neither silently regressed by re-running the
+full 96-test unit suite and the 3 real integration scenarios above clean,
+twice.
