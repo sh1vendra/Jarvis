@@ -11,6 +11,7 @@ makes the call based on the instruction below.
 
 from google.adk.agents import LlmAgent
 
+from .flight_slots import flight_slot_extractor_agent
 from .planner import planner_agent
 
 # The single source of truth for "what can Jarvis actually do right now" -
@@ -57,10 +58,18 @@ orchestrator_agent = LlmAgent(
         f'"{_CAPABILITIES_ANSWER}"\n'
         "Do NOT transfer these to the planner - this is a direct answer, "
         "not a task.\n\n"
-        "3. A REAL TASK - anything that requires taking action on the user's "
-        "computer or planning multiple steps (e.g. 'open Spotify and play "
-        "some lo-fi music'). For these, transfer to the planner_agent so it "
-        "can break the task into milestones. Do not try to plan it yourself."
+        "3. A FLIGHT SEARCH OR BOOKING TASK - specifically about searching "
+        "for, comparing, or booking a FLIGHT (e.g. 'book me a flight to New "
+        "York', 'find flights to Denver next Friday'). For these, transfer "
+        "to the flight_slot_extractor_agent - it decides which details are "
+        "already given, not you. Do not ask any clarifying question "
+        "yourself and do not transfer these to the planner_agent - that "
+        "happens automatically once the real details are resolved.\n\n"
+        "4. ANY OTHER REAL TASK - anything else that requires taking action "
+        "on the user's computer or planning multiple steps (e.g. 'open "
+        "Spotify and play some lo-fi music', 'create a reminder to call "
+        "mom'). For these, transfer to the planner_agent so it can break "
+        "the task into milestones. Do not try to plan it yourself."
     ),
-    sub_agents=[planner_agent],
+    sub_agents=[planner_agent, flight_slot_extractor_agent],
 )
