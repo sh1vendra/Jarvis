@@ -77,21 +77,21 @@ class RecordingSession:
     touching a real WebSocket - lets a test assert exactly what the UI
     would have been told, in order, without a real connection."""
 
-    def __init__(self, approval_answers: list[bool] | None = None):
+    def __init__(self, approval_answers: list[bool | str] | None = None):
         self.sent: list[dict] = []
         self._approval_answers = list(approval_answers or [])
 
     async def send(self, payload: dict) -> None:
         self.sent.append(payload)
 
-    async def await_reply(self) -> bool:
+    async def await_reply(self):
         # Real ClientSession.await_reply() returns an awaitable Future
-        # resolved later by a client message (approval_response or
-        # clarification_response - this fake only ever stands in for the
-        # approval-gate usage, hence the bool return type); here the test
-        # already knows the answer up front, so this just returns it
-        # directly - `await` on a plain bool works fine since this method
-        # is itself async.
+        # resolved later by a client message - a bool for approval_response,
+        # a str for clarification_response (the flight-slot loop, and now
+        # Stage 3's flight-pick pause). This fake doesn't care which: the
+        # test already knows the answer(s) up front and just pops them in
+        # call order, bool or str - `await` on a plain value works fine
+        # since this method is itself async.
         if not self._approval_answers:
             raise AssertionError("await_reply() called more times than the test scripted answers for")
         return self._approval_answers.pop(0)

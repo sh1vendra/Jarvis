@@ -22,6 +22,7 @@ callback and mac_control's zoom-search logger actually print.
 
 import asyncio
 import logging
+import re
 import sys
 
 from dotenv import load_dotenv
@@ -426,7 +427,7 @@ async def run_command_with_clarification(
 
 async def run_action(
     runner: InMemoryRunner, session_id: str, milestone: Milestone, on_event=None
-) -> tuple[bool, str | None]:
+) -> tuple[bool, str | None, list[dict] | None]:
     """Sends one milestone (goal + success_signal) to the Action agent and
     prints the tool call it makes plus the tool's own success/failure
     result.
@@ -453,6 +454,15 @@ async def run_action(
     didn't complete (not just that it didn't) use this; it plays no part in
     deciding milestone_ok itself.
 
+    flight_candidates is the raw candidates list from a read_kayak_flight_
+    results call made during this milestone (None if that tool wasn't
+    called, or was called but read nothing) - Stage 3's real hook for the
+    orchestration layer (run_plan_with_approval_gate / agent_server._run_plan)
+    to know a real flight pick is needed, without keyword-matching the
+    milestone's own goal text (fragile - see planning.md's paraphrasing
+    fixes elsewhere) or widening this function's honest-completion logic to
+    somehow cover it.
+
     success_signal is included alongside goal (not just goal alone) so the
     Action agent has a concrete, observable description to draw on when it
     has to fill in click_ui's expected_outcome argument - goal alone is
@@ -476,6 +486,7 @@ async def run_action(
 
     tool_calls: list[tuple[str, bool | None]] = []
     last_agent_text: str | None = None
+    flight_candidates: list[dict] | None = None
 
     async for event in runner.run_async(
         user_id=USER_ID,
@@ -500,6 +511,12 @@ async def run_action(
                     tool_calls.append(
                         (part.function_response.name, bool(success) if success is not None else None)
                     )
+                    if (
+                        part.function_response.name == "read_kayak_flight_results"
+                        and isinstance(response, dict)
+                        and response.get("read_ok")
+                    ):
+                        flight_candidates = response.get("candidates") or None
                     await _emit(
                         on_event,
                         {
@@ -529,7 +546,7 @@ async def run_action(
             "success": milestone_ok,
         },
     )
-    return milestone_ok, last_agent_text
+    return milestone_ok, last_agent_text, flight_candidates
 
 
 async def run_milestones_until_approval(
@@ -550,11 +567,15 @@ async def run_milestones_until_approval(
     execution, which is exactly the kind of self-reported gate this
     project has repeatedly found unreliable elsewhere (see planning.md).
 
-    Returns `(paused_milestone, all_ok)` - `paused_milestone` is the first
-    requires_approval milestone reached (None if the whole list ran), and
-    `all_ok` is False if any milestone that actually ran reported failure.
+    Returns `(paused_milestone, all_ok, flight_candidates)` - `paused_milestone`
+    is the first requires_approval milestone reached (None if the whole list
+    ran), `all_ok` is False if any milestone that actually ran reported
+    failure, and `flight_candidates` (Stage 3) carries whatever a
+    read_kayak_flight_results call in the last-run milestone read back, so
+    a caller can pause for a real flight pick once the list ran out.
     """
     all_ok = True
+    flight_candidates = None
     for milestone in milestones:
         if milestone.requires_approval:
             print(f"\n{'!' * 60}")
@@ -562,14 +583,16 @@ async def run_milestones_until_approval(
             print(f"(success_signal: {milestone.success_signal!r})")
             print("Execution paused here - this milestone was NOT run.")
             print("!" * 60)
-            return milestone, all_ok
-        ok, _last_text = await run_action(action_runner, session_id, milestone)
+            return milestone, all_ok, flight_candidates
+        ok, _last_text, candidates_this_milestone = await run_action(action_runner, session_id, milestone)
+        if candidates_this_milestone is not None:
+            flight_candidates = candidates_this_milestone
         all_ok = all_ok and ok
-    return None, all_ok
+    return None, all_ok, flight_candidates
 
 
 async def run_plan_with_approval_gate(
-    action_runner: InMemoryRunner, session_id: str, milestones: list[Milestone]
+    action_runner: InMemoryRunner, session_id: str, milestones: list[Milestone], ask_clarification=None
 ) -> str:
     """Run a whole plan through the Action agent, pausing at every
     requires_approval milestone. Each pause waits on a real Enter press
@@ -577,22 +600,109 @@ async def run_plan_with_approval_gate(
     card. The ADK session is unchanged across the pause, so the Action agent
     keeps full context from the milestones that already ran.
 
-    Returns "completed" if every milestone that ran reported success,
+    Stage 3: if the plan's last milestone read back real Kayak flight
+    candidates (read_kayak_flight_results), this pauses AGAIN after the
+    plan finishes - a real question naming the candidates, via the exact
+    same pause primitive Stage 1/2 built (`ask_clarification`, defaulting
+    to the same real blocking input() the approval gate above already
+    uses) - and waits for a real pick before returning, rather than just
+    reporting the run as "failed" because the read-only milestone's own
+    success is (deliberately) always False. There is no booking step yet
+    (Stage 5), so the pick is only acknowledged back, not acted on.
+
+    Returns "completed" if every milestone that ran reported success (and,
+    when a real flight pick happened, the pick was acknowledged),
     "failed" if any of them didn't (the CLI has no reject path - Enter
     always approves)."""
+    if ask_clarification is None:
+        ask_clarification = _ask_clarification_via_input
+
     remaining = list(milestones)
     all_ok = True
+    flight_candidates = None
     while remaining:
-        pending, ran_ok = await run_milestones_until_approval(action_runner, session_id, remaining)
+        pending, ran_ok, candidates = await run_milestones_until_approval(action_runner, session_id, remaining)
         all_ok = all_ok and ran_ok
+        if candidates is not None:
+            flight_candidates = candidates
         if pending is None:
             break
         input("\n[APPROVAL GATE] Paused. Press Enter to simulate the user approving this step...")
         print(f"[TEST] Simulated approval granted for: {pending.goal!r}")
-        ok, _last_text = await run_action(action_runner, session_id, pending)
+        ok, _last_text, candidates_this_milestone = await run_action(action_runner, session_id, pending)
+        if candidates_this_milestone is not None:
+            flight_candidates = candidates_this_milestone
         all_ok = ok and all_ok
         remaining = remaining[remaining.index(pending) + 1:]
+
+    if flight_candidates:
+        await _pause_for_flight_pick(flight_candidates, ask_clarification)
+
     return "completed" if all_ok else "failed"
+
+
+def build_flight_pick_question(candidates: list[dict]) -> str:
+    """Renders the real candidates read back from Kayak into one question,
+    shared by both the CLI pause (_pause_for_flight_pick, below) and
+    agent_server.py's WS-based equivalent so the two real callers never
+    drift into presenting the same data two different ways."""
+    lines = []
+    for c in candidates:
+        stops = c.get("stops")
+        stops_text = "nonstop" if stops == 0 else f"{stops} stop(s)"
+        badge = f" ({c['badge']})" if c.get("badge") else ""
+        lines.append(f"{c.get('position')}) {c.get('airline')} - {c.get('price')} - {stops_text}{badge}")
+    return "Here are the flights I found:\n" + "\n".join(lines) + "\nWhich one would you like?"
+
+
+async def _pause_for_flight_pick(candidates: list[dict], ask_clarification) -> str:
+    """Stage 3's real pause-and-pick: present the real candidates read back
+    from Kayak and wait for a real answer via the same `ask_clarification`
+    pause primitive the flight-slot clarification loop uses (Stage 1's
+    generalized await_reply(), not a new mechanism). Interpretation is
+    deliberately simple, not a second LLM call - matches a bare position
+    number/ordinal ("2", "the second one") or an airline name substring
+    against `candidates`, falling back to just relaying the raw answer if
+    neither matches, since there is nothing to act on the pick with yet
+    (Stage 5, not built) - this only needs to prove the real pause/resume
+    round-trip and an honest acknowledgement, not a booking decision.
+    """
+    question = build_flight_pick_question(candidates)
+
+    answer = await ask_clarification(question)
+    print(f"[FLIGHT PICK] {answer!r}")
+
+    picked = _match_flight_pick(answer, candidates)
+    if picked is not None:
+        print(f"[FLIGHT PICK] matched: {picked}")
+    return answer
+
+
+_ORDINAL_WORDS = {"first": 1, "second": 2, "third": 3, "1st": 1, "2nd": 2, "3rd": 3}
+
+
+def _match_flight_pick(answer: str, candidates: list[dict]) -> dict | None:
+    """Deterministic, not an LLM guess - matches a bare position number, an
+    ordinal word, or an airline-name substring against the real candidates.
+    Returns None (not a guess) if nothing matches confidently, same "don't
+    guess, say so" standard as everywhere else in this project."""
+    lowered = answer.strip().lower()
+    for word, position in _ORDINAL_WORDS.items():
+        if word in lowered:
+            for c in candidates:
+                if c.get("position") == position:
+                    return c
+    digits = re.findall(r"\d+", lowered)
+    if digits:
+        position = int(digits[0])
+        for c in candidates:
+            if c.get("position") == position:
+                return c
+    for c in candidates:
+        airline = str(c.get("airline") or "").strip().lower()
+        if airline and airline in lowered:
+            return c
+    return None
 
 
 async def _ask_clarification_via_input(question: str) -> str:

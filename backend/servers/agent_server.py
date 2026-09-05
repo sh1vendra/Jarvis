@@ -135,7 +135,14 @@ if _backend_dir not in sys.path:
 from agents.action import action_agent  # noqa: E402
 from agents.orchestrator import orchestrator_agent  # noqa: E402
 from agents.planner import MilestonePlan  # noqa: E402
-from main import APP_NAME, USER_ID, run_action, run_command_with_clarification, summarize_plan  # noqa: E402
+from main import (  # noqa: E402
+    APP_NAME,
+    USER_ID,
+    build_flight_pick_question,
+    run_action,
+    run_command_with_clarification,
+    summarize_plan,
+)
 from memory import store as memory_store  # noqa: E402
 from tools import setup_checks  # noqa: E402
 from voice.stt import TranscriptionError, transcribe_audio  # noqa: E402
@@ -418,8 +425,17 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
     police its own execution. The only change from the CLI version is what
     the pause waits on: a client message instead of a keypress.
 
+    Stage 3: a milestone that read real Kayak flight candidates
+    (read_kayak_flight_results) is never added to failed_goals even though
+    its own success is always False (it's read-only by design, same
+    convention as search_spotify_candidates) - once the loop finishes, a
+    real flight pick is a genuine pause (see _pause_for_flight_pick_via_ws
+    below), not a failure to report.
+
     Returns one of:
       "completed" - every milestone that ran reported its tools succeeded
+        (or the only "failure" was the expected read-only flight-results
+        read, now resolved by a real pick)
       "rejected"  - the user rejected an approval gate
       "failed"    - a milestone ran but its tools reported failure
 
@@ -433,6 +449,7 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
     await session.send({"type": "state", "state": "doing"})
 
     failed_goals: list[dict] = []
+    flight_candidates: list[dict] | None = None
     for milestone in plan.milestones:
         if milestone.requires_approval:
             logger.info("agent server: awaiting real approval for %r", milestone.goal)
@@ -454,8 +471,12 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
                 await session.send({"type": "speak", "text": _speak_text_for_cancelled(milestone.goal)})
                 return "rejected"
 
-        ok, last_text = await run_action(action_runner, action_session.id, milestone, on_event=session.send)
-        if not ok:
+        ok, last_text, candidates_this_milestone = await run_action(
+            action_runner, action_session.id, milestone, on_event=session.send
+        )
+        if candidates_this_milestone is not None:
+            flight_candidates = candidates_this_milestone
+        elif not ok:
             # last_text carries the Action agent's own explanation for why -
             # e.g. a clarifying question it asked instead of guessing at an
             # ambiguous Spotify result (see planning.md) - so the UI can
@@ -469,25 +490,54 @@ async def _run_plan(session: ClientSession, plan: MilestonePlan) -> str:
         await session.send({"type": "speak", "text": _speak_text_for_failed(failed_goals)})
         return "failed"
 
+    if flight_candidates:
+        await _pause_for_flight_pick_via_ws(session, flight_candidates)
+
     await session.send({"type": "state", "state": "done", "reason": "completed"})
     await session.send({"type": "speak", "text": _speak_text_for_done_plan()})
     return "completed"
+
+
+async def _pause_for_flight_pick_via_ws(session: ClientSession, candidates: list[dict]) -> None:
+    """Stage 3's real pause-and-pick over the WS protocol - reuses the
+    exact same clarification_needed/clarification_response pair and
+    await_reply() primitive the flight-slot clarification loop already
+    uses (Stage 1/2), rather than a new message type, since this is
+    structurally the same thing: a real question that needs a real typed/
+    spoken answer before the run can call itself finished. Deliberately
+    sends `clarification_needed` itself (matching main.run_command_with_
+    clarification's own call shape) rather than through _ask_clarification_
+    via_ws, which - after the real double-send bug this session found and
+    fixed (see planning.md) - now assumes ITS caller already sent it.
+    """
+    question = build_flight_pick_question(candidates)
+    await session.send({"type": "clarification_needed", "question": question})
+    answer = await _ask_clarification_via_ws(session, question)
+    await session.send({"type": "clarification_received", "text": answer})
+    logger.info("agent server: flight pick answer: %r", answer)
 
 
 async def _ask_clarification_via_ws(session: ClientSession, question: str) -> str:
     """The real, WS-based clarifying-question pause - uses the exact
     generalized primitive Stage 1 built and confirmed (three real runs,
     see planning.md and tests/integration/test_pause_resume_context.py)
-    survives real interleaved traffic without losing anything: send
-    `clarification_needed`, block on `await_reply()`, resume once a real
-    `clarification_response` resolves it. A disconnect/cancel mid-pause
-    resolves the Future with `False` (see ClientSession.cancel_pending) -
-    `str(answer or "")` turns that into an honest empty answer rather than
-    crashing, though the task cancellation right behind it makes this
-    mostly moot in practice.
+    survives real interleaved traffic without losing anything: block on
+    `await_reply()`, resume once a real `clarification_response` resolves
+    it. A disconnect/cancel mid-pause resolves the Future with `False`
+    (see ClientSession.cancel_pending) - `str(answer or "")` turns that
+    into an honest empty answer rather than crashing, though the task
+    cancellation right behind it makes this mostly moot in practice.
+
+    Does NOT send its own `clarification_needed` - a real, live Stage 3
+    test caught this sending it twice: main.run_command_with_clarification
+    (the only caller) already emits `clarification_needed` via `on_event`
+    (with the `missing` field, which a second send here didn't carry)
+    before ever calling this function. Sending it again here left one real
+    Future pending but two identical-looking prompts reaching the client -
+    a second real answer to the second prompt found nothing left to
+    resolve. See planning.md's Stage 3 entry.
     """
     future = session.await_reply()
-    await session.send({"type": "clarification_needed", "question": question})
     answer = await future
     return str(answer or "")
 

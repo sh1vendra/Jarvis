@@ -26,8 +26,12 @@ _MILESTONE = Milestone(
 
 
 async def _run(events) -> tuple[bool, str | None]:
+    """Drops the 3rd (flight_candidates) return value for every test that
+    doesn't care about it - see test_a_read_kayak_flight_results_call_
+    surfaces_its_candidates below for the one that does."""
     runner = FakeRunner(events)
-    return await run_action(runner, session_id="test-session", milestone=_MILESTONE)
+    ok, text, _candidates = await run_action(runner, session_id="test-session", milestone=_MILESTONE)
+    return ok, text
 
 
 @pytest.mark.asyncio
@@ -192,6 +196,47 @@ async def test_a_real_action_after_a_failed_lookup_still_counts():
     ]
     ok, _text = await _run(events)
     assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_a_read_kayak_flight_results_call_surfaces_its_candidates():
+    """Stage 3's real hook: run_action must surface the raw candidates list
+    from a read_kayak_flight_results call so the orchestration layer
+    (run_plan_with_approval_gate / agent_server._run_plan) can pause for a
+    real pick - without that, the only signal available is prose text,
+    which is what main.build_flight_pick_question exists to avoid having
+    to re-parse."""
+    real_candidates = [
+        {"position": 1, "airline": "Delta", "price": "$439", "stops": 0, "badge": "Best"},
+        {"position": 2, "airline": "JetBlue", "price": "$391", "stops": 1, "badge": "Cheapest"},
+    ]
+    events = [
+        tool_call_event("action_agent", "read_kayak_flight_results", {}),
+        tool_result_event(
+            "action_agent",
+            "read_kayak_flight_results",
+            {"success": False, "read_ok": True, "candidates": real_candidates, "message": "..."},
+        ),
+    ]
+    runner = FakeRunner(events)
+    ok, _text, candidates = await run_action(runner, session_id="test-session", milestone=_MILESTONE)
+    assert ok is False  # read-only, deliberately never a completion signal
+    assert candidates == real_candidates
+
+
+@pytest.mark.asyncio
+async def test_a_read_kayak_flight_results_call_with_nothing_read_surfaces_no_candidates():
+    events = [
+        tool_call_event("action_agent", "read_kayak_flight_results", {}),
+        tool_result_event(
+            "action_agent",
+            "read_kayak_flight_results",
+            {"success": False, "read_ok": False, "candidates": [], "message": "nothing visible"},
+        ),
+    ]
+    runner = FakeRunner(events)
+    _ok, _text, candidates = await run_action(runner, session_id="test-session", milestone=_MILESTONE)
+    assert candidates is None
 
 
 @pytest.mark.asyncio

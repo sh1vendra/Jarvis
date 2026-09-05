@@ -26,12 +26,31 @@ def _milestone(step, goal, *, requires_approval=False):
 
 def _patch_run_action(monkeypatch, results):
     """`results` is a list of (ok, text) tuples, consumed in call order -
-    one per milestone actually reached. Patched on agent_server's own
-    module namespace: `_run_plan` calls the name it imported via `from
-    main import ... run_action ...`, which is a separate binding from
+    one per milestone actually reached. The real run_action returns a
+    3-tuple (Stage 3 added flight_candidates) - every result here is
+    padded with candidates=None, since none of these tests are about the
+    flight-pick pause specifically (see _patch_run_action_with_candidates
+    below for the one that is). Patched on agent_server's own module
+    namespace: `_run_plan` calls the name it imported via `from main
+    import ... run_action ...`, which is a separate binding from
     `main.run_action` itself - patching `main.run_action` would leave
     agent_server's already-bound reference untouched.
     """
+    calls = []
+
+    async def fake_run_action(_runner, _session_id, milestone, on_event=None):
+        calls.append(milestone.goal)
+        ok, text = results.pop(0)
+        return ok, text, None
+
+    monkeypatch.setattr(agent_server, "run_action", fake_run_action)
+    return calls
+
+
+def _patch_run_action_with_candidates(monkeypatch, results):
+    """Like _patch_run_action, but `results` is a list of full (ok, text,
+    candidates) 3-tuples - for the flight-pick pause tests, which need
+    real control over the candidates value."""
     calls = []
 
     async def fake_run_action(_runner, _session_id, milestone, on_event=None):
@@ -148,6 +167,52 @@ async def test_approval_required_milestone_never_runs_before_a_decision_arrives(
     # message ordering around it.
     types_sent = session.sent_types()
     assert types_sent.index("approval_required") < types_sent.index("approval_result")
+
+
+@pytest.mark.asyncio
+async def test_a_real_flight_pick_pauses_and_completes_not_fails(monkeypatch):
+    """Stage 3's real behavior: a milestone that reads back real Kayak
+    candidates has its own success always False (read-only, by design,
+    same convention as search_spotify_candidates) - the old code would
+    have reported this as a `failed` run. It must instead pause for a real
+    pick (the same await_reply() primitive the flight-slot clarification
+    loop uses) and then report `completed`, never `failed`, once answered."""
+    plan = MilestonePlan(
+        milestones=[
+            _milestone(1, "The flight search is submitted", requires_approval=True),
+            _milestone(2, "The top flight results are read and presented"),
+        ]
+    )
+    candidates = [
+        {"position": 1, "airline": "Delta", "price": "$439", "stops": 0, "badge": "Best"},
+        {"position": 2, "airline": "JetBlue", "price": "$391", "stops": 1, "badge": "Cheapest"},
+    ]
+    calls = _patch_run_action_with_candidates(
+        monkeypatch,
+        [
+            (True, "Submitted the search.", None),
+            (False, "Here are the flights I found: ...", candidates),
+        ],
+    )
+    session = RecordingSession(approval_answers=[True, "the second one"])
+
+    outcome = await agent_server._run_plan(session, plan)
+
+    assert outcome == "completed"
+    assert calls == ["The flight search is submitted", "The top flight results are read and presented"]
+    # No failed_goals were ever sent for the read-only results milestone.
+    assert "failed" not in session.sent_types()
+    types_sent = session.sent_types()
+    assert "clarification_needed" in types_sent
+    assert "clarification_received" in types_sent
+    received_index = next(i for i, p in enumerate(session.sent) if p["type"] == "clarification_received")
+    assert session.sent[received_index]["text"] == "the second one"
+    done_index = next(
+        i for i, p in enumerate(session.sent) if p["type"] == "state" and p["state"] == "done"
+    )
+    assert session.sent[done_index]["reason"] == "completed"
+    # The pause happens before the run is reported done, not after.
+    assert received_index < done_index
 
 
 @pytest.mark.asyncio
