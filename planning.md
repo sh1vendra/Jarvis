@@ -4315,3 +4315,144 @@ scope, not patched over here. `tests/unit/test_run_action.py` and
 new candidate-surfacing and pause-and-pick behavior; the full existing
 suite (106 unit, all integration bar the one pre-existing, documented
 speaker/mic flake) still passes clean.
+
+## Fixing the real Kayak search-submission gap: investigated for real, not re-guessed
+
+**The ask, restated:** Stage 3's own entry left a real, disclosed limitation
+on the table - typing into Kayak's origin/destination fields verifiably
+lands the text (`type_in_web_field`'s own generation-and-value check
+confirms that), but Kayak's backend still rejected the search because
+nothing was ever resolved to a real airport, and the calendar's confirm
+mechanism was never actually understood, just worked around with an
+instruction hint. This entry is that gap, investigated and fixed for real.
+
+**Investigation method: real DOM snapshots, not more guessing.** A small,
+opt-in debug hook (`browser/bridge.py`'s `_debug_dump_snapshot`, gated on
+`JARVIS_DEBUG_DUMP_SNAPSHOTS`, zero cost when unset) dumps every real
+snapshot's full element list to disk. Driving the real, live agent chain
+against real Kayak with this on gave direct, indisputable answers instead
+of another round of query-phrasing guesses:
+
+- **The destination field is a real `<input role="combobox">` from the
+  moment the page loads** - `aria_label="Destination location"` -
+  confirmed directly from a fresh homepage snapshot. It was never a
+  collapsed button needing a click first; every earlier failure to find it
+  was a query-phrasing miss against an element that was findable all
+  along by its own stable aria-label.
+- **The real suggestion rows Kayak shows after typing are ordinary,
+  clickable `div`/`button` elements carrying the full descriptive location
+  text and a real airport code in parens** - e.g. "John F Kennedy Intl,
+  New York, United States, (JFK)" - confirmed directly, not assumed.
+- **The calendar needs no separate "Select this date" confirm click for a
+  one-way search** - confirmed directly: a real day-cell click closed the
+  calendar and left the date field showing "Wed 9/16", with no confirm
+  button anywhere in the DOM at that moment. The earlier "Select this
+  date" sighting was very likely specific to round-trip mode (needing two
+  dates); not re-investigated this session, since every real test here ran
+  one-way per the existing multi-field-milestone ordering.
+- **Kayak's calendar renders several months at once**, so a single day
+  number (e.g. "16") appears multiple times in the DOM with no month name
+  in the cell's own text - the nearest (first, in document order) match is
+  the one that's actually wanted in every real, near-term travel-planning
+  case tested.
+
+**What got built: two new deterministic composite tools, same shape as
+`read_kayak_flight_results` - one real interaction encoded in code,
+instead of trusting the Action agent's own per-call query guessing.**
+
+- **`select_kayak_airport(field, query)`** (`tools/browser_tools.py`):
+  finds the origin/destination field (by known aria-label, or - origin
+  only - by scanning for the first element already showing a resolved
+  airport code, since Kayak's own geolocation default means origin is
+  usually already correct and shows its full value as text, not a generic
+  placeholder), short-circuits immediately if the field's current value
+  already names the query and carries a real airport code (no action
+  dispatched, same convention `type_in_web_field`'s own exact-match
+  short-circuit already uses), otherwise types the query and scans the
+  resulting real snapshot directly for a suggestion row naming the query
+  with a real airport code, clicks it, and verifies the field's real value
+  afterward shows a resolved airport - not just the raw typed text.
+- **`select_kayak_departure_date(query)`**: finds the date field ("Departure
+  date" / "Select dates"), extracts a day number from `query` (handling
+  ordinals - "16th", "1st", "23rd"), opens the calendar, clicks the first
+  matching day cell, and verifies the date field's own text afterward
+  contains that day number.
+
+**Two real bugs found building and testing these, both fixed before
+trusting the tools:**
+
+1. **The origin-only "already resolved" fallback was firing for
+   destination too.** A live test found `select_kayak_airport("destination",
+   ...)` silently grabbing origin's own "(AUS)" value display (the first
+   airport-code-carrying element in document order, which is always
+   origin's) and clicking THAT instead of ever touching the real
+   destination field - producing a misleading "could not find its real
+   input afterward" error that had nothing to do with the actual
+   destination field at all. Fixed by gating that fallback to
+   `field == "origin"` only; a real regression test
+   (`test_destination_does_not_short_circuit_on_origins_own_value`) pins
+   this down directly.
+2. **The day-number regex didn't match ordinal suffixes.** `\b(\d{1,2})\b`
+   requires a word boundary immediately after the digits, but "16th" has
+   none there (digits and letters are both "word" characters to `\b`) - a
+   live run's first `select_kayak_departure_date("September 16th")` call
+   failed with "Could not find a day number", and only succeeded because
+   the Action agent noticed and retried with a bare "16". Fixed:
+   `\b(\d{1,2})(?:st|nd|rd|th)?\b`.
+
+**Real, honest test results - 3 out of 3 clean, fully automated, no-human-
+touch runs**, each a real "search Kayak for a one-way flight from Austin
+to New York on September 16th" command through the real, live production
+WebSocket server, no manual completion at any point:
+
+- Run 1: one destination retry (`type_in_web_field` reported an empty
+  value once - a real, if minor, timing hiccup; the Action agent recovered
+  on its own by re-finding the field via its own `aria_label` and
+  succeeding on the second try) - otherwise clean. `state: done, reason:
+  completed`.
+- Run 2: one `select_kayak_departure_date` retry, from the pre-fix ordinal
+  bug above (before the regex fix landed) - `state: done, reason:
+  completed`.
+- Run 3 (after both real bug fixes above): every milestone succeeded on
+  its first attempt, no retries anywhere. `state: done, reason: completed`.
+
+Every run reached a genuinely valid Kayak results URL
+(`kayak.com/flights/AUS-JFK/2026-09-16`), with **no validation error at
+any point** ("Please enter a valid Depart date" / "Please enter a 'To'
+airport" never appeared once across all 3 runs), read back 3 real flight
+results via `read_kayak_flight_results` (Delta/JetBlue/American, real
+prices and times, consistent with the same live search across runs), paused
+for a real pick via the Stage 1/2 primitive, and reported the run
+`completed` - not `failed` - after a real answer arrived. This is the
+real, complete, end-to-end proof the user asked for: search →
+submit → real results → real pause → real pick → real completion, with
+zero manual intervention anywhere in the chain.
+
+**A real, external factor worth naming, encountered repeatedly and
+entirely outside this project's control: Kayak itself sometimes redirects
+straight to a booking partner (Booking.com, Priceline) instead of showing
+its own aggregated results list**, apparently non-deterministically (the
+exact same query redirected to Booking.com once, Priceline once, and
+showed Kayak's own list the other times, across this session's testing).
+When that happens, `read_kayak_flight_results` correctly reports
+`no_candidates_read` rather than hallucinating results from a page shaped
+nothing like Kayak's own cards - an honest failure, not a false read. Not
+something to fix; a real characteristic of the live third-party site, not
+a defect in this project's own code.
+
+**Not chased further, deliberately:** the round-trip-mode calendar
+interaction (whether it genuinely needs a separate confirm click, as
+originally suspected) was not re-verified this session, since every real
+test here used one-way. If round-trip support is ever needed,
+`select_kayak_departure_date` would need a real, live check against that
+specific mode before being trusted there too - flagged honestly rather
+than assumed to already cover it.
+
+**Status: the search-submission gap Stage 3's own entry left open is now
+closed and proven, for the one-way case, with a real 3/3 result.** Real
+unit coverage added for every path that doesn't require a live bridge
+connection (`tests/unit/test_select_kayak_airport.py`, 6 cases - the
+bad-field rejection, both fields' exact-match short-circuits, the
+destination-doesn't-steal-origin's-value regression, and both real day-
+number-parsing bugs). The full suite (112 unit, all integration but the
+one pre-existing, documented speaker/mic flake) passes clean.

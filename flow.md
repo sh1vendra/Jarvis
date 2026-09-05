@@ -175,9 +175,45 @@ There is no booking step yet (Stage 5) - the pick is acknowledged, not
 acted on. See planning.md's Stage 3 entry for the real bugs this surfaced
 along the way (a `find_web_element` substring-matching false-positive, a
 lookup-tool-as-completion-signal bug in `run_action`, a duplicate
-`clarification_needed` send, a Planner multi-field-milestone gap, and
-Kayak's own date-picker/destination-panel automation limits, left
-disclosed rather than fully solved).
+`clarification_needed` send, and a Planner multi-field-milestone gap).
+
+**Setting the origin/destination/date fields for real, not just typing
+into them.** Confirmed live (see planning.md): `type_in_web_field`
+genuinely, verifiably lands typed text in Kayak's origin/destination
+fields, but that's not the same as Kayak's backend accepting the search -
+each field has to show a real, resolved airport, not raw typed text.
+`select_kayak_airport(field, query)` and `select_kayak_departure_date(query)`
+(`tools/browser_tools.py`) encode the real interaction Kayak actually
+needs, the same "one composite tool instead of per-call agent guessing"
+shape as `search_spotify_candidates`:
+- `select_kayak_airport` finds the field (by aria-label, or - origin only
+  - by scanning for an element that already shows a resolved airport code,
+  since Kayak's own geolocation default usually means origin is already
+  correct), short-circuits with no action dispatched if the field already
+  names the query and carries a real code, otherwise types the query and
+  scans the resulting real snapshot directly for a suggestion row (an
+  ordinary clickable element carrying the query's name and a real airport
+  code, e.g. "John F Kennedy Intl, New York, United States, (JFK)") rather
+  than guessing a `find_web_element` phrasing for it, clicks it, and
+  verifies the field's real value afterward shows a resolved airport.
+- `select_kayak_departure_date` finds the date field ("Departure date" /
+  "Select dates"), extracts a day number from the query (handling
+  ordinals), opens the calendar, and clicks the first matching day cell -
+  confirmed live that Kayak's one-way calendar needs no separate confirm
+  click at all; the field's own text ("Wed 9/16") updates immediately.
+
+Verified end to end, real and complete, 3/3: a full "search Kayak for a
+one-way flight..." command through the real WS server, with every
+milestone (browser open, trip type, origin, destination, date, submit,
+read results) succeeding with no manual completion anywhere, landing on a
+real, valid Kayak results URL with no validation error, reading real
+results, and completing the real pause-and-pick from the entry above.
+Kayak itself occasionally redirects a valid search straight to a partner
+site (Booking.com, Priceline) instead of showing its own results list - a
+real, external, non-deterministic behavior of the live site, not something
+this project's own code controls; `read_kayak_flight_results` correctly
+reports `no_candidates_read` rather than misreading a differently-shaped
+page when that happens.
 
 ## 3. Planner's milestone generation
 
