@@ -15,6 +15,7 @@ from tools.mac_control import (
     click_ui_tool,
     create_reminder_tool,
     open_app_tool,
+    read_kayak_flight_results_tool,
     search_spotify_candidates_tool,
     type_in_field_tool,
 )
@@ -165,9 +166,26 @@ action_agent = LlmAgent(
         "yourself; always look it up first.\n"
         "- click_web_element: clicks the element with the given ref_id. "
         "Verified automatically by the tool via a fresh page snapshot - "
-        "you don't need to pass an expected outcome.\n"
+        "you don't need to pass an expected outcome. For a milestone about "
+        "setting a DATE on a calendar widget: clicking a day cell often "
+        "only previews that date - real, live testing found the actual "
+        "search still rejected as invalid afterward. Look for and click a "
+        "separate confirm/apply control (e.g. 'Select this date', 'Apply', "
+        "'Done') if the calendar shows one, before considering the date "
+        "set - don't stop at the day-cell click alone.\n"
         "- type_in_web_field: types text into the field with the given "
-        "ref_id. Also self-verifying.\n\n"
+        "ref_id. Also self-verifying.\n"
+        "- read_kayak_flight_results: use this when the milestone is about "
+        "reading back / presenting the flight results after a Kayak search "
+        "has already been submitted (e.g. 'the top flight results are read "
+        "and ready to present'). Takes no arguments - it reads whatever "
+        "results the already-open Chrome window is showing. It never "
+        "clicks or navigates, and its own success is always False since "
+        "it's a read-only step - that's expected, not a failure to explain "
+        "away. Its message already lists the candidates in a form ready to "
+        "read back to the user - relay it (or something very close to it) "
+        "as your own final reply so the user hears the real options, never "
+        "pick one yourself.\n\n"
         "If the milestone doesn't match any available tool, or a tool "
         "refuses to act (e.g. wrong_frontmost_app), don't retry blindly - "
         "report plainly what happened and that the milestone wasn't "
@@ -179,6 +197,7 @@ action_agent = LlmAgent(
     tools=[
         open_app_tool,
         search_spotify_candidates_tool,
+        read_kayak_flight_results_tool,
         click_ui_tool,
         type_in_field_tool,
         create_reminder_tool,

@@ -1341,6 +1341,160 @@ def search_spotify_candidates(query: str) -> dict:
 search_spotify_candidates_tool = FunctionTool(search_spotify_candidates)
 
 
+# --- read_kayak_flight_results: Stage 3 of the clarification/booking -------
+# subsystem (see planning.md). Same read-before-you-act shape as
+# search_spotify_candidates above - never plays/books anything, only reads
+# back what a real, already-submitted Kayak search actually shows, as
+# structured data, so the user can be asked which one they want (Stage 1/2's
+# pause primitive) rather than Jarvis silently picking one. Vision-based for
+# the same reason search_spotify_candidates is: Kayak's result cards carry
+# no single, stable, easily-queried DOM shape worth building a bespoke
+# parser against (badges, logos, and layout details change card to card),
+# and a screenshot of a rendered results page is something Gemini vision
+# reads cleanly, confirmed directly against a real page (see planning.md) -
+# 3/3 real test runs against the same real screenshot came back with every
+# field (airline, price, both times, duration, stops, badge) exactly
+# correct, including correctly reading the third card's airline name off a
+# logo when that card was partially cut off at the screenshot's bottom edge.
+
+
+def _ask_vision_for_kayak_flight_candidates(image_bytes: bytes) -> list[dict] | None:
+    """Asks Gemini vision to read back Kayak's visible flight results as
+    structured data. Returns a list of {"position", "airline", "price",
+    "depart_time", "arrive_time", "duration", "stops", "badge"} dicts in
+    on-screen top-to-bottom order, or None if the reply wasn't usable JSON."""
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-flash-lite-latest",
+        contents=[
+            genai_types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+            (
+                "This is a screenshot of a Kayak.com flight search results page. "
+                "List the top 3 visible flight results, in the order they actually appear on "
+                "screen (top to bottom). For each one give: the airline name, the price as "
+                "shown (with currency symbol), the departure time, the arrival time, the total "
+                "duration, and the number of stops (0 for nonstop, or the number of stops). "
+                "Also include any badge label Kayak shows on that result (e.g. \"Best\", "
+                "\"Cheapest\", \"Cheapest nonstop\"), or null if none is shown. Only list actual "
+                "flight result cards - skip filter bars, ads, or any other page chrome.\n"
+                "Reply with ONLY raw JSON (no markdown fences): a list like "
+                '[{"position": 1, "airline": "...", "price": "...", "depart_time": "...", '
+                '"arrive_time": "...", "duration": "...", "stops": 0, "badge": "Best"}, ...]. '
+                "If you see no flight results at all, reply with an empty list []."
+            ),
+        ],
+    )
+    text = response.text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").removeprefix("json").strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def read_kayak_flight_results() -> dict:
+    """Reads back the top 3 flight results from an already-submitted real
+    Kayak search - does NOT navigate, search, or click anything itself.
+    Meant to run as the milestone right after "the flight search is
+    submitted" (the existing approval-gated step), while the results page
+    Chrome already has open is still the frontmost window.
+
+    `success` is ALWAYS False, same convention as search_spotify_candidates
+    and for the same reason: this is a read-only step, never a completion
+    signal, so it can never be mistaken for "the task is done" even if it's
+    the last tool called in its milestone (see main.run_action's
+    _LOOKUP_ONLY_TOOLS/deciding-tool logic for the general version of this
+    problem this convention sidesteps).
+
+    If some other app has stolen the foreground since the search was
+    submitted, this tries one real, non-destructive `open_app("Google
+    Chrome")` re-activation before giving up - real, live testing found
+    another app genuinely grabbing focus between milestones on occasion,
+    and the Action agent's own fallback (calling navigate_to_url again)
+    made things worse: a fresh navigation reloads Kayak's homepage,
+    destroying the very results this tool exists to read. `open_app` only
+    brings the existing window forward - no URL, no reload, no lost state.
+
+    Returns a dict with:
+        success: bool - always False, see above
+        read_ok: bool - True if at least one candidate was read back
+        candidates: list of {"position", "airline", "price", "depart_time",
+            "arrive_time", "duration", "stops", "badge"}, in on-screen order
+        message: human-readable summary, safe to read aloud/present as-is
+        error: raw error string if something went wrong, else None
+    """
+    _require_macos()
+
+    frontmost = _frontmost_app_name()
+    if frontmost != "Google Chrome":
+        open_app("Google Chrome")
+        frontmost = _frontmost_app_name()
+    if frontmost != "Google Chrome":
+        return {
+            "success": False,
+            "read_ok": False,
+            "candidates": [],
+            "message": (
+                f"Cannot read Kayak's results - expected Google Chrome to be frontmost, but "
+                f"{frontmost!r} is frontmost instead, even after trying to bring it forward."
+            ),
+            "error": "wrong_frontmost_app",
+        }
+
+    try:
+        screenshot = capture_screenshot(app_name="Google Chrome")
+    except RuntimeError as exc:
+        return {
+            "success": False,
+            "read_ok": False,
+            "candidates": [],
+            "message": f"Could not capture Chrome's window to read Kayak's results: {exc}",
+            "error": "capture_failed",
+        }
+
+    candidates = _ask_vision_for_kayak_flight_candidates(screenshot)
+    if not candidates:
+        return {
+            "success": False,
+            "read_ok": False,
+            "candidates": [],
+            "message": "Could not read back any visible flight results from the current page.",
+            "error": "no_candidates_read",
+        }
+
+    lines = []
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        stops = c.get("stops")
+        stops_text = "nonstop" if stops == 0 else f"{stops} stop{'s' if stops != 1 else ''}"
+        badge = f" ({c['badge']})" if c.get("badge") else ""
+        lines.append(
+            f"{c.get('position')}) {c.get('airline')} - {c.get('price')} - "
+            f"{c.get('depart_time')} to {c.get('arrive_time')}, {c.get('duration')}, "
+            f"{stops_text}{badge}"
+        )
+    summary = "; ".join(lines)
+
+    return {
+        "success": False,
+        "read_ok": True,
+        "candidates": candidates,
+        "message": (
+            f"Read back {len(candidates)} flight result(s) from Kayak: {summary}. "
+            "Present these to the user (in this order) and ask which one they want - "
+            "never pick one automatically."
+        ),
+        "error": None,
+    }
+
+
+read_kayak_flight_results_tool = FunctionTool(read_kayak_flight_results)
+
+
 _VERIFY_REGION_SIZE = (400.0, 160.0)  # width, height in points, centered on the field
 _NO_CHANGE_DIFF_THRESHOLD = 2.0  # mean 0-255 grayscale diff below this = "nothing visibly happened"
 
