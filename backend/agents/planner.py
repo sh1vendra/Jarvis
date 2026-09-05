@@ -27,15 +27,34 @@ class MilestonePlan(BaseModel):
     milestones: list[Milestone]
 
 
-# The Planner is a leaf agent (no sub_agents) — it only ever receives a task
-# description and returns a structured plan. output_schema forces Gemini's
-# final reply to validate against MilestonePlan, so we can parse it directly
-# instead of scraping free-text.
-planner_agent = LlmAgent(
-    name="planner_agent",
-    model="gemini-flash-lite-latest",
-    description="Breaks a real task into an ordered list of outcome-based milestones.",
-    instruction=(
+def build_planner_agent() -> LlmAgent:
+    """Constructs a fresh, independent Planner agent instance.
+
+    Used for the module-level `planner_agent` singleton below (wired as an
+    Orchestrator sub_agent) AND, separately, whenever `main.py` needs to
+    run the Planner directly outside the Orchestrator's own tree (the
+    flight-clarification loop's final "now that slots are resolved,
+    produce the real plan" step). Deliberately TWO separate instances,
+    never the same object reused both ways: ADK permanently sets an
+    agent's `.parent_agent` the moment it's added to any `sub_agents` list
+    (`BaseAgent.__set_parent_agent_for_sub_agents`, confirmed by reading
+    ADK's own source), and once set, a `transfer_to_agent` call from
+    anywhere in that same tree can retarget execution to/through it -
+    confirmed the hard way, not assumed: reusing the single
+    `planner_agent` singleton as the target of a second, separate
+    `InMemoryRunner` (main.py's own direct Planner call) produced real,
+    observed cross-talk with the Orchestrator's tree - a bounced sequence
+    of transfer_to_agent calls across planner_agent/
+    flight_slot_extractor_agent/orchestrator_agent, landing on the wrong
+    final responder - instead of a clean, isolated run. A second, freshly
+    built instance with identical config has no `.parent_agent` at all and
+    was confirmed to run in true isolation.
+    """
+    return LlmAgent(
+        name="planner_agent",
+        model="gemini-flash-lite-latest",
+        description="Breaks a real task into an ordered list of outcome-based milestones.",
+        instruction=(
         "You are a planning agent. You receive a task description and break it "
         "into an ordered sequence of milestones.\n\n"
         "Each milestone must describe a GOAL or OUTCOME, never a fixed low-level "
@@ -100,6 +119,13 @@ planner_agent = LlmAgent(
         "ignore any preference not relevant to this command.\n\n"
         "Keep the plan minimal — only the milestones actually needed to "
         "accomplish the task, in the order they must happen."
-    ),
-    output_schema=MilestonePlan,
-)
+        ),
+        output_schema=MilestonePlan,
+    )
+
+
+# The Orchestrator's own sub-agent - registered in its sub_agents list
+# (agents/orchestrator.py), which is exactly why standalone re-invocation
+# needs build_planner_agent() instead of reusing this object - see that
+# function's docstring.
+planner_agent = build_planner_agent()

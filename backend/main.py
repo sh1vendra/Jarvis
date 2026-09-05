@@ -29,8 +29,9 @@ from google.adk.runners import InMemoryRunner
 from google.genai import types
 
 from agents.action import action_agent
+from agents.flight_slots import FlightSlots, build_flight_slot_extractor_agent
 from agents.orchestrator import orchestrator_agent
-from agents.planner import Milestone, MilestonePlan
+from agents.planner import Milestone, MilestonePlan, build_planner_agent
 from memory import store as memory_store
 from servers.browser_bridge_server import serve_forever as serve_browser_bridge_forever
 from voice.stt import transcribe_audio
@@ -90,14 +91,20 @@ def _with_preferences(text: str) -> tuple[str, dict[str, str]]:
     return effective, prefs
 
 
-async def run_command(
+async def _run_orchestrator_turn(
     runner: InMemoryRunner, session_id: str, text: str, on_event=None
-) -> MilestonePlan | None:
-    """Sends one text command through the Orchestrator agent and prints
-    every event it and its sub-agents produce. Returns the parsed
-    MilestonePlan if the Planner responded, else None (e.g. conversational
-    input handled directly by the Orchestrator)."""
-
+) -> tuple[str | None, str | None]:
+    """One real agent turn: sends `text` (preference-augmented, see
+    _with_preferences) into the given runner/session and returns
+    (final_text, responding_agent) - the raw ingredients each caller
+    interprets differently depending on which agent actually produced the
+    final response. `run_command` only ever sees `planner_agent` (a plan)
+    or the orchestrator itself (a conversational reply); this same helper
+    is reused by `run_command_with_clarification` for the same runner and
+    also for the flight_slot_extractor_agent/planner_agent calls it makes
+    directly - the turn-taking and event printing/emitting is identical
+    either way, only the *interpretation* of the final response differs.
+    """
     print(f"\n{'=' * 60}")
     print(f"USER COMMAND: {text!r}")
     print("=" * 60)
@@ -117,7 +124,8 @@ async def run_command(
         new_message=message,
     ):
         # Each event carries which agent produced it, useful for seeing the
-        # orchestrator -> planner handoff happen in real time.
+        # orchestrator -> planner (or -> flight_slot_extractor) handoff
+        # happen in real time.
         if event.content and event.content.parts:
             for part in event.content.parts:
                 if part.text:
@@ -130,34 +138,274 @@ async def run_command(
             responding_agent = event.author
 
     print(f"\nFinal responder: {responding_agent}")
+    return final_text, responding_agent
+
+
+async def _parse_and_emit_plan(plan_json: str, on_event=None) -> MilestonePlan:
+    """Shared by run_command and run_command_with_clarification - parses a
+    real MilestonePlan out of the Planner's own structured JSON reply and
+    emits the same `{"type": "plan", ...}` event either caller's client
+    already expects, so a plan looks identical to the UI regardless of
+    which path produced it."""
+    plan = MilestonePlan.model_validate_json(plan_json)
+    print("\nPARSED MILESTONE PLAN:")
+    for m in plan.milestones:
+        print(f"  {m.step_number}. {m.goal}")
+        print(f"     success_signal: {m.success_signal}")
+        if m.requires_approval:
+            print("     requires_approval: TRUE")
+    await _emit(
+        on_event,
+        {
+            "type": "plan",
+            "milestones": [
+                {
+                    "step_number": m.step_number,
+                    "goal": m.goal,
+                    "success_signal": m.success_signal,
+                    "requires_approval": m.requires_approval,
+                }
+                for m in plan.milestones
+            ],
+        },
+    )
+    return plan
+
+
+async def run_command(
+    runner: InMemoryRunner, session_id: str, text: str, on_event=None
+) -> MilestonePlan | None:
+    """Sends one text command through the Orchestrator agent. Returns the
+    parsed MilestonePlan if the Planner responded, else None (e.g.
+    conversational input handled directly by the Orchestrator).
+
+    Does NOT handle a flight-slot-extractor response - a plain flight
+    command routed here (not through run_command_with_clarification) would
+    fall through to the conversational branch below, which is why
+    agent_server.py's real user-facing "text"/"audio" path calls
+    run_command_with_clarification instead of this directly. This
+    function stays exactly as it always has for every other caller
+    (main.py's CLI demo commands for Spotify/Reminders, this module's own
+    tests) - unchanged behavior, confirmed by the existing test suite.
+    """
+    final_text, responding_agent = await _run_orchestrator_turn(runner, session_id, text, on_event)
 
     if responding_agent == "planner_agent" and final_text:
-        plan = MilestonePlan.model_validate_json(final_text)
-        print("\nPARSED MILESTONE PLAN:")
-        for m in plan.milestones:
-            print(f"  {m.step_number}. {m.goal}")
-            print(f"     success_signal: {m.success_signal}")
-            if m.requires_approval:
-                print("     requires_approval: TRUE")
-        await _emit(
-            on_event,
-            {
-                "type": "plan",
-                "milestones": [
-                    {
-                        "step_number": m.step_number,
-                        "goal": m.goal,
-                        "success_signal": m.success_signal,
-                        "requires_approval": m.requires_approval,
-                    }
-                    for m in plan.milestones
-                ],
-            },
-        )
-        return plan
+        return await _parse_and_emit_plan(final_text, on_event)
 
     # Conversational reply handled by the Orchestrator itself - no plan.
     await _emit(on_event, {"type": "reply", "text": (final_text or "").strip()})
+    return None
+
+
+# ── Flight-slot clarification loop ──────────────────────────────────────────
+#
+# Deterministic gap-checking, not an LLM judgment call (see
+# agents/flight_slots.py's own docstring for why): a slot counts as
+# resolved if the request itself states it, or - for origin/destination
+# only, the two slots with a real, standing personal default - a stored
+# preference covers it. Anything left over after that is a genuine gap,
+# and v1 asks about every genuine gap in ONE combined question, not one
+# per turn - a deliberate, bounded scope (see planning.md) rather than an
+# open-ended slot-filling dialogue.
+
+_FLIGHT_SLOT_REQUIRED = ("destination", "origin", "depart_date", "trip_type")
+
+# Only these two slots have a sensible standing personal default - a
+# preferred home airport/city and a commonly-flown-to destination are
+# real, stable facts about a person; a travel date or trip type is not,
+# so those are never defaulted, only ever stated or asked about.
+_FLIGHT_SLOT_PREFERENCE_KEYS = {
+    "origin": "default_flight_origin",
+    "destination": "default_flight_destination",
+}
+
+_FLIGHT_SLOT_QUESTION_PHRASES = {
+    "destination": "where you're flying to",
+    "origin": "where you're flying from",
+    "depart_date": "what date you'd like to leave",
+    "trip_type": "whether it's one-way or round-trip",
+    "return_date": "when you'd like to return",
+}
+
+
+def _resolve_flight_slots(
+    slots: FlightSlots, prior: dict[str, str] | None = None
+) -> tuple[dict[str, str], list[str], dict[str, str]]:
+    """Deterministic slot resolution - see the module comment above.
+
+    `prior` carries anything already resolved from an earlier round (the
+    initial extraction), so a second pass (after the user's clarifying
+    answer) only ever fills in what's still missing, never re-asks or
+    silently overwrites something already known.
+
+    Returns (resolved, missing, defaulted):
+      resolved:  slot name -> value, for every slot successfully resolved
+      missing:   slot names still genuinely unresolved, in question order
+      defaulted: slot name -> value, for slots filled from a stored
+                 preference rather than stated in the request - reported
+                 separately so a caller can log/announce it, mirroring how
+                 _with_preferences already surfaces its own defaults
+    """
+    resolved = dict(prior or {})
+    defaulted: dict[str, str] = {}
+
+    def _take(name: str, stated_value: str | None) -> None:
+        if resolved.get(name):
+            return
+        if stated_value:
+            resolved[name] = stated_value
+
+    _take("destination", slots.destination)
+    _take("origin", slots.origin)
+    _take("depart_date", slots.depart_date)
+    _take("trip_type", slots.trip_type)
+    _take("return_date", slots.return_date)
+
+    # A stated return date unambiguously implies a round trip, even if the
+    # extractor didn't separately set trip_type - a real, deterministic
+    # implication, not a guess.
+    if not resolved.get("trip_type") and resolved.get("return_date"):
+        resolved["trip_type"] = "round_trip"
+
+    for slot_name, pref_key in _FLIGHT_SLOT_PREFERENCE_KEYS.items():
+        if resolved.get(slot_name):
+            continue
+        pref_value = memory_store.get_preference(pref_key)
+        if pref_value:
+            resolved[slot_name] = pref_value
+            defaulted[slot_name] = pref_value
+
+    missing = [s for s in _FLIGHT_SLOT_REQUIRED if not resolved.get(s)]
+    # return_date is conditionally required - only once trip_type is
+    # actually round_trip - never asked for a resolved one-way trip.
+    if resolved.get("trip_type") == "round_trip" and not resolved.get("return_date"):
+        missing.append("return_date")
+
+    return resolved, missing, defaulted
+
+
+def _build_flight_clarifying_question(missing: list[str]) -> str:
+    """One natural, combined question naming every genuine gap - never one
+    question per slot (see the module comment above for why)."""
+    phrases = [_FLIGHT_SLOT_QUESTION_PHRASES[s] for s in missing]
+    if len(phrases) == 1:
+        joined = phrases[0]
+    else:
+        joined = ", ".join(phrases[:-1]) + ", and " + phrases[-1]
+    return f"I need a bit more to search that - can you tell me {joined}?"
+
+
+def _build_full_flight_task_text(original_text: str, resolved: dict[str, str], still_missing: list[str]) -> str:
+    """Deterministically assembles the complete, unambiguous task
+    description handed to the Planner - built in code from real resolved
+    values, not by relying on any LLM's memory of an earlier turn (see
+    planning.md for why this was the deliberate choice here). `still_missing`
+    is only ever non-empty in the honest v1 edge case where the user's one
+    clarifying answer didn't cover every real gap - named plainly so the
+    Planner/Action agent see it rather than silently proceeding as if
+    nothing were missing."""
+    # v1 is explicitly locked to Kayak (see planning.md) - the only real
+    # browser-automation target this project has actually proven reliable.
+    # Confirmed live this needed to be explicit: a bare "book me a flight
+    # to X" with no site named left the Planner's own site choice
+    # inconsistent - one real run picked Google Flights instead, the exact
+    # site this project already found unreliable for automation and chose
+    # Kayak specifically to avoid.
+    parts = [
+        original_text.rstrip(". ") + ".",
+        "Search Kayak (kayak.com) for this - not Google Flights or any other site.",
+    ]
+    if resolved.get("origin"):
+        parts.append(f"Flying from {resolved['origin']}.")
+    if resolved.get("destination"):
+        parts.append(f"Flying to {resolved['destination']}.")
+    if resolved.get("depart_date"):
+        parts.append(f"Departure date: {resolved['depart_date']}.")
+    if resolved.get("trip_type"):
+        parts.append(f"Trip type: {resolved['trip_type'].replace('_', ' ')}.")
+    if resolved.get("return_date"):
+        parts.append(f"Return date: {resolved['return_date']}.")
+    if still_missing:
+        parts.append(f"(Could not determine: {', '.join(still_missing)}.)")
+    return " ".join(parts)
+
+
+async def run_command_with_clarification(
+    orchestrator_runner: InMemoryRunner,
+    session_id: str,
+    text: str,
+    ask_clarification,
+    on_event=None,
+) -> MilestonePlan | None:
+    """Like run_command, but recognizes when the Orchestrator routes to
+    flight_slot_extractor_agent instead of straight to the Planner, and -
+    only then - runs the real, deterministic clarification loop before
+    ever reaching the Planner. Every other outcome (a conversational
+    reply, or a task the Orchestrator sent straight to planner_agent)
+    behaves exactly like run_command, because it calls the same shared
+    helpers - this only adds the one new branch on top.
+
+    `ask_clarification`: `async def ask_clarification(question: str) -> str`
+    - the one real integration point a caller supplies for actually
+    pausing and getting a real answer back. agent_server.py implements
+    this with the generalized ClientSession.await_reply() primitive
+    (Stage 1) plus the clarification_needed/clarification_response
+    message pair; main.py's own CLI demo implements it with a real
+    blocking input() prompt, mirroring how the CLI's approval gate already
+    works (see run_milestones_until_approval).
+    """
+    final_text, responding_agent = await _run_orchestrator_turn(orchestrator_runner, session_id, text, on_event)
+
+    if responding_agent != "flight_slot_extractor_agent" or not final_text:
+        # Not a flight task (or the model, unusually, produced no
+        # response) - behaves exactly like run_command from here.
+        if responding_agent == "planner_agent" and final_text:
+            return await _parse_and_emit_plan(final_text, on_event)
+        await _emit(on_event, {"type": "reply", "text": (final_text or "").strip()})
+        return None
+
+    slots = FlightSlots.model_validate_json(final_text)
+    resolved, missing, defaulted = _resolve_flight_slots(slots)
+    if defaulted:
+        print(f"\n[MEMORY] filled from stored preference(s): {defaulted}")
+        await _emit(on_event, {"type": "preferences_applied", "preferences": defaulted})
+
+    if missing:
+        question = _build_flight_clarifying_question(missing)
+        print(f"\n[CLARIFICATION NEEDED] {question}")
+        await _emit(on_event, {"type": "clarification_needed", "question": question, "missing": missing})
+
+        answer = await ask_clarification(question)
+        print(f"[CLARIFICATION ANSWER] {answer!r}")
+        await _emit(on_event, {"type": "clarification_received", "text": answer})
+
+        # A second, independent extraction call over the original request
+        # plus the real answer, combined as one piece of text - not a
+        # second turn relying on any LLM's memory of the first (Stage 1
+        # proved that would actually work, but this is simpler and just as
+        # correct, so it's what v1 actually uses - see planning.md).
+        combined_text = f"{text} Additional details: {answer}"
+        extractor_runner = InMemoryRunner(agent=build_flight_slot_extractor_agent(), app_name=APP_NAME)
+        extractor_session = await extractor_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+        answer_text, answer_agent = await _run_orchestrator_turn(
+            extractor_runner, extractor_session.id, combined_text, on_event=None
+        )
+        if answer_text and answer_agent == "flight_slot_extractor_agent":
+            answer_slots = FlightSlots.model_validate_json(answer_text)
+            resolved, missing, _ = _resolve_flight_slots(answer_slots, prior=resolved)
+        # If genuinely still missing after this one round, v1 does not
+        # loop again - it proceeds honestly (see _build_full_flight_task_text)
+        # rather than forcing an open-ended back-and-forth.
+
+    full_text = _build_full_flight_task_text(text, resolved, missing)
+    planner_runner = InMemoryRunner(agent=build_planner_agent(), app_name=APP_NAME)
+    planner_session = await planner_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
+    plan_text, plan_agent = await _run_orchestrator_turn(planner_runner, planner_session.id, full_text, on_event)
+    if plan_agent == "planner_agent" and plan_text:
+        return await _parse_and_emit_plan(plan_text, on_event)
+
+    await _emit(on_event, {"type": "reply", "text": (plan_text or "").strip()})
     return None
 
 
@@ -321,12 +569,26 @@ async def run_plan_with_approval_gate(
     return "completed" if all_ok else "failed"
 
 
+async def _ask_clarification_via_input(question: str) -> str:
+    """CLI stand-in for a real clarifying question - the same real,
+    blocking `input()` pattern the CLI's own approval gate already uses
+    (see run_plan_with_approval_gate), not a stub answer. Used by every
+    demo/regression command below, not just Kayak - harmless for
+    non-flight commands, since the Orchestrator only ever routes a
+    genuinely flight-shaped request to the clarifier in the first place."""
+    print(f"\n[CLARIFICATION NEEDED] {question}")
+    return input("> ")
+
+
 async def run_voice_command(
     runner: InMemoryRunner, session_id: str, audio
 ) -> tuple[str, MilestonePlan | None]:
     """The voice entry point: transcribe captured audio to text, then send
-    that text through exactly the same Orchestrator path a typed command
-    would take (`run_command`).
+    that text through the same Orchestrator path a typed command would
+    take, now clarification-aware (`run_command_with_clarification`) so a
+    genuinely underspecified flight request (the Kayak demo command
+    included) gets a real question instead of being silently mishandled
+    as a conversational reply.
 
     `audio` is whatever the capture layer produced - a real
     `speech_recognition.AudioData`, or a `voice.stt.SimulatedAudio` in a
@@ -340,7 +602,7 @@ async def run_voice_command(
     print(f"\n{'*' * 60}")
     print(f"GOOGLE STT TRANSCRIPT: {transcript!r}")
     print("*" * 60)
-    plan = await run_command(runner, session_id, transcript)
+    plan = await run_command_with_clarification(runner, session_id, transcript, _ask_clarification_via_input)
     return transcript, plan
 
 
@@ -475,8 +737,8 @@ async def run_typed_regression() -> None:
     # navigate_to_url) - no manual browser setup. See planning.md for why
     # Kayak, not Google Flights.
     session4 = await orchestrator_runner.session_service.create_session(app_name=APP_NAME, user_id=USER_ID)
-    kayak_plan = await run_command(
-        orchestrator_runner, session4.id, "open Kayak and search for a flight to New York"
+    kayak_plan = await run_command_with_clarification(
+        orchestrator_runner, session4.id, "open Kayak and search for a flight to New York", _ask_clarification_via_input
     )
     if kayak_plan is not None:
         action_runner3 = InMemoryRunner(agent=action_agent, app_name=APP_NAME)
