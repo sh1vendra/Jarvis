@@ -48,6 +48,8 @@ being a single shared event.
 """
 
 import asyncio
+import dataclasses
+import json
 import logging
 import os
 import secrets
@@ -58,6 +60,34 @@ from .models import ActionRequest, ActionResult, DomChangeEvent, PageSnapshot
 from .store import browser_store
 
 logger = logging.getLogger(__name__)
+
+# Opt-in investigation aid, off by default (no-op unless
+# JARVIS_DEBUG_DUMP_SNAPSHOTS is set): dumps every real snapshot's full
+# element list to disk, so investigating a real site's DOM (this is how
+# Kayak's destination takeover panel and calendar structure were actually
+# confirmed for Stage 3 - see planning.md) doesn't have to guess from
+# find_web_element's own pass/fail messages alone. Zero cost and zero
+# behavior change when unset, which is every normal run.
+_DEBUG_DUMP_DIR = os.environ.get("JARVIS_DEBUG_DUMP_SNAPSHOTS")
+
+
+def _debug_dump_snapshot(snapshot: PageSnapshot) -> None:
+    if not _DEBUG_DUMP_DIR:
+        return
+    os.makedirs(_DEBUG_DUMP_DIR, exist_ok=True)
+    path = os.path.join(_DEBUG_DUMP_DIR, f"snapshot_{snapshot.generation}.json")
+    with open(path, "w") as f:
+        json.dump(
+            {
+                "url": snapshot.url,
+                "title": snapshot.title,
+                "generation": snapshot.generation,
+                "element_count": len(snapshot.elements),
+                "elements": [dataclasses.asdict(e) for e in snapshot.elements],
+            },
+            f,
+            indent=2,
+        )
 
 
 class BrowserBridge:
@@ -139,6 +169,7 @@ class BrowserBridge:
             len(snapshot.elements),
             snapshot.url,
         )
+        _debug_dump_snapshot(snapshot)
         self._snapshot_event.set()
         self._snapshot_event = asyncio.Event()  # set-then-swap - see module docstring
 
