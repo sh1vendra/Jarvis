@@ -173,6 +173,8 @@ async def navigate_to_url(url: str) -> dict:
     }
 
 
+_MIN_SUBSTRING_MATCH_LEN = 3  # below this, a "substring" match is usually just noise (see below)
+
 def _match_score(query: str, el: ElementRef) -> float:
     """Scores how well el matches a plain-language query, checked in
     priority order - visible label text first, then placeholder, then
@@ -180,6 +182,21 @@ def _match_score(query: str, el: ElementRef) -> float:
     substring match, mirroring the same priority the content script's own
     heuristic matcher (content_script.js's scoreCandidate) uses for
     consistency between "finding" and "resolving" an element.
+
+    The substring branch requires both strings to be at least
+    _MIN_SUBSTRING_MATCH_LEN long - found necessary by a real, live
+    failure: Kayak's own account-avatar button has el.text == "s" (the
+    user's initial), which is trivially a substring of nearly any query
+    ("search button" included) and, at the "text" field's top weight,
+    outscored the real Search button - find_web_element confidently handed
+    back the avatar. A 1-2 character field is essentially never a
+    meaningful description on its own, so it can still win via an exact
+    match (a query that's genuinely just "s"), just not by coincidentally
+    appearing inside something longer. This doesn't catch every case of
+    this general shape - a genuinely longer decorative string that happens
+    to contain a real whole word from the query (e.g. a heading containing
+    "from") can still out-substring-match the actual field - but it fixes
+    the concrete, observed one.
     """
     fields_in_priority = [
         (el.text, 4.0),
@@ -194,7 +211,7 @@ def _match_score(query: str, el: ElementRef) -> float:
             continue
         if v == query:
             best = max(best, weight * 2.0)
-        elif query in v or v in query:
+        elif len(v) >= _MIN_SUBSTRING_MATCH_LEN and len(query) >= _MIN_SUBSTRING_MATCH_LEN and (query in v or v in query):
             best = max(best, weight * 1.0)
     return best
 
